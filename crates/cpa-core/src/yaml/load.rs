@@ -135,12 +135,18 @@ struct Size {
     nodes: usize,
     /// Alias uses, those inside alias copies included (serde_yaml_ng's `jumpcount`).
     jumps: usize,
+    /// Levels from this node down to its deepest scalar, alias copies included, so an
+    /// alias cannot compose a tree deeper than [`MAX_DEPTH`] out of shallow syntax (the
+    /// walkers over the composed tree recurse once per level).
+    depth: usize,
 }
 
 impl std::ops::AddAssign for Size {
+    /// Adds a child: `other` is the child's size, one level below.
     fn add_assign(&mut self, other: Size) {
         self.nodes = self.nodes.saturating_add(other.nodes);
         self.jumps = self.jumps.saturating_add(other.jumps);
+        self.depth = self.depth.max(other.depth.saturating_add(1));
     }
 }
 
@@ -213,7 +219,15 @@ pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Err
                     plain: style == ScalarStyle::Plain,
                     tag: tag.map(|t| format!("{}{}", t.handle(), t.suffix())),
                 };
-                Some((Rc::new(Node::Scalar(scalar)), anchor, Size { nodes: 1, jumps: 0 }))
+                Some((
+                    Rc::new(Node::Scalar(scalar)),
+                    anchor,
+                    Size {
+                        nodes: 1,
+                        jumps: 0,
+                        depth: 1,
+                    },
+                ))
             }
             Event::Alias(id) => {
                 let (node, size) = anchors
@@ -227,7 +241,11 @@ pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Err
                 stack.push(Frame::Sequence {
                     items: Vec::new(),
                     anchor,
-                    size: Size { nodes: 1, jumps: 0 },
+                    size: Size {
+                        nodes: 1,
+                        jumps: 0,
+                        depth: 1,
+                    },
                 });
                 None
             }
@@ -235,7 +253,11 @@ pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Err
                 stack.push(Frame::Mapping {
                     entries: Vec::new(),
                     anchor,
-                    size: Size { nodes: 1, jumps: 0 },
+                    size: Size {
+                        nodes: 1,
+                        jumps: 0,
+                        depth: 1,
+                    },
                     key: None,
                     texts: HashSet::new(),
                 });
@@ -256,6 +278,11 @@ pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Err
         let Some((node, anchor, size)) = done else {
             continue;
         };
+        // The node's own levels under the frames still open: an alias copy of a deep
+        // anchor at a deep position is refused as the same nesting written out would be.
+        if stack.len().saturating_add(size.depth) > MAX_DEPTH {
+            return Err(Error::msg(format!("yaml: nesting exceeds {MAX_DEPTH} levels")));
+        }
         if anchor != 0 {
             anchors.insert(anchor, (node.clone(), size));
         }
@@ -943,5 +970,32 @@ mod tests {
         assert!(from_str(&deep).is_err());
         let ok = format!("{}{}", "[".repeat(200), "]".repeat(200));
         assert!(from_str(&ok).is_ok());
+        // An alias composes depth out of shallow syntax: 300 levels anchored, aliased
+        // at the bottom of 300 more, is 600 levels in the composed tree.
+        let nested = |n: usize, inner: &str| format!("{}{inner}{}", "[".repeat(n), "]".repeat(n));
+        let spliced = |n: usize| {
+            format!(
+                "a: &a {}
+b: {}
+",
+                nested(n, "1"),
+                nested(n, "*a")
+            )
+        };
+        assert!(from_str(&spliced(300)).is_err(), "600 composed levels");
+        assert!(from_str(&spliced(150)).is_ok(), "300 composed levels");
+        // A chain doubles with each step at constant syntactic depth.
+        let mut chain = String::from(
+            "a0: &a0 [1]
+",
+        );
+        for i in 1..=600 {
+            chain.push_str(&format!(
+                "a{i}: &a{i} [*a{}]
+",
+                i - 1
+            ));
+        }
+        assert!(from_str(&chain).is_err(), "a 601-level alias chain");
     }
 }
