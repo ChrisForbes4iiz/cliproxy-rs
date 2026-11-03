@@ -1153,6 +1153,35 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
     apply_prefix(models, credential_prefix(c), cfg.routing.force_model_prefix)
 }
 
+/// The metadata keys [`models_for`] reads, besides those [`auth_kind`] reads for the
+/// kind alone: `prefix` ([`credential_prefix`]), `models` and `model_aliases`
+/// ([`config_models`]), and the Vertex model lists (`openapi_models`, `openapi-models`,
+/// `models`).
+const CATALOG_METADATA: [&str; 6] = ["prefix", "models", "model_aliases", "openapi_models", "openapi-models", "auth_kind"];
+
+/// Whether [`models_for`] (and [`Registry::build`], which registers its result under
+/// the ID and [`provider_key`]) can give `after` other models than `before`, under the
+/// same config and global catalogs (static, plugin, web-search hints). They read the
+/// ID, provider, label (an OpenAI-compatible provider key), `disabled`, the source
+/// (config entries and Vertex service accounts take different paths), the attributes,
+/// [`CATALOG_METADATA`] and the auth kind. The kind reads the token fields only for
+/// whether one is set, so it is compared as derived: a token refresh that writes new
+/// tokens and expiry times, or any other metadata key (Antigravity's `project_id`, an
+/// email), keeps the catalog.
+pub fn catalog_changed(before: &Credential, after: &Credential) -> bool {
+    before.id != after.id
+        || before.provider != after.provider
+        || before.label != after.label
+        || before.disabled != after.disabled
+        || before.source != after.source
+        || before.attributes != after.attributes
+        || CATALOG_METADATA
+            .iter()
+            .any(|key| before.metadata.get(*key) != after.metadata.get(*key))
+        || uses_siwc(before) != uses_siwc(after)
+        || auth_kind(before) != auth_kind(after)
+}
+
 /// The model names an auth file lists (Go d9451cb6): a comma-separated string, an
 /// array of strings, or an array of entries with a string `name`.
 pub fn for_each_model_name(raw: &Value, mut f: impl FnMut(&str)) {
@@ -1807,6 +1836,59 @@ mod tests {
             c.attributes.insert((*k).into(), (*v).into());
         }
         Arc::new(c)
+    }
+
+    /// A token refresh (new tokens, expiry, Antigravity's `project_id`) cannot change a
+    /// credential's catalog; whatever `models_for` reads can.
+    #[test]
+    fn only_catalog_inputs_change_the_catalog() {
+        let cfg = Config::parse("").unwrap();
+        let aliases = global_aliases(&cfg);
+        let base = file(
+            "codex-a.json",
+            serde_json::json!({"type": "codex", "email": "a@example.invalid", "access_token": "old", "refresh_token": "r1", "expired": "2026-01-01T00:00:00Z"}),
+            &[("plan_type", "plus")],
+        );
+        let with = |edit: &dyn Fn(&mut Credential)| {
+            let mut c = Credential::clone(&base);
+            edit(&mut c);
+            c
+        };
+        let refreshed = with(&|c| {
+            for (k, v) in [("access_token", "new"), ("refresh_token", "r2"), ("expired", "2026-02-01T00:00:00Z"), ("project_id", "p2"), ("last_refresh", "now")] {
+                c.metadata.insert(k.into(), v.into());
+            }
+            c.revision += 1;
+        });
+        assert!(!catalog_changed(&base, &refreshed), "a token refresh");
+        let ids = |c: &Credential| models_for(&cfg, &aliases, c, 0).into_iter().map(|m| m.id).collect::<Vec<_>>();
+        assert_eq!(ids(&base), ids(&refreshed));
+        for (what, changed) in [
+            ("plan", with(&|c| {
+                c.attributes.insert("plan_type".into(), "team".into());
+            })),
+            ("prefix", with(&|c| {
+                c.metadata.insert("prefix".into(), "team".into());
+            })),
+            ("disabled", with(&|c| c.disabled = true)),
+            ("exclusions", with(&|c| {
+                c.attributes.insert("excluded_models".into(), "gpt-*".into());
+            })),
+            ("auth kind", with(&|c| {
+                c.metadata.insert("auth_kind".into(), "apikey".into());
+            })),
+            ("siwc", with(&|c| {
+                c.metadata.insert("use_siwc".into(), true.into());
+            })),
+            ("label", with(&|c| c.label = "other".into())),
+        ] {
+            assert!(catalog_changed(&base, &changed), "{what}");
+        }
+        // The kind reads tokens for their presence: the first token changes it.
+        let empty = file("claude-a.json", serde_json::json!({"type": "claude"}), &[]);
+        let mut token = Credential::clone(&empty);
+        token.metadata.insert("access_token".into(), "t".into());
+        assert!(catalog_changed(&empty, &token));
     }
 
     /// Go `GetStaticModelDefinitionsByChannel` and `LookupStaticModelInfoByChannel`: Go's

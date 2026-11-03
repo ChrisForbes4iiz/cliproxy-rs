@@ -239,7 +239,16 @@ impl Management {
     /// c4c1d43e). Callers hold `disk`. Infallible on purpose: access settings of a
     /// valid config (a rotated or removed secret) always take effect.
     pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) {
-        self.publish_upload(cfg, files, None);
+        self.publish_scanned(cfg, files, None, None);
+    }
+
+    /// [`Self::publish`] for a scan of the one auth file at `only` (Go's watcher
+    /// `addOrUpdateClientLocked` / `removeClientLocked`): every other file keeps the
+    /// credentials the store holds when the scan is published, taken under the store's
+    /// reconciliation gate as a deferred file's are, and only `only`'s upload fallback
+    /// is read again. An empty scan removes what `only` held.
+    pub(crate) fn publish_file(&self, cfg: Config, scan: credentials::AuthScan, only: &std::path::Path) {
+        self.publish_scanned(cfg, Some(scan), None, Some(only));
     }
 
     /// [`Self::publish`] after an upload wrote `upload`'s file. While plugin auth
@@ -254,6 +263,18 @@ impl Management {
         files: Option<credentials::AuthScan>,
         upload: Option<(Credential, [u8; 32])>,
     ) {
+        self.publish_scanned(cfg, files, upload, None);
+    }
+
+    /// [`Self::publish_upload`]; with `only`, `files` covers that one auth file
+    /// ([`Self::publish_file`]).
+    fn publish_scanned(
+        &self,
+        cfg: Config,
+        files: Option<credentials::AuthScan>,
+        upload: Option<(Credential, [u8; 32])>,
+        only: Option<&std::path::Path>,
+    ) {
         // Nothing below is applied for a config the runtime would refuse to publish.
         if !Runtime::accepts_config(&cfg) {
             return;
@@ -266,11 +287,16 @@ impl Management {
         let mut read = scan.read;
         // Uploads record absolute paths; a relative auth-dir scans relative ones.
         let absolute = |p: &PathBuf| std::path::absolute(p).unwrap_or_else(|_| p.clone());
+        let only = only.map(|p| std::path::absolute(p).unwrap_or_else(|_| p.to_owned()));
         // Fallbacks follow their file: gone with it, replaced once a synthesizer
         // claims it, otherwise rebuilt from its current content.
         let mut claimed = Vec::new();
         let mut fallbacks = self.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
         fallbacks.retain(|path| {
+            // A one-file scan leaves every other fallback, and its credential, as it is.
+            if only.as_ref().is_some_and(|only| *only != absolute(path)) {
+                return true;
+            }
             let Ok(data) = std::fs::read(path) else { return false };
             if all
                 .iter()
@@ -326,6 +352,9 @@ impl Management {
         }
         let rejected = self.rt.store().reconcile_scanned_with(all, &read, |current, all| {
             crate::plugins::keep_deferred(current, all, &scan.deferred);
+            if let Some(only) = &only {
+                keep_other_files(current, all, only);
+            }
             if let Some((upload, _)) = upload {
                 all.retain(|c| c.id != upload.id);
                 all.push(upload);
@@ -345,6 +374,22 @@ impl Management {
         }
         // Go's watcher calls redisqueue.NotifyUsageRefresh after every client reload.
         self.rt.usage_queue().notify_usage_refresh();
+    }
+}
+
+/// For a scan of the one auth file `only` ([`Management::publish_file`]): the current
+/// credentials of every other file, unless the scan already holds their ID.
+fn keep_other_files(current: &[Arc<Credential>], all: &mut Vec<Credential>, only: &std::path::Path) {
+    // Saves and uploads record absolute paths; a relative auth-dir scans relative ones.
+    let absolute = |p: &std::path::Path| std::path::absolute(p).unwrap_or_else(|_| p.to_owned());
+    let ids: std::collections::HashSet<String> = all.iter().map(|c| c.id.clone()).collect();
+    for existing in current {
+        if let Source::File(p) = &existing.source
+            && absolute(p).as_path() != only
+            && !ids.contains(&existing.id)
+        {
+            all.push(Credential::clone(existing));
+        }
     }
 }
 

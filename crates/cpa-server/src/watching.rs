@@ -11,9 +11,11 @@
 //! the top-level `*.json` auth files every 50 ms, hashing only files whose metadata
 //! changed or that were modified in the last two seconds (git's racy timestamp rule),
 //! until the change has been stable for 150 ms (config) or one tick (auth files) and is
-//! applied. While nothing changes it does no work and sets no timer. As in Go, changes
-//! made by another machine on a network or FUSE file system raise no event and are seen
-//! with the next local change.
+//! applied. A change to one auth file alone is applied from that file, as Go's
+//! `handleEvent` applies it; anything else (the config, several files, a plugin auth
+//! provider) reloads the folder. While nothing changes it does no work and sets no
+//! timer. As in Go, changes made by another machine on a network or FUSE file system
+//! raise no event and are seen with the next local change.
 use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -104,6 +106,8 @@ impl HashCache {
         {
             return Some(*hash);
         }
+        #[cfg(test)]
+        tests::note_read(path);
         let data = std::fs::read(path).ok()?;
         let hash: Hash = Sha256::digest(&data).into();
         self.0.insert(path.to_owned(), (stat, hash));
@@ -277,6 +281,12 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                     tracing::info!("config file changed, reloading: {}", state.path.display());
                 }
             }
+            // Go `handleEvent`: one auth file changed, with the config and the plugin auth
+            // providers as last applied, is applied from that file alone.
+            let single = match &applied {
+                Some(before) if !read_config && applied_epoch == epoch => single_auth_change(before, &current),
+                _ => None,
+            };
             // The reload may move auth-dir, and new auth files need their own watches on
             // macOS: retarget after it, on the same blocking thread. A change that lands
             // before a new watch exists is caught by the extra look `Events` then makes.
@@ -285,7 +295,12 @@ pub fn start(state: &Arc<Management>) -> tokio::task::JoinHandle<()> {
                 let state = state.clone();
                 let current = current.clone();
                 move || {
-                    let loaded = catch_unwind(AssertUnwindSafe(|| reload_config(&state, read_config, &current)));
+                    let loaded = catch_unwind(AssertUnwindSafe(|| {
+                        single
+                            .as_deref()
+                            .and_then(|path| reload_auth_file(&state, &current, path))
+                            .map_or_else(|| reload_config(&state, read_config, &current), |read| (Ok(None), read))
+                    }));
                     let _ = catch_unwind(AssertUnwindSafe(|| {
                         events.retarget(&targets(&state, Some(&current)));
                     }));
@@ -473,6 +488,8 @@ fn reload_config(
         credentials::preparse_auth_dir(&state.rt.config());
     }
     let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+    #[cfg(test)]
+    tests::note_full_reload(&state.rt.config().auth_dir);
     let mut read = Snapshot {
         config: observed.config,
         auth: BTreeMap::new(),
@@ -528,6 +545,77 @@ fn reload_config(
     (result, read)
 }
 
+/// The one auth file whose content differs between two snapshots (created, rewritten
+/// or removed), when exactly one does and the watcher could read it both times.
+fn single_auth_change(before: &Snapshot, after: &Snapshot) -> Option<PathBuf> {
+    let mut changed = after
+        .auth
+        .iter()
+        .filter(|(path, hash)| before.auth.get(*path) != Some(*hash))
+        .map(|(path, _)| path)
+        .chain(before.auth.keys().filter(|path| !after.auth.contains_key(*path)));
+    let path = changed.next()?;
+    if changed.next().is_some() {
+        return None;
+    }
+    // An unreadable file is kept as observed by the full reload's rules.
+    let unreadable = |s: &Snapshot| s.auth.get(path).is_some_and(|hash| *hash == Hash::default());
+    (!unreadable(before) && !unreadable(after)).then(|| path.clone())
+}
+
+/// Go `handleEvent` for one auth file: `addOrUpdateClientLocked` reads, synthesizes and
+/// publishes that file alone, and a removal is re-checked first (`removeClientLocked`
+/// only once the path stays gone: Go stats it again, three more times 25 ms apart for a
+/// known file, and a file back in place is an update). It publishes through
+/// [`Management::publish_file`], so upload fallbacks, the freshness check and
+/// incomplete writes ([`keep_incomplete`]) behave as in the full reload. Returns what
+/// it read, as [`reload_config`] does, or `None` when only a full reload can apply the
+/// change: a plugin auth provider is active (its parse covers the folder), the file is
+/// outside the published auth-dir, or it cannot be read as a regular file.
+fn reload_auth_file(state: &Management, observed: &Snapshot, path: &Path) -> Option<Snapshot> {
+    if credentials::plugin_auth_parser_active() {
+        return None;
+    }
+    let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut config = (*state.rt.config()).clone();
+    state.lock_auth_dir(&mut config);
+    if path.parent() != Some(config.auth_dir.as_path()) {
+        return None;
+    }
+    // The watcher observes regular files only ([`observe`]).
+    let is_file = || std::fs::metadata(path).is_ok_and(|meta| meta.is_file());
+    let present = observed.auth.contains_key(path)
+        || is_file()
+        || (0..3).any(|_| {
+            std::thread::sleep(Duration::from_millis(25));
+            is_file()
+        });
+    let mut scan = credentials::AuthScan::default();
+    if present {
+        #[cfg(test)]
+        tests::note_read(path);
+        let data = credentials::read_regular(path)?;
+        scan.read.insert(path.to_owned(), Sha256::digest(&data).into());
+        // The full scan's rules for one file: empty or not JSON is incomplete, an error
+        // skips the file.
+        if serde_json::from_slice::<serde::de::IgnoredAny>(&data).is_err() {
+            scan.incomplete.insert(path.to_owned());
+        } else {
+            match credentials::from_file(&config, &config.auth_dir, path, &data) {
+                Ok(Some(credential)) => scan.credentials.push(credential),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(path = %path.display(), error = %e, "skipping auth file"),
+            }
+        }
+        keep_incomplete(state, &mut scan.credentials, &scan.incomplete);
+    }
+    let mut read = observed.clone();
+    read.auth.remove(path);
+    read.auth.extend(scan.read.iter().map(|(p, hash)| (p.clone(), *hash)));
+    state.publish_file(config, scan, path);
+    Some(read)
+}
+
 /// An empty or half-written file is not a deletion (Go 7484a521): keep the
 /// last good credentials of the files the scan found incomplete. Deciding from the scan's
 /// own read, never a second one, means a file completed after the scan is picked up by
@@ -547,6 +635,57 @@ fn keep_incomplete(state: &Management, files: &mut Vec<Credential>, incomplete: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The auth files the watcher read, and the auth folders it rescanned, so a test can
+    /// tell what one change cost. Process-wide (the reads run on blocking threads): each
+    /// test filters by its own folder.
+    static READS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    static FULL_RELOADS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn note_read(path: &Path) {
+        if is_auth_json(path) {
+            READS.lock().unwrap_or_else(PoisonError::into_inner).push(path.to_owned());
+        }
+    }
+
+    pub(super) fn note_full_reload(auth_dir: &Path) {
+        FULL_RELOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(auth_dir.to_owned());
+    }
+
+    fn reads_in(dir: &Path) -> Vec<PathBuf> {
+        READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .cloned()
+            .collect()
+    }
+
+    fn full_reloads_of(dir: &Path) -> usize {
+        FULL_RELOADS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|p| p.starts_with(dir))
+            .count()
+    }
+
+    /// Waits until the watcher has stopped reading files in `dir`.
+    async fn reads_settle(dir: &Path) {
+        let mut last = usize::MAX;
+        loop {
+            let now = reads_in(dir).len();
+            if now == last {
+                return;
+            }
+            last = now;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
 
     fn state() -> (Arc<Management>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("cpa-watch-outcome-{}", uuid::Uuid::new_v4()));
@@ -1305,5 +1444,133 @@ mod tests {
             assert_eq!(ids(), ["claude-a", "claude-b"]);
             std::fs::remove_dir_all(dir).unwrap();
         });
+    }
+
+    /// Go `handleEvent` (internal/watcher/events.go) re-stats a removed auth file before
+    /// `removeClientLocked`: one back in place by then (an atomic replace) is an update,
+    /// read and applied (`addOrUpdateClientLocked`); one still gone is removed.
+    #[tokio::test]
+    async fn a_removal_is_rechecked_before_it_is_applied() {
+        let (state, dir) = state();
+        let file = state.rt.config().auth_dir.join("a.json");
+        std::fs::write(&file, r#"{"type":"codex","email":"a@example.com"}"#).unwrap();
+        reload(&state).unwrap();
+        let mut cache = HashCache::default();
+        let applied = observe(&state, &mut cache);
+        let mut gone = applied.clone();
+        gone.auth.remove(&file);
+        assert_eq!(single_auth_change(&applied, &gone).as_ref(), Some(&file));
+        let email = |state: &Management| {
+            state
+                .rt
+                .store()
+                .get("a.json")
+                .and_then(|c| c.str("email").map(str::to_owned))
+        };
+        // Replaced after the watcher saw it go.
+        std::fs::write(&file, r#"{"type":"codex","email":"b@example.com"}"#).unwrap();
+        let read = reload_auth_file(&state, &gone, &file).expect("applied from the file");
+        assert!(read.auth.contains_key(&file), "the update is recorded as read");
+        assert_eq!(email(&state).as_deref(), Some("b@example.com"));
+        std::fs::remove_file(&file).unwrap();
+        let read = reload_auth_file(&state, &gone, &file).expect("applied from the file");
+        assert!(!read.auth.contains_key(&file));
+        assert_eq!(email(&state), None, "removed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Two changed files, or one the watcher could not read, go to the full reload.
+    #[test]
+    fn only_one_readable_changed_file_takes_the_single_file_path() {
+        let snapshot = |files: &[(&str, u8)]| Snapshot {
+            config: None,
+            auth: files.iter().map(|(n, h)| (PathBuf::from(n), [*h; 32])).collect(),
+        };
+        let before = snapshot(&[("a.json", 1), ("b.json", 2), ("c.json", 0)]);
+        assert_eq!(single_auth_change(&before, &before), None);
+        let one = snapshot(&[("a.json", 9), ("b.json", 2), ("c.json", 0)]);
+        assert_eq!(single_auth_change(&before, &one), Some(PathBuf::from("a.json")));
+        let created = snapshot(&[("a.json", 1), ("b.json", 2), ("c.json", 0), ("d.json", 4)]);
+        assert_eq!(single_auth_change(&before, &created), Some(PathBuf::from("d.json")));
+        let removed = snapshot(&[("a.json", 1), ("c.json", 0)]);
+        assert_eq!(single_auth_change(&before, &removed), Some(PathBuf::from("b.json")));
+        let two = snapshot(&[("a.json", 9), ("c.json", 0)]);
+        assert_eq!(single_auth_change(&before, &two), None);
+        let unreadable = snapshot(&[("a.json", 0), ("b.json", 2), ("c.json", 0)]);
+        assert_eq!(single_auth_change(&before, &unreadable), None);
+        let was_unreadable = snapshot(&[("a.json", 1), ("b.json", 2), ("c.json", 3)]);
+        assert_eq!(single_auth_change(&before, &was_unreadable), None);
+    }
+
+    /// Go v8.0.35 `handleEvent` -> `addOrUpdateClientLocked` / `removeClientLocked`: in
+    /// a 2,000-file auth folder, a rewritten file is the only one the watcher reads, a
+    /// removal reads none, the folder is not rescanned, and every other credential keeps
+    /// its revision.
+    // kqueue holds a descriptor per watched file, beyond macOS's default limit here.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_changed_file_in_a_large_auth_dir_is_read_alone() {
+        use std::io::Write as _;
+        const FILES: usize = 2_000;
+        let (state, dir) = state();
+        let auth = state.rt.config().auth_dir.clone();
+        let doc = |email: &str| format!(r#"{{"type":"codex","email":"{email}"}}"#);
+        let name = |i: usize| format!("a-{i:04}.json");
+        // Old enough not to be re-hashed as racy.
+        let old = SystemTime::now() - Duration::from_secs(60);
+        for i in 0..FILES {
+            let mut file = std::fs::File::create(auth.join(name(i))).unwrap();
+            file.write_all(doc(&format!("u{i}@example.invalid")).as_bytes()).unwrap();
+            file.set_modified(old).unwrap();
+        }
+        let store = state.rt.store().clone();
+        let watcher = start(&state);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while store.snapshot().len() < FILES {
+                tokio::time::sleep(TICK).await;
+            }
+        })
+        .await
+        .expect("the first reload loads every file");
+        reads_settle(&auth).await;
+        let email = |id: &str| store.get(id).and_then(|c| c.str("email").map(str::to_owned));
+        let kept = store.get(&name(1)).unwrap().revision;
+        let full = full_reloads_of(&auth);
+
+        let changed = auth.join(name(7));
+        let mark = reads_in(&auth).len();
+        std::fs::write(&changed, doc("new@example.invalid")).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while email(&name(7)).as_deref() != Some("new@example.invalid") {
+                tokio::time::sleep(TICK).await;
+            }
+        })
+        .await
+        .expect("the rewrite is applied");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let read = reads_in(&auth).split_off(mark);
+        assert!(!read.is_empty() && read.iter().all(|p| *p == changed), "{read:?}");
+        assert_eq!(full_reloads_of(&auth), full, "the folder was rescanned");
+        assert_eq!(store.get(&name(1)).unwrap().revision, kept);
+
+        let mark = reads_in(&auth).len();
+        std::fs::remove_file(auth.join(name(8))).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while store.get(&name(8)).is_some() {
+                tokio::time::sleep(TICK).await;
+            }
+        })
+        .await
+        .expect("the removal is applied");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The rewritten file is still racy, so the watcher keeps hashing it.
+        let read = reads_in(&auth).split_off(mark);
+        assert!(read.iter().all(|p| *p == changed), "{read:?}");
+        assert_eq!(full_reloads_of(&auth), full, "the folder was rescanned");
+        assert_eq!(store.get(&name(1)).unwrap().revision, kept);
+        assert_eq!(store.snapshot().len(), FILES - 1);
+        watcher.abort();
+        let _ = watcher.await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

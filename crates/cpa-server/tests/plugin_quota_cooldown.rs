@@ -133,6 +133,8 @@ async fn plugin_quota_reset_persists_cleared_cooldowns_to_the_backend() {
         rt.store().cooldowns("claude.json").is_empty(),
         "the reset cleared the cooldown"
     );
+    // The reset queues its save on the persistence worker.
+    rt.flush_persistence().await;
     {
         let saves = backend.saves.lock().unwrap();
         assert!(saves.len() > saves_before, "the cleared state was saved to the backend");

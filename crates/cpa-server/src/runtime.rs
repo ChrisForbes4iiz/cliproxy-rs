@@ -382,9 +382,9 @@ impl Runtime {
     /// A hit holds the cache lock only to clone the `Arc`. A miss builds under
     /// `registry_build`, outside the cache lock, so requests whose key is cached never
     /// wait for a build; builds run one at a time and publish in order.
-    // ponytail: the key is the store epoch, which every token refresh bumps, so a
-    // refresh still costs a rebuild; skipping it needs proof that `models_for` reads
-    // none of the patched keys (Antigravity's refresh writes `project_id`).
+    ///
+    /// The credential half of the key is the store's catalog epoch, so a token refresh
+    /// that changes nothing `models_for` reads keeps the registry.
     pub fn registry(&self) -> Arc<Registry> {
         let config = self.config();
         let generation = self.registry_generation();
@@ -407,13 +407,14 @@ impl Runtime {
         registry
     }
 
-    /// What a registry is built from besides the config: the credential epoch, and the
-    /// static catalog and capability generations (a refreshed catalog re-registers every
-    /// credential, as Go's model refresh callback does; capability probes, such as
-    /// Antigravity web search, refine registered models later).
+    /// What a registry is built from besides the config: the credential catalog epoch
+    /// ([`CredentialStore::catalog_epoch`]), and the static catalog and capability
+    /// generations (a refreshed catalog re-registers every credential, as Go's model
+    /// refresh callback does; capability probes, such as Antigravity web search, refine
+    /// registered models later).
     fn registry_generation(&self) -> (u64, u64, u64) {
         (
-            self.store.epoch(),
+            self.store.catalog_epoch(),
             cpa_core::registry::catalog_generation(),
             cpa_core::registry::dynamic::capabilities_generation(),
         )
@@ -1628,6 +1629,9 @@ struct Inner {
     generation: u64,
     /// Bumped on every reconcile and patch, including pure removals.
     epoch: u64,
+    /// Bumped with `epoch` only when the change can alter the model registry
+    /// ([`registration_changed`]): a token refresh leaves it alone.
+    catalog_epoch: u64,
 }
 
 /// Pending background refreshes after a 401, and the last token rotations.
@@ -1738,6 +1742,26 @@ impl Drop for Draining<'_> {
     }
 }
 
+/// Whether the model registry can differ for `after` than for `before`
+/// ([`cpa_core::registry::dynamic::catalog_changed`]), or `after` is an Antigravity
+/// credential at a new revision: a rebuild hands the new revision to its web-search
+/// probe (`Executors::models_registered`), which an access token or `project_id` change
+/// needs.
+fn registration_changed(before: &Credential, after: &Credential) -> bool {
+    let antigravity = |c: &Credential| c.provider == cpa_exec::antigravity::PROVIDER;
+    antigravity(before) || antigravity(after) || cpa_core::registry::dynamic::catalog_changed(before, after)
+}
+
+/// [`registration_changed`] for a set: other IDs, another order (registration order
+/// decides provider order), or a changed credential.
+fn set_registration_changed(before: &[Arc<Credential>], after: &[Arc<Credential>]) -> bool {
+    before.len() != after.len()
+        || before
+            .iter()
+            .zip(after)
+            .any(|(b, a)| !Arc::ptr_eq(b, a) && (b.id != a.id || registration_changed(b, a)))
+}
+
 /// The ids in `before` that `after` no longer has.
 fn removed_ids(before: &[Arc<Credential>], after: &[Arc<Credential>]) -> Vec<String> {
     let kept: std::collections::HashSet<&str> = after.iter().map(|c| c.id.as_str()).collect();
@@ -1820,6 +1844,7 @@ impl CredentialStore {
             creds: Vec::new(),
             generation: 0,
             epoch: 0,
+            catalog_epoch: 0,
         };
         for mut cred in credentials {
             inner.generation += 1;
@@ -1990,6 +2015,11 @@ impl CredentialStore {
     }
 
     /// Go `persistCooldownStates`: rewrites the `.cds` files from the live cooldowns.
+    /// Blocking (one fsync per credential and an auth-dir walk): a request, management
+    /// or reload path asks for it through `persist_later`. Only switching the
+    /// store ([`Self::configure_cooldown_store`], [`Self::set_cooldown_backend`]) calls
+    /// it directly, because that write must reach the store being replaced, and the
+    /// switch already loads the new store inline.
     pub fn persist_cooldowns(&self) {
         let Some(dir) = self.cooldown_dir.read().unwrap_or_else(PoisonError::into_inner).clone() else {
             return;
@@ -2148,7 +2178,7 @@ impl CredentialStore {
                 .clear_disabled(&inner.creds, &policy)
         };
         if cleared {
-            self.persist_cooldowns();
+            self.persist_later(true, None);
         }
     }
 
@@ -2316,7 +2346,7 @@ impl CredentialStore {
     pub fn reset_cooldown(&self, id: &str) -> Vec<String> {
         let models = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner).reset(id);
         if !models.is_empty() {
-            self.persist_cooldowns();
+            self.persist_later(true, None);
         }
         models
     }
@@ -2476,8 +2506,9 @@ impl CredentialStore {
 
     /// Runs the cooldown snapshot (`cooldowns`) and the credential save a recorded
     /// result asks for on the persistence worker ([`Persister`]), so the tokio worker
-    /// that ended the lease never blocks on a file. Outside a tokio runtime (a plain
-    /// test, a drop after shutdown) they run here, as before.
+    /// that ended the lease never blocks on a file. Management resets, reconciles,
+    /// patches and policy changes queue their cooldown snapshot here too. Outside a
+    /// tokio runtime (a plain test, a drop after shutdown) they run here, as before.
     fn persist_later(&self, cooldowns: bool, credential: Option<&Arc<Credential>>) {
         if !cooldowns && credential.is_none() {
             return;
@@ -2549,8 +2580,9 @@ impl CredentialStore {
         }
     }
 
-    /// Blocks until every write a recorded result queued has landed: at shutdown, and in
-    /// tests that read the `.cds` or credential files right after an attempt. Blocking:
+    /// Blocks until every write a recorded result, reset or reconcile queued has landed:
+    /// at shutdown, and in tests that read the `.cds` or credential files (or a cooldown
+    /// backend) right after one. Blocking:
     /// call it from `spawn_blocking` or outside the runtime.
     #[doc(hidden)]
     pub fn flush_persistence(&self) {
@@ -2705,8 +2737,12 @@ impl CredentialStore {
                             std::slice::from_ref(&next),
                             &[],
                         );
+                        let catalog = registration_changed(&inner.creds[index], &next);
                         inner.creds[index] = next;
                         inner.epoch += 1;
+                        if catalog {
+                            inner.catalog_epoch += 1;
+                        }
                         self.changed.send_replace(());
                         inner.creds[index].clone()
                     },
@@ -2742,6 +2778,12 @@ impl CredentialStore {
     /// Changes whenever the credential set or any credential changes.
     pub fn epoch(&self) -> u64 {
         self.read().epoch
+    }
+
+    /// Changes whenever the credential set changes in a way the model registry reads
+    /// (`registration_changed`); the registry cache is keyed on it.
+    pub fn catalog_epoch(&self) -> u64 {
+        self.read().catalog_epoch
     }
 
     /// Attempts finished so far, by outcome.
@@ -2851,6 +2893,10 @@ impl CredentialStore {
                     crate::plugins::refresh::record(&self.refresh_schedules, &next, |c, s| {
                         crate::plugins::refresh::committed(c, s, chrono::Utc::now())
                     });
+                }
+                // A token refresh keeps the registry; a patch of what it reads rebuilds it.
+                if registration_changed(&inner.creds[index], &next) {
+                    inner.catalog_epoch += 1;
                 }
                 inner.creds[index] = next;
                 inner.epoch += 1;
@@ -2964,16 +3010,20 @@ impl CredentialStore {
         let next = Arc::new(next);
         self.register(std::slice::from_ref(slot), std::slice::from_ref(&next), &[]);
         let cleared = self.clear_replaced_unauthorized(std::slice::from_ref(slot), std::slice::from_ref(&next));
+        let catalog = registration_changed(&**slot, &next);
         *slot = next;
         let committed = slot.clone();
         inner.generation = generation;
         // Registrations depend on the credential (prefix, models): invalidate the
         // registry cache like `apply_patch` does.
         inner.epoch += 1;
+        if catalog {
+            inner.catalog_epoch += 1;
+        }
         self.changed.send_replace(());
         drop(inner);
         if cleared {
-            self.persist_cooldowns();
+            self.persist_later(true, None);
         }
         // Go `Manager.Update` clears the cooldowns of an auth it stores disabled (or
         // with cooling off), so a later re-enable routes to it at once.
@@ -3062,6 +3112,9 @@ impl CredentialStore {
                 self.register(&before, &inner.creds, &[]);
                 self.clear_replaced_unauthorized(&before, &inner.creds);
                 inner.epoch += 1;
+                if set_registration_changed(&before, &inner.creds) {
+                    inner.catalog_epoch += 1;
+                }
                 self.changed.send_replace(());
                 self.scheduler
                     .lock()
@@ -3072,7 +3125,7 @@ impl CredentialStore {
         )?;
         self.close_sessions(removed.unwrap_or_default());
         self.clear_disabled_cooldowns();
-        self.persist_cooldowns();
+        self.persist_later(true, None);
         Ok(())
     }
 
@@ -3304,8 +3357,12 @@ impl CredentialStore {
         let removed = removed_ids(&inner.creds, &next);
         self.register(&inner.creds, &next, &[]);
         self.clear_replaced_unauthorized(&inner.creds, &next);
+        let catalog = set_registration_changed(&inner.creds, &next);
         inner.creds = next;
         inner.epoch += 1;
+        if catalog {
+            inner.catalog_epoch += 1;
+        }
         self.changed.send_replace(());
         self.scheduler
             .lock()
@@ -3319,7 +3376,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
-        self.persist_cooldowns();
+        self.persist_later(true, None);
         rejected
     }
 
@@ -3355,8 +3412,12 @@ impl CredentialStore {
         let removed = removed_ids(&inner.creds, &next);
         self.register(&inner.creds, &next, &[]);
         self.clear_replaced_unauthorized(&inner.creds, &next);
+        let catalog = set_registration_changed(&inner.creds, &next);
         inner.creds = next;
         inner.epoch += 1;
+        if catalog {
+            inner.catalog_epoch += 1;
+        }
         self.changed.send_replace(());
         self.scheduler
             .lock()
@@ -3366,7 +3427,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
-        self.persist_cooldowns();
+        self.persist_later(true, None);
     }
 
     /// Inserts or replaces one credential (a plugin's `host.auth.save`) under a single
@@ -3428,6 +3489,9 @@ impl CredentialStore {
         self.register(&before, &inner.creds, saved);
         self.clear_replaced_unauthorized(&before, &inner.creds);
         inner.epoch += 1;
+        if set_registration_changed(&before, &inner.creds) {
+            inner.catalog_epoch += 1;
+        }
         self.changed.send_replace(());
         self.scheduler
             .lock()
@@ -3437,7 +3501,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
-        self.persist_cooldowns();
+        self.persist_later(true, None);
     }
 
     /// Adds a runtime-only credential (Go's auth add for a `/v1/ws` relay session)
@@ -3454,6 +3518,7 @@ impl CredentialStore {
         inner.creds.push(Arc::new(credential));
         self.register(&before, &inner.creds, &[]);
         inner.epoch += 1;
+        inner.catalog_epoch += 1;
         self.changed.send_replace(());
         self.scheduler
             .lock()
@@ -3473,6 +3538,7 @@ impl CredentialStore {
         }
         self.register(&before, &inner.creds, &[]);
         inner.epoch += 1;
+        inner.catalog_epoch += 1;
         self.changed.send_replace(());
         self.scheduler
             .lock()
@@ -3556,7 +3622,7 @@ impl CredentialStore {
             .reset_cooldowns(id);
         if had {
             // Go `ResetQuota` persists the cleared state.
-            self.persist_cooldowns();
+            self.persist_later(true, None);
         }
         models
     }
@@ -3575,7 +3641,7 @@ impl CredentialStore {
             .unwrap_or_else(PoisonError::into_inner)
             .clear_unauthorized(id, Instant::now());
         if cleared {
-            self.persist_cooldowns();
+            self.persist_later(true, None);
         }
     }
 }
@@ -5690,6 +5756,204 @@ pub(crate) mod tests {
         rt.publish_config(Config::parse(&format!("auth-dir: {}\n", dir.display())).unwrap());
         rt.store.reset_cooldown("b.json");
         assert!(dir.join("b.cds").exists(), "no writes once disabled");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cooldown backend whose saves block while `armed`, until `release`.
+    struct StalledBackend {
+        armed: std::sync::atomic::AtomicBool,
+        entered: std::sync::atomic::AtomicBool,
+        released: Mutex<bool>,
+        wake: std::sync::Condvar,
+        saves: Mutex<Vec<Vec<crate::cooldown_store::Record>>>,
+    }
+
+    impl StalledBackend {
+        fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    impl crate::cooldown_store::Backend for StalledBackend {
+        fn load(&self) -> Result<Vec<crate::cooldown_store::Record>, String> {
+            Ok(vec![crate::cooldown_store::Record {
+                provider: "claude".into(),
+                auth_id: "a.json".into(),
+                status: "error".into(),
+                next_retry_after: Some(std::time::SystemTime::now() + Duration::from_secs(3600)),
+                reason: "quota".into(),
+                quota: crate::cooldown_store::Quota {
+                    exceeded: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }])
+        }
+
+        fn save(&self, records: Vec<crate::cooldown_store::Record>, _: std::time::SystemTime) -> Result<(), String> {
+            if self.armed.load(Ordering::SeqCst) {
+                self.entered.store(true, Ordering::SeqCst);
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    released = self.wake.wait(released).unwrap();
+                }
+            }
+            self.saves.lock().unwrap().push(records);
+            Ok(())
+        }
+    }
+
+    /// A management cooldown reset (Go `ResetQuota`) returns while the cooldown save it
+    /// asks for is stalled: the write runs on the persistence worker, not the handler's
+    /// tokio worker, and holds the cleared state once flushed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cooldown_reset_does_not_wait_for_its_save() {
+        let dir = std::env::temp_dir().join(format!(
+            "cds-stall-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config::parse(&format!(
+            "auth-dir: {}\nrouting:\n  cooldown:\n    save-cooldown-status: true\n",
+            dir.display()
+        ))
+        .unwrap();
+        let rt = crate::testing::runtime(
+            config,
+            vec![cred("a.json", "claude", false)],
+            Executors {
+                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                codex: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+                devices: Default::default(),
+            },
+        );
+        let backend = Arc::new(StalledBackend {
+            armed: Default::default(),
+            entered: Default::default(),
+            released: Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+            saves: Mutex::default(),
+        });
+        rt.set_cooldown_backend(backend.clone());
+        assert!(!rt.store.cooldowns("a.json").is_empty(), "the backend's cooldown was restored");
+        let saves_before = backend.saves.lock().unwrap().len();
+
+        backend.armed.store(true, Ordering::SeqCst);
+        let store = rt.store.clone();
+        let reset = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::spawn(async move { store.reset_cooldowns("a.json") }),
+        )
+        .await;
+        let returned = reset.is_ok();
+        let mut stalled = false;
+        if returned {
+            for _ in 0..200 {
+                if backend.entered.load(Ordering::SeqCst) {
+                    stalled = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let saved_while_stalled = backend.saves.lock().unwrap().len();
+        backend.release();
+        assert!(returned, "the reset waited for the stalled save");
+        assert!(stalled, "the save ran on the persistence worker");
+        assert_eq!(saved_while_stalled, saves_before, "nothing saved while stalled");
+        assert!(rt.store.cooldowns("a.json").is_empty(), "the reset cleared the cooldown");
+
+        rt.flush_persistence().await;
+        let saves = backend.saves.lock().unwrap();
+        assert!(saves.len() > saves_before, "the cleared state was saved");
+        assert!(
+            saves.last().unwrap().iter().all(|r| r.auth_id != "a.json"),
+            "the last save holds no cooldown for the reset credential"
+        );
+        drop(saves);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The registry is keyed on the catalog epoch: a Codex or Claude access-token refresh
+    /// keeps the built registry, while an Antigravity `project_id` change (its web-search
+    /// probe runs per revision) and a change of what `models_for` reads rebuild it.
+    #[test]
+    fn a_token_refresh_keeps_the_model_registry() {
+        let dir = std::env::temp_dir().join(format!(
+            "registry-epoch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, doc) in [
+            (
+                "codex-a.json",
+                r#"{"type":"codex","email":"a@example.invalid","access_token":"old","refresh_token":"r1"}"#,
+            ),
+            (
+                "claude-a.json",
+                r#"{"type":"claude","email":"b@example.invalid","access_token":"old","refresh_token":"r1"}"#,
+            ),
+            (
+                "antigravity-a.json",
+                r#"{"type":"antigravity","email":"c@example.invalid","access_token":"old","refresh_token":"r1","project_id":"p1"}"#,
+            ),
+        ] {
+            std::fs::write(dir.join(name), doc).unwrap();
+        }
+        let config = Config::parse(&format!("auth-dir: {}\n", dir.display())).unwrap();
+        let credentials = cpa_core::config::credentials::from_auth_dir(&config);
+        let rt = crate::testing::runtime(
+            config,
+            credentials,
+            Executors {
+                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                codex: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+                devices: Default::default(),
+            },
+        );
+        let patch = |id: &str, set: &[(&str, &str)]| {
+            let current = rt.store.get(id).unwrap();
+            let mut patch = MetadataPatch::default();
+            for (key, value) in set {
+                patch.set.insert((*key).into(), (*value).into());
+            }
+            rt.store.apply_patch(id, current.revision, &patch).unwrap();
+        };
+        let built = rt.registry();
+        assert!(built.has_client("codex-a.json") && built.has_client("claude-a.json"));
+        for id in ["codex-a.json", "claude-a.json"] {
+            let epoch = rt.store.epoch();
+            patch(
+                id,
+                &[
+                    ("access_token", "new"),
+                    ("refresh_token", "r2"),
+                    ("expired", "2030-01-01T00:00:00Z"),
+                ],
+            );
+            assert!(rt.store.epoch() > epoch, "{id}: the refresh committed");
+            assert!(Arc::ptr_eq(&built, &rt.registry()), "{id}: a token refresh rebuilt the registry");
+        }
+        patch("antigravity-a.json", &[("project_id", "p2")]);
+        let rebuilt = rt.registry();
+        assert!(!Arc::ptr_eq(&built, &rebuilt), "an Antigravity project_id change rebuilds");
+        patch("codex-a.json", &[("prefix", "team")]);
+        let prefixed = rt.registry();
+        assert!(!Arc::ptr_eq(&rebuilt, &prefixed), "a prefix change rebuilds");
+        assert!(prefixed.ids().any(|id| id.starts_with("team/")), "the rebuild registers the prefix");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
