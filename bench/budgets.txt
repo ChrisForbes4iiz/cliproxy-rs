@@ -20,6 +20,10 @@
 # their lines; the budgets hold today's numbers so that nothing gets worse meanwhile.
 
 # 2026-10-06: Rust 1.99.0.
+# 2026-11-03: Rust 1.99.1. Budget values unchanged: on one machine (WSL Ubuntu 24.04) the
+# base 737ac93b's .text is 30_091_991 with 1.99.0 and 30_093_210 with 1.99.1 (+1.2 KB), and the
+# 2026-11-02 review fixes add 98_496 (+96 KB) over that, inside the 2% tolerance. Absolute
+# values there run about 545 KB above this Ubuntu 22.04 job's, so the CI run confirms them.
 
 # Release binary and archive, Linux x86_64 (every pull request). Target: binary 30 MB
 # or less, archive 13 MB or less.
