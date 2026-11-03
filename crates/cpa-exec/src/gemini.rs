@@ -157,14 +157,15 @@ pub(crate) fn translate(
     deep_stack(body, || {
         crate::codex_client::translate_request(req.source_format, target, &ctx, body, &client).map(|t| t.body)
     })
-    .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
+    .map_err(|e| crate::translate::translator_error(400, FailureScope::Request, e))
 }
 
 /// Runs a translator under `cpa_translate::deep_stack`, sized for `body`'s nesting as
 /// `cpa_translate::translate_request` does for registered pairs: the ported schema walkers
 /// recurse per nesting level like Go's, whose stacks grow. The shared guard sizes the
-/// stack per level, answers an error (a local 400 at the callers) when the stack cannot
-/// be reserved, counts brackets inside strings and never nests a second deep thread.
+/// stack per level, answers an error when the stack cannot be reserved (a retryable 503
+/// at the callers, through `translate::translator_error`), counts brackets inside strings
+/// up to the parsers' depth limit and never nests a second deep thread.
 pub(crate) fn deep_stack<T: Send>(
     body: &[u8],
     f: impl FnOnce() -> Result<T, cpa_translate::Error> + Send,

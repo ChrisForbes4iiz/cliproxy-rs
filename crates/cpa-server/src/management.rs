@@ -239,16 +239,25 @@ impl Management {
     /// c4c1d43e). Callers hold `disk`. Infallible on purpose: access settings of a
     /// valid config (a rotated or removed secret) always take effect.
     pub(crate) fn publish(&self, cfg: Config, files: Option<credentials::AuthScan>) {
-        self.publish_scanned(cfg, files, None, None);
+        self.publish_scanned(cfg, files, None, None, true);
+    }
+
+    /// [`Self::publish`] for the watcher's full reload. `from_file` says `cfg` was read
+    /// from the config file, which Go republishes however it compares; an auth-only
+    /// reload passes the current config again and keeps it (and everything derived from
+    /// it) when nothing changed.
+    pub(crate) fn publish_observed(&self, cfg: Config, scan: credentials::AuthScan, from_file: bool) {
+        self.publish_scanned(cfg, Some(scan), None, None, from_file);
     }
 
     /// [`Self::publish`] for a scan of the one auth file at `only` (Go's watcher
     /// `addOrUpdateClientLocked` / `removeClientLocked`): every other file keeps the
     /// credentials the store holds when the scan is published, taken under the store's
     /// reconciliation gate as a deferred file's are, and only `only`'s upload fallback
-    /// is read again. An empty scan removes what `only` held.
+    /// is read again. An empty scan removes what `only` held. The config, passed again
+    /// unchanged, is kept.
     pub(crate) fn publish_file(&self, cfg: Config, scan: credentials::AuthScan, only: &std::path::Path) {
-        self.publish_scanned(cfg, Some(scan), None, Some(only));
+        self.publish_scanned(cfg, Some(scan), None, Some(only), false);
     }
 
     /// [`Self::publish`] after an upload wrote `upload`'s file. While plugin auth
@@ -263,17 +272,20 @@ impl Management {
         files: Option<credentials::AuthScan>,
         upload: Option<(Credential, [u8; 32])>,
     ) {
-        self.publish_scanned(cfg, files, upload, None);
+        self.publish_scanned(cfg, files, upload, None, true);
     }
 
     /// [`Self::publish_upload`]; with `only`, `files` covers that one auth file
-    /// ([`Self::publish_file`]).
+    /// ([`Self::publish_file`]). `republish` publishes `cfg` even when it equals the
+    /// current config (a management reload re-applies everything, as Go's does);
+    /// otherwise an equal config is kept and only the credentials are reconciled.
     fn publish_scanned(
         &self,
         cfg: Config,
         files: Option<credentials::AuthScan>,
         upload: Option<(Credential, [u8; 32])>,
         only: Option<&std::path::Path>,
+        republish: bool,
     ) {
         // Nothing below is applied for a config the runtime would refuse to publish.
         if !Runtime::accepts_config(&cfg) {
@@ -332,11 +344,21 @@ impl Management {
             }
         }
         all.extend(credentials::from_config(&cfg));
-        self.access.config_published(&cfg);
-        crate::logging::configure(&cfg);
-        self.rt.usage_queue().configure(self.access.available(), &cfg);
-        let policy = policy(&cfg);
-        self.rt.publish_config_and_policy(cfg, policy);
+        // Go's watcher publishes the config only when the config file changed; an
+        // auth-file event (`addOrUpdateClientLocked`) touches the clients alone. The same
+        // here: unless the caller asks for a republish, a config equal to the current one
+        // keeps its `Arc`, so the registry and alias caches keyed on it
+        // (`Runtime::registry`, `Runtime::aliases`) survive a token refresh written back
+        // through the watcher, and nothing derived from the config (access, logging,
+        // usage queue, policy, catalogs, the plugin host) is republished. Only the
+        // credentials are reconciled below.
+        if republish || *self.rt.config() != cfg {
+            self.access.config_published(&cfg);
+            crate::logging::configure(&cfg);
+            self.rt.usage_queue().configure(self.access.available(), &cfg);
+            let policy = policy(&cfg);
+            self.rt.publish_config_and_policy(cfg, policy);
+        }
         let upload = upload.filter(|(c, _)| {
             matches!(&c.source, Source::File(path) if scan.deferred.iter().any(|p| absolute(p) == absolute(path)))
         });
@@ -1395,9 +1417,19 @@ fn if_match_satisfied(values: &[String], etag: &HeaderValue) -> bool {
         .any(|tag| trim(tag) == etag.as_bytes())
 }
 
+/// Go `GetConfigYAML` (config_basic.go): the raw file, never cached or sniffed, as the
+/// v8 YAML view above.
 async fn legacy_yaml(State(state): State<Arc<Management>>) -> Response {
     match tokio::fs::read(&state.path).await {
-        Ok(bytes) => ([(header::CONTENT_TYPE, "application/yaml; charset=utf-8")], bytes).into_response(),
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "application/yaml; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            ],
+            bytes,
+        )
+            .into_response(),
         Err(_) => error(404, "not_found"),
     }
 }

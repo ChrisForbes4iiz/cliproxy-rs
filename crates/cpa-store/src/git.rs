@@ -17,10 +17,9 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
 use futures_util::future::BoxFuture;
 
 const GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -33,6 +32,25 @@ const AUTHOR_EMAIL: &str = "cliproxy@local";
 /// must not queue every later save forever. The store repository is a few small files
 /// with squashed history, so two minutes covers a slow network with a wide margin.
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// The environment variable the git credential helper reads the token from.
+const TOKEN_ENV: &str = "CPA_GITSTORE_TOKEN";
+
+/// `<scheme>://<host[:port]>/` of an http(s) `remote`, as git's `credential_from_url`
+/// reads it (userinfo dropped, the port exactly as written), to scope a
+/// `credential.<url>.*` entry to the remote's host. None for any other remote (ssh, a
+/// local path), which takes no HTTP credential.
+fn credential_url(remote: &str) -> Option<String> {
+    let (scheme, rest) = remote.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) {
+        return None;
+    }
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}/"))
+}
 
 /// Whether a path from the remote's tree (`ls-tree`, `diff --name-only`) may be joined to
 /// the working tree. Git's own checkout refuses the rest, which leaves them "missing",
@@ -95,6 +113,69 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> std::
 /// capture them).
 fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Output> {
     wait_with_timeout(cmd.stdin(Stdio::null()).spawn()?, timeout)
+}
+
+/// `output_with_timeout` for a command run in the repository at `dir`: a git killed at
+/// the deadline leaves its lock files behind, and every later command would fail with
+/// "File exists" until an operator removed them, so the ones it created are removed.
+fn output_with_timeout_in(dir: &Path, cmd: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    let started = SystemTime::now();
+    let result = output_with_timeout(cmd, timeout);
+    if let Err(error) = &result
+        && error.kind() == std::io::ErrorKind::TimedOut
+    {
+        let git_dir = dir.join(".git");
+        if git_dir.is_dir() {
+            remove_stale_locks(&git_dir, started);
+        }
+    }
+    result
+}
+
+/// Removes the lock files a killed git left behind: `*.lock` directly under `.git`
+/// (`index.lock`, `HEAD.lock`, `packed-refs.lock`, `config.lock`) and under `refs/` and
+/// `logs/` (`refs/heads/<branch>.lock`, reflog locks). Only a file modified at or after
+/// `started`, less a tolerance for file systems with coarse timestamps, is removed: an
+/// older lock belongs to another process. Each removal is logged with its path; the
+/// repository holds secrets, but a lock file's name carries none.
+fn remove_stale_locks(git_dir: &Path, started: SystemTime) {
+    const TOLERANCE: Duration = Duration::from_secs(2);
+    let since = started.checked_sub(TOLERANCE).unwrap_or(started);
+    let mut dirs = vec![git_dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                // `objects/` holds no lock files worth a walk; refs and reflogs do.
+                if dir == git_dir && entry.file_name() != "refs" && entry.file_name() != "logs" {
+                    continue;
+                }
+                dirs.push(path);
+                continue;
+            }
+            if !path.extension().is_some_and(|ext| ext == "lock") {
+                continue;
+            }
+            match meta.modified() {
+                Ok(modified) if modified >= since => {}
+                _ => continue,
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => tracing::warn!(
+                    path = %path.display(),
+                    "git token store: removed a lock file left by a git killed at the deadline"
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "git token store: could not remove a lock file left by a git killed at the deadline"
+                ),
+            }
+        }
+    }
 }
 
 /// A branch name taken from the remote (`ls-remote --symref`) before it reaches
@@ -364,27 +445,63 @@ impl GitStore {
         cmd.current_dir(dir)
             .args(args)
             .env("GIT_TERMINAL_PROMPT", "0")
+            // An empty GIT_ASKPASS also disables core.askPass and SSH_ASKPASS, so a host
+            // the credential below is not scoped to gets no prompt-sourced credential
+            // either; the command fails there instead.
+            .env("GIT_ASKPASS", "")
             .env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
             .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
             .env("GIT_COMMITTER_NAME", AUTHOR_NAME)
             .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL);
-        // Fetched objects are checked (tree entries such as `.git` or `..` are refused);
-        // go-git has no such check, but the store only ever holds plain files.
-        let mut config: Vec<(&str, String)> = vec![("fetch.fsckObjects", "true".to_owned())];
+        // Fetched objects are checked, and a tree entry named `.git` (in any case, with
+        // its NTFS variants), `.` or `..` fails the fetch: git's hasDotgit, hasDotdot and
+        // hasDot only warn by default, so they are raised to errors here, and a hostile
+        // remote never reaches `safe_tree_path`. go-git has no such check. Any other
+        // error-level fsck finding in the remote's history (a commit without an author
+        // email, a malformed date) fails the fetch too; the store's own history is one
+        // squashed commit, so only a repository made by other tools carries one. A clone
+        // of a local path copies objects without this check; transports run it.
+        let mut config: Vec<(String, String)> = [
+            ("fetch.fsckObjects", "true"),
+            ("fetch.fsck.hasDotgit", "error"),
+            ("fetch.fsck.hasDotdot", "error"),
+            ("fetch.fsck.hasDot", "error"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect();
         // Go `gitClientOptions`: HTTP basic auth, user "git" when only a token is set.
-        // Passed through the environment so it never appears in a process listing.
-        if !self.username.is_empty() || !self.password.is_empty() {
+        // The credential goes through git's credential system, scoped to the remote's
+        // scheme, host and port (gitcredentials(7): a `credential.<url>.*` entry applies
+        // only where protocol and host, port included, match exactly), so git offers it
+        // to that host alone, after its 401 challenge, and a redirect to another host
+        // gets none; Go's net/http drops Authorization on a cross-host redirect the same
+        // way. `http.extraHeader` went to every host of the invocation (cliproxy-rs-zlj.2).
+        // The token travels in the child's environment, where the inline helper reads it,
+        // so it is in no config value and no argv (`printf`, not `echo`: dash's `echo`
+        // interprets backslashes). `initial`, git's default, is pinned so a global `true`
+        // cannot widen it: the first request follows redirects and the later requests go
+        // to the URL it landed on, so a remote written without its `.git` suffix or an
+        // http:// URL that moved to https:// syncs; `false` refused those too.
+        if (!self.username.is_empty() || !self.password.is_empty())
+            && let Some(scope) = credential_url(&self.remote)
+        {
             let user = if self.username.is_empty() {
                 "git"
             } else {
-                &self.username
+                self.username.as_str()
             };
-            let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{}", self.password));
-            config.push(("http.extraHeader", format!("Authorization: Basic {token}")));
-            // git sends an extra header on every request of the invocation, including
-            // after a redirect to another host; Go's net/http drops Authorization there.
-            config.push(("http.followRedirects", "false".to_owned()));
+            // An empty helper resets the list, so a helper from the global or system
+            // config (a credential manager with a stored login) is never asked.
+            config.push(("credential.helper".to_owned(), String::new()));
+            config.push((format!("credential.{scope}.username"), user.to_owned()));
+            config.push((
+                format!("credential.{scope}.helper"),
+                format!("!f() {{ printf 'password=%s\\n' \"${TOKEN_ENV}\"; }}; f"),
+            ));
+            cmd.env(TOKEN_ENV, &self.password);
+            config.push(("http.followRedirects".to_owned(), "initial".to_owned()));
         }
         cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
         for (i, (key, value)) in config.into_iter().enumerate() {
@@ -397,7 +514,7 @@ impl GitStore {
     fn run_in(&self, dir: &Path, args: &[&str]) -> Result<Output> {
         let mut cmd = self.command(dir, args);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = output_with_timeout(&mut cmd, GIT_TIMEOUT).map_err(|e| {
+        let output = output_with_timeout_in(dir, &mut cmd, GIT_TIMEOUT).map_err(|e| {
             if e.kind() == std::io::ErrorKind::TimedOut {
                 anyhow!("git token store: git {}: {e}", args.first().unwrap_or(&""))
             } else {
@@ -753,7 +870,8 @@ impl GitStore {
         let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let mut archive = self.command(&self.repo, &["archive", "--format=tar", &head]);
         archive.stdout(Stdio::null()).stderr(Stdio::piped());
-        let archived = output_with_timeout(&mut archive, GIT_TIMEOUT).map_err(|e| anyhow!("run git: {e}"))?;
+        let archived =
+            output_with_timeout_in(&self.repo, &mut archive, GIT_TIMEOUT).map_err(|e| anyhow!("run git: {e}"))?;
         if !archived.status.success() {
             bail!(
                 "object not found: {}",
@@ -1189,6 +1307,92 @@ mod path_tests {
         ] {
             assert!(super::safe_tree_path(path), "{path:?}");
         }
+    }
+
+    /// cliproxy-rs-zlj.2: the credential scope is the remote's scheme, host and port as
+    /// written, for http(s) remotes only.
+    #[test]
+    fn credential_scopes_follow_the_remote_url() {
+        for (remote, scope) in [
+            (
+                "https://gitlab.example.com/group/tokens",
+                Some("https://gitlab.example.com/"),
+            ),
+            (
+                "https://gitlab.example.com/group/tokens.git",
+                Some("https://gitlab.example.com/"),
+            ),
+            ("http://127.0.0.1:8080/tokens", Some("http://127.0.0.1:8080/")),
+            ("https://host:443/x", Some("https://host:443/")),
+            ("https://user:pw@host/x", Some("https://host/")),
+            ("https://host", Some("https://host/")),
+            ("git@github.com:org/tokens.git", None),
+            ("ssh://git@host/tokens.git", None),
+            ("/srv/tokens.git", None),
+            ("https:///x", None),
+            ("", None),
+        ] {
+            assert_eq!(super::credential_url(remote).as_deref(), scope, "{remote:?}");
+        }
+    }
+
+    /// cliproxy-rs-zlj.2: a token reaches git only through its credential system, scoped
+    /// to the remote's host, read by the helper from the environment; no `extraHeader`,
+    /// and no config value holds it. A non-HTTP remote configures no credential at all.
+    #[test]
+    fn the_token_is_scoped_to_the_remote_host() {
+        use std::collections::BTreeMap;
+        let envs = |remote: &str| -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+            let store = super::GitStore::new(remote, "", "secret-token", "", std::path::Path::new("repo"));
+            let cmd = store.command(std::path::Path::new("repo"), &["ls-remote"]);
+            let env: BTreeMap<String, String> = cmd
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    Some((
+                        key.to_string_lossy().into_owned(),
+                        value?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect();
+            let count: usize = env["GIT_CONFIG_COUNT"].parse().unwrap();
+            let config = (0..count)
+                .map(|i| {
+                    (
+                        env[&format!("GIT_CONFIG_KEY_{i}")].clone(),
+                        env[&format!("GIT_CONFIG_VALUE_{i}")].clone(),
+                    )
+                })
+                .collect();
+            (env, config)
+        };
+        let (env, config) = envs("https://gitlab.example.com/group/tokens");
+        assert_eq!(env[super::TOKEN_ENV], "secret-token");
+        assert_eq!(config["credential.helper"], "");
+        assert_eq!(config["credential.https://gitlab.example.com/.username"], "git");
+        let helper = &config["credential.https://gitlab.example.com/.helper"];
+        assert!(helper.starts_with("!f() {"), "{helper}");
+        assert!(helper.contains(&format!("\"${}\"", super::TOKEN_ENV)), "{helper}");
+        assert_eq!(config["http.followRedirects"], "initial");
+        assert!(!config.contains_key("http.extraHeader"));
+        assert!(
+            config.values().all(|value| !value.contains("secret-token")),
+            "no config value holds the token"
+        );
+        // The reset precedes the scoped helper, so it cannot clear it.
+        let keys: Vec<&String> = config.keys().collect();
+        let count: usize = env["GIT_CONFIG_COUNT"].parse().unwrap();
+        let order: Vec<&str> = (0..count)
+            .map(|i| env[&format!("GIT_CONFIG_KEY_{i}")].as_str())
+            .collect();
+        assert!(
+            order.iter().position(|k| *k == "credential.helper") < order.iter().position(|k| k.ends_with("/.helper")),
+            "{order:?} {keys:?}"
+        );
+
+        let (env, config) = envs("git@github.com:org/tokens.git");
+        assert!(!env.contains_key(super::TOKEN_ENV));
+        assert!(config.keys().all(|key| !key.starts_with("credential.")), "{config:?}");
+        assert!(!config.contains_key("http.followRedirects"));
     }
 
     /// cliproxy-rs-7ea.23: a remote default branch must stay a plain name.

@@ -880,7 +880,7 @@ pub(crate) fn events(body: ResponseBody) -> ExecStream {
 }
 
 fn translate_error(error: cpa_translate::Error) -> ExecError {
-    ExecError::local(502, FailureScope::Request, error.to_string())
+    crate::translate::translator_error(502, FailureScope::Request, error)
 }
 
 /// The client body for a buffered response (`TranslateNonStream`): the registered pair,

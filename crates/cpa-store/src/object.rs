@@ -502,7 +502,9 @@ impl ObjectStore {
                 // the startup load could turn a refused file into one a later start uploads.
                 cpa_core::config::prepare_for_upload(&self.config_path)
                     .context("object store: prepare local config for seeding")?;
-                let data = std::fs::read(&self.config_path).context("object store: read local config")?;
+                let data = tokio::fs::read(&self.config_path)
+                    .await
+                    .context("object store: read local config")?;
                 if !data.is_empty() {
                     self.put(CONFIG_KEY, &data, "application/x-yaml").await?;
                 }
@@ -577,10 +579,11 @@ impl ObjectStore {
         Ok(format!("{AUTH_PREFIX}/{}", rel.to_string_lossy().replace('\\', "/")))
     }
 
-    /// Go `uploadAuth`: a missing or empty file deletes the object.
+    /// Go `uploadAuth`: a missing or empty file deletes the object. File reads and
+    /// removals here run on the blocking pool (`tokio::fs`), not on the runtime's workers.
     async fn upload_auth(&self, path: &Path) -> Result<()> {
         let key = self.auth_key(path)?;
-        match std::fs::read(path) {
+        match tokio::fs::read(path).await {
             Ok(data) if !data.is_empty() => self.put(&key, &data, "application/json").await,
             Ok(_) => self.remove(&key).await,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.remove(&key).await,
@@ -606,7 +609,7 @@ impl ObjectStore {
     /// Go `PersistConfig`.
     pub async fn persist_config(&self) -> Result<()> {
         let _guard = self.lock.lock().await;
-        match std::fs::read(&self.config_path) {
+        match tokio::fs::read(&self.config_path).await {
             Ok(data) if !data.is_empty() => self.put(CONFIG_KEY, &data, "application/x-yaml").await,
             Ok(_) => self.remove(CONFIG_KEY).await,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.remove(CONFIG_KEY).await,
@@ -618,7 +621,7 @@ impl ObjectStore {
     pub async fn delete(&self, path: &Path) -> Result<()> {
         let path = &self.resolve(path);
         let _guard = self.lock.lock().await;
-        match std::fs::remove_file(path) {
+        match tokio::fs::remove_file(path).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => bail!("object store: delete auth file: {e}"),

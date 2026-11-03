@@ -469,7 +469,16 @@ pub struct PgCooldown {
     previous: Arc<StdMutex<HashMap<CooldownKey, DateTime<Utc>>>>,
     /// The newest save not yet taken by the worker. Each save is the complete live set,
     /// so a newer one replaces a queued one instead of queueing behind it.
-    pending: Arc<StdMutex<Option<PendingSave>>>,
+    pending: Arc<StdMutex<Pending>>,
+}
+
+/// The save waiting for the worker, and whether a queued job will take it. A save
+/// whose job the full queue refused stays here unclaimed, so the next save queues a job
+/// instead of taking the refusal for a queued one (cliproxy-rs-zlj.10).
+#[derive(Default)]
+struct Pending {
+    save: Option<PendingSave>,
+    queued: bool,
 }
 
 /// One encoded cooldown save: the rows to upsert, their keys, and its `now`.
@@ -568,20 +577,23 @@ impl cpa_server::cooldown_store::Backend for PgCooldown {
         );
         let previous = self.previous.clone();
         let save = PendingSave { encoded, current, now };
-        if self
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(save)
-            .is_some()
         {
-            // The queued job has not started yet and will take this newer save.
-            return Ok(());
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.save = Some(save);
+            if pending.queued {
+                // The queued job has not started yet and will take this newer save.
+                return Ok(());
+            }
+            pending.queued = true;
         }
         let pending = self.pending.clone();
         let queued = self.pg.submit(move |client| async move {
             // The guard is dropped here, before any await.
-            let taken = pending.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let taken = {
+                let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
+                pending.queued = false;
+                pending.save.take()
+            };
             let Some(PendingSave { encoded, current, now }) = taken else {
                 return;
             };
@@ -636,8 +648,12 @@ impl cpa_server::cooldown_store::Backend for PgCooldown {
             }
         });
         if !queued {
-            // Nothing will take it: the next save starts a new job.
-            self.pending.lock().unwrap_or_else(PoisonError::into_inner).take();
+            // Nothing will take it, so it stays, unclaimed: the next save (every save is
+            // the complete live set, so it supersedes this one) queues a job again.
+            // ponytail: no periodic flush; the database stays stale until the next
+            // cooldown change when the queue was full.
+            self.pending.lock().unwrap_or_else(PoisonError::into_inner).queued = false;
+            tracing::warn!("postgres cooldown store: save not queued; it waits for the next cooldown change");
         }
         Ok(())
     }
@@ -677,9 +693,10 @@ mod tests {
         assert_eq!(clean(Path::new("")), PathBuf::from("."));
     }
 
-    /// cliproxy-rs-7ea.22: cooldown saves waiting for a stalled worker coalesce into
-    /// one queued job holding the newest set; a save that finds the queue full is
-    /// dropped and leaves nothing pending, so the next one queues again.
+    /// cliproxy-rs-7ea.22 and cliproxy-rs-zlj.10: cooldown saves waiting for a stalled
+    /// worker coalesce into one queued job holding the newest set; a save whose job the
+    /// full queue refused stays pending and unclaimed, and the next save queues a job for
+    /// the newest set instead of taking the refused job for a queued one.
     #[test]
     fn queued_cooldown_saves_coalesce() {
         use cpa_server::cooldown_store::Backend;
@@ -687,7 +704,16 @@ mod tests {
             auth_id: id.to_owned(),
             ..Record::default()
         };
-        let (pg, _queue) = Pg::stalled(2);
+        let pending_keys = |backend: &PgCooldown| -> (Vec<CooldownKey>, bool) {
+            let pending = backend.pending.lock().unwrap();
+            let keys = pending
+                .save
+                .as_ref()
+                .map(|save| save.current.keys().cloned().collect())
+                .unwrap_or_default();
+            (keys, pending.queued)
+        };
+        let (pg, mut queue) = Pg::stalled(2);
         let backend = PgCooldown {
             pg: pg.clone(),
             table: "cooldown_store".into(),
@@ -698,15 +724,23 @@ mod tests {
             backend.save(vec![record(id)], SystemTime::now()).unwrap();
         }
         assert_eq!(pg.queued(), 1);
-        let pending = backend.pending.lock().unwrap();
-        let keys: Vec<&CooldownKey> = pending.as_ref().unwrap().current.keys().collect();
-        assert_eq!(keys, vec![&("c".to_owned(), String::new())]);
-        drop(pending);
+        assert_eq!(pending_keys(&backend), (vec![("c".to_owned(), String::new())], true));
 
+        // The job takes the save; then the queue fills up behind it.
+        *backend.pending.lock().unwrap() = Pending::default();
         assert!(pg.submit(|_| async {}));
-        backend.pending.lock().unwrap().take();
         backend.save(vec![record("d")], SystemTime::now()).unwrap();
+        assert_eq!(pg.queued(), 2, "the full queue refused the job");
+        assert_eq!(
+            pending_keys(&backend),
+            (vec![("d".to_owned(), String::new())], false),
+            "the refused save stays, and no job is claimed for it"
+        );
+
+        // The worker takes one job; the next save queues a job for the newest set.
+        assert!(queue.try_recv().is_ok());
+        backend.save(vec![record("e")], SystemTime::now()).unwrap();
         assert_eq!(pg.queued(), 2);
-        assert!(backend.pending.lock().unwrap().is_none());
+        assert_eq!(pending_keys(&backend), (vec![("e".to_owned(), String::new())], true));
     }
 }

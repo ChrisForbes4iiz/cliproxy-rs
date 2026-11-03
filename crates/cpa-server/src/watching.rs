@@ -537,7 +537,9 @@ fn reload_config(
         }
     }
     let result = accepted.then(|| config.clone());
-    state.publish(config, Some(scan));
+    // A config read and accepted from the file is published as Go publishes it; an
+    // auth-only reload keeps the current config when nothing in it changed.
+    state.publish_observed(config, scan, accepted);
     let result = match config_error {
         Some(error) => Err(error),
         None => Ok(result),
@@ -1479,6 +1481,67 @@ mod tests {
         let read = reload_auth_file(&state, &gone, &file).expect("applied from the file");
         assert!(!read.auth.contains_key(&file));
         assert_eq!(email(&state), None, "removed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A token refresh written back to its auth file (Go `addOrUpdateClientLocked`, and
+    /// an auth-only full reload) reconciles the credentials alone: the config `Arc` stays,
+    /// and with it the model registry and alias caches keyed on it
+    /// (`a_token_refresh_keeps_the_model_registry` round-tripped through the watcher).
+    #[tokio::test]
+    async fn a_token_refresh_reloaded_from_its_file_keeps_the_config_and_the_registry() {
+        let (state, dir) = state();
+        let file = state.rt.config().auth_dir.join("codex-a.json");
+        let token = |access: &str| {
+            format!(r#"{{"type":"codex","email":"a@example.invalid","access_token":"{access}","refresh_token":"r1"}}"#)
+        };
+        std::fs::write(&file, token("old")).unwrap();
+        reload(&state).unwrap();
+        let mut cache = HashCache::default();
+        let observed = observe(&state, &mut cache);
+        let config = state.rt.config();
+        let registry = state.rt.registry();
+        assert!(registry.has_client("codex-a.json"));
+        let access = |state: &Management| {
+            state
+                .rt
+                .store()
+                .get("codex-a.json")
+                .and_then(|c| c.str("access_token").map(str::to_owned))
+        };
+        // The single-file path.
+        std::fs::write(&file, token("new")).unwrap();
+        reload_auth_file(&state, &observed, &file).expect("applied from the file");
+        assert_eq!(access(&state).as_deref(), Some("new"));
+        assert!(
+            Arc::ptr_eq(&config, &state.rt.config()),
+            "the single-file reload republished an unchanged config"
+        );
+        assert!(
+            Arc::ptr_eq(&registry, &state.rt.registry()),
+            "the single-file reload rebuilt the registry"
+        );
+        // The full reload of an auth-only event.
+        std::fs::write(&file, token("newer")).unwrap();
+        assert!(reload_config(&state, false, &observed).0.unwrap().is_none());
+        assert_eq!(access(&state).as_deref(), Some("newer"));
+        assert!(
+            Arc::ptr_eq(&config, &state.rt.config()),
+            "an auth-only reload republished an unchanged config"
+        );
+        assert!(
+            Arc::ptr_eq(&registry, &state.rt.registry()),
+            "an auth-only reload rebuilt the registry"
+        );
+        // A config read from the file is published, as Go publishes it.
+        std::fs::write(
+            &state.path,
+            format!("port: 9009\noauth: {{auth-dir: {}}}\n", dir.display()),
+        )
+        .unwrap();
+        reload(&state).unwrap();
+        assert!(!Arc::ptr_eq(&config, &state.rt.config()));
+        assert_eq!(state.rt.config().port, 9009);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

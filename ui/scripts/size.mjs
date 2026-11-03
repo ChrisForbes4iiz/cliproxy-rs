@@ -4,10 +4,12 @@
 // beginner onboarding (first-run checklist, Use with tools page, limits on the overview,
 // sign-in help), and again the same day to 49,500 B for the owner-requested Claude usage
 // parser (plain names, money, the newer limits list) and plan limits on the overview.
+// 2026-11-03: raised to 50,000 B for the review fixes: the Codex snippet's model line and
+// provider name, the keys.env sign-in hints and the trusted-proxies hint on the 403 (+400 B).
 import { readdirSync, readFileSync, copyFileSync } from "node:fs";
 import { gzipSync } from "node:zlib";
 
-const BUDGET = { js: 49_500, css: 6_853 };
+const BUDGET = { js: 50_000, css: 6_853 };
 
 copyFileSync("dist/index.html", "dist/management.html");
 const html = readFileSync("dist/index.html", "utf8");

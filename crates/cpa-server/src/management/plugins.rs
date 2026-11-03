@@ -728,14 +728,26 @@ pub(crate) async fn delete(State(state): State<Arc<Management>>, UrlPath(raw): U
     }
     let mut file_deleted = false;
     if !path.is_empty() {
-        match std::fs::remove_file(&path) {
-            Ok(()) => file_deleted = true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
+        // Off the runtime workers, as the save below.
+        let removed = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || std::fs::remove_file(&path)).await
+        };
+        match removed {
+            Ok(Ok(())) => file_deleted = true,
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(Err(e)) => {
                 return error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "plugin_delete_failed",
                     &e.to_string(),
+                );
+            }
+            Err(_) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "plugin_delete_failed",
+                    "internal error",
                 );
             }
         }

@@ -171,13 +171,13 @@ Each sign-in creates a file in `auth-dir`. Routing chooses among ready credentia
 
 ## CLIProxyAPI compatibility
 
-Config and protocol tests check compatibility with Go CLIProxyAPI at `6fecc6e`. The bundled dashboard has tests against both servers. No third-party CLIProxyAPI app has been tested with cliproxy-rs yet.
+The compatibility target is Go CLIProxyAPI v8.0.35 (`ae3ee3be`); config and protocol tests check it against fixtures recorded from the Go server. The bundled dashboard has tests against both servers. No third-party CLIProxyAPI app has been tested with cliproxy-rs yet.
 
 Before switching, read [MIGRATING-FROM-GO.md](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/MIGRATING-FROM-GO.md), especially the refresh-token warning. The default Docker image expects `/data/config.yaml` and runs as UID/GID 10001. Update mounts and permissions, or override `--config` and set an accessible `oauth.auth-dir` to keep existing paths.
 
 ## Terminal UI
 
-`cliproxy -tui` manages a running server. It uses `-management-base-url`, then `management.base-url`, then `http://127.0.0.1:<port>`, and asks for the management key. `cliproxy -tui -standalone` starts the server in the same process and stops it when you quit. Standalone mode needs a loopback or wildcard `host` and no `server.tls`.
+`cliproxy -tui` manages a running server. It uses `-management-base-url`, then `management.base-url`, then `http://127.0.0.1:<port>`, and asks for the management key. `cliproxy -tui -standalone` starts the server in the same process with a random local management password, so it needs no management key, and stops the server when you quit; `-password` sets that password instead, and because the value shows in process listings the server logs a warning. Standalone mode needs a loopback or wildcard `host` and no `server.tls`.
 
 ## Upcoming features
 
@@ -215,7 +215,7 @@ Go was faster in the 0.1.0 launch build's synthetic runs. It served 1,568 non-st
 
 The dashboard is built into the binary. Model catalogs are downloaded at start and every three hours; `--local-model` turns that off.
 
-Keep `access.api-keys` set and `server.host` on `127.0.0.1` unless your other machines need access. Behind a local tunnel or reverse proxy, set `server.trusted-proxies`; otherwise internet clients count as local. [Running it safely](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/GETTING-STARTED.md#running-it-safely) explains this. [SECURITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/SECURITY.md) covers vulnerability reports.
+Keep `access.api-keys` set and `server.host` on `127.0.0.1` unless your other machines need access. Behind a local tunnel or reverse proxy, set `server.trusted-proxies`; until then the server treats the requests the proxy relays as remote, so with `allow-remote: false` the dashboard refuses them, and five wrong keys from any client through the proxy block `127.0.0.1` for everyone. [Running it safely](https://github.com/vayungodara/cliproxy-rs/blob/master/docs/GETTING-STARTED.md#running-it-safely) explains this. [SECURITY.md](https://github.com/vayungodara/cliproxy-rs/blob/master/SECURITY.md) covers vulnerability reports.
 
 ## Development
 

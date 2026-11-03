@@ -2,7 +2,7 @@
 
 cliproxy-rs reads one YAML file, `config.yaml`. Pass its path with `--config`; without it, the server reads `config.yaml` in the current directory. It accepts CLIProxyAPI's v8 layout (shown here) and the older flat layout, and every setting in CLIProxyAPI's [`config.example.yaml`](https://github.com/router-for-me/CLIProxyAPI/blob/6fecc6e5567912661654a4eaf9b8f5436facd1c2/config.example.yaml) is accepted. Settings for features that are not ported yet are kept in the file but have no effect.
 
-The server watches the file and applies most changes within a second, without a restart. `server.host`, `server.port`, `server.tls` and `server.trusted-proxies` are read at start, so restart after changing them. When the dashboard or the Management API changes a setting, only that key is rewritten; the rest of the file, comments included, stays as it was. The first such save of a file in an older layout moves its settings to the current layout, with their comments, and writes Windows (CRLF) line endings as LF. Saves through the older `/v0/management` setting endpoints are the exception: as in CLIProxyAPI, they keep a file that has no current-layout sections in its older layout. When the file uses YAML that cannot be moved line by line, such as anchors, that save writes the file again from its values: the comments at the top are kept, and other comments may be lost.
+The server watches the file and applies most changes within a second, without a restart. `server.host`, `server.port`, `server.tls` and `server.trusted-proxies` are read at start, so restart after changing them. When the dashboard or the Management API changes a setting, only that key is rewritten; the rest of the file, comments included, stays as it was. The file is replaced through a synced temporary file in the same directory and a rename, keeping its mode (0600 for a new file) and owner, so an interrupted save leaves the previous file intact; CLIProxyAPI writes in place. The first such save of a file in an older layout moves its settings to the current layout, with their comments, and writes Windows (CRLF) line endings as LF. Saves through the older `/v0/management` setting endpoints are the exception: as in CLIProxyAPI, they keep a file that has no current-layout sections in its older layout. When the file uses YAML that cannot be moved line by line, such as anchors, that save writes the file again from its values: the comments at the top are kept, and other comments may be lost.
 
 ## A complete small example
 
@@ -37,7 +37,9 @@ observability:
 | `tls.enable`, `tls.cert`, `tls.key` | Serve HTTPS on the same port with this certificate and key file. |
 | `max-request-body-bytes` | The largest request body accepted, in bytes; `0` (the default) or a negative value sets no limit. A larger body gets `413` before it is processed: on the client routes, the Management API and plugin routes. As in Go, a streamed body whose JSON value or multipart form ends before the limit is handled from the bytes before it. Changes apply to the next request. The client routes also stop at 64 MiB whatever this says. The older top-level `max-request-body-bytes` also works; the one under `server` wins. |
 | `github-token` | A GitHub token. CLIProxyAPI sends it to the GitHub API ahead of the `GITHUB_TOKEN` environment variable: on its release checks, its panel downloads and plugin store requests that no `plugins.store-auth` rule covers. cliproxy-rs keeps the setting but sends it nowhere yet: its release check sends no token, its dashboard is built in, and the plugin store use is upcoming. Management API config reads show it, as in CLIProxyAPI. The older top-level `github-token` also works; the one under `server` wins. |
-| `trusted-proxies` | Addresses of reverse proxies or tunnels whose `X-Forwarded-For` header is trusted. Set it when a tunnel on the same machine forwards requests, for example `[127.0.0.1, "::1"]`. See [running it safely](GETTING-STARTED.md#running-it-safely). |
+| `trusted-proxies` | Addresses or CIDR ranges of reverse proxies or tunnels whose `X-Forwarded-For` or `X-Real-IP` header gives the client address; read at start. Set it when a tunnel on the same machine forwards requests, for example `[127.0.0.1, "::1"]`, and restart. A request from a loopback address not listed here that carries `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `CF-Connecting-IP` is relayed by an unlisted proxy, and the management routes treat it as remote. See [running it safely](GETTING-STARTED.md#running-it-safely). |
+
+An HTTP/1 connection must deliver each request's complete header block within 30 seconds, and a keep-alive connection that sends nothing for 30 seconds is closed. CLIProxyAPI sets no such timeouts.
 
 ## access
 
@@ -50,8 +52,10 @@ observability:
 | Setting | What it does |
 |---|---|
 | `secret-key` | The dashboard and Management API password. A plaintext value is replaced by its bcrypt hash on first start. The `MANAGEMENT_PASSWORD` environment variable works too. When neither is set, the management API is off. |
-| `allow-remote` | `false` (the default) accepts management requests from this computer only. |
+| `allow-remote` | `false` (the default) accepts management requests from this computer only: from `127.0.0.1` or `::1` after `server.trusted-proxies` resolution, and not through an unlisted proxy. A set `MANAGEMENT_PASSWORD` also allows remote requests. |
 | `disable-control-panel` | `true` stops serving the dashboard at `/management.html`; the Management API keeps working. |
+
+Five wrong keys from one address block it for 30 minutes. A request that presents no key is answered `401` but not counted, so a web page you visit cannot ban your own address; CLIProxyAPI counts it. The `-password` flag sets a local management password accepted from this computer only; it is visible in process listings, so the server logs a warning, and `MANAGEMENT_PASSWORD` is the better choice. A `secret-key` changed in the file takes effect without a restart.
 
 ## oauth
 
@@ -152,15 +156,22 @@ Claude accounts ignore `HTTPS_PROXY` and `HTTP_PROXY`. Without an explicit proxy
 
 | Setting | What it does |
 |---|---|
-| `logs.logging-to-file` | `true` writes the log to `main.log` in a `logs` folder, rotated, instead of standard output. |
+| `logs.logging-to-file` | `true` writes the log to `main.log` in the log directory (below), rotated, instead of standard output. |
 | `logs.logs-max-total-size-mb` | The most disk space the log files may use. |
-| `logs.request-log` | `true` writes one file per request with client and upstream request/response sections. Recognised sensitive headers and URL fields are masked, but bodies can contain credentials, including Realtime client secrets, as well as private prompts and output. Keep the logs private. |
+| `logs.debug` | `true` lowers the log level from `info` to `debug`, without a restart. A set `RUST_LOG` replaces this switch with its own filter. |
+| `logs.request-log` | `true` writes one file per request with client and upstream request/response sections. Recognised sensitive headers and URL fields are masked, but bodies can contain credentials, including Realtime client secrets, as well as private prompts and output. Keep the logs private. The files are named `<route>-<time>-<id>.log`, with `error-` first for a failed request, and created with mode 0600 on Unix (CLIProxyAPI creates them 0644). Capture reads at most 64 MiB of a request body and answers a larger one with `413`. The dashboard's Logs page opens a request's file by its request id, through `GET /v8/management/observability/logs/requests/<id>`, which matches the id's last eight characters. |
+| `usage.usage-statistics-enabled` | `false` by default. `true` keeps a usage record per request in a short in-memory queue for the dashboard's usage views and `GET /v8/management/observability/usage/queue`, as in CLIProxyAPI; management must be enabled. `usage.redis-usage-queue-retention-seconds` sets how long a record waits to be read: 60 by default, at most 3600. |
 | `usage.claude-cache-telemetry` | A cliproxy-rs addition, `false` by default. With `usage.usage-statistics-enabled: true` and management enabled, adds content-free final-wire Claude cache observations to the existing usage queue and RESP channel. No tokenizer or maintenance requests run. Hashes rotate on restart; additional records without returned usage have `usage_observed: false`. Large payloads add parsing and hashing work before upstream send. See [Claude cache telemetry](CLAUDE-CACHE-TELEMETRY.md). Go ignores the setting at startup, preserves it on v0 saves, and archives it on v8 edits. |
-| `pprof.enable` | `false` by default. `true` starts a separate plain-HTTP debug listener, without API keys, management authentication or TLS. Keep it on loopback: its command-line route can expose arguments, and profiling consumes CPU. Changes apply without a restart. |
+| `pprof.enable` | `false` by default. `true` starts a separate plain-HTTP debug listener, without API keys, management authentication or TLS. Keep it on loopback: its command-line route exposes the process arguments, and profiling consumes CPU; the server logs a warning when the listener is reachable beyond loopback. Changes apply without a restart. |
 | `pprof.addr` | The debug listener address, `"127.0.0.1:8316"` by default, also used for an empty or whitespace-only value. Changes move the listener without a restart. A bind failure is logged without stopping the main server; another config publication retries it. |
 
+The log directory is `logs` under `WRITABLE_PATH` when that variable is set, else `logs`
+in the working directory when it exists and is writable, else `logs` under
+`oauth.auth-dir`, as in CLIProxyAPI.
+
 The legacy top-level `pprof` mapping works too. `/debug/pprof/` lists the routes;
-`cmdline` returns NUL-separated arguments and `symbol` accepts program counters in
+`cmdline` returns NUL-separated arguments, with the values of `-password` and
+`-home-jwt` replaced by `[REDACTED]`, and `symbol` accepts program counters in
 the raw query or a POST body, separated by `+`. Go runtime profiles return plain-text
 `501` answers. CPU `profile?seconds=30` requires a Unix build with
 `cargo build --release -p cliproxy --features cpa-server/pprof` and returns a pprof
@@ -179,7 +190,7 @@ service-name ports such as `:http` are not accepted.
 
 | Setting | What it does |
 |---|---|
-| `catalog`, `codex-catalog`, `devin-catalog` | Where the model catalog (`models.json`), the Codex client catalog and the Devin catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. cliproxy-rs checks and keeps these settings but does not use them yet; see [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md). |
+| `catalog`, `codex-catalog`, `devin-catalog` | Where the model catalog (`models.json`), the Codex client catalog and the Devin catalog come from: an absolute local path or an `http`/`https` URL. Empty keeps the default. Any other value, such as a relative path, `~/models.json` or a `file://` URL, refuses the config, as in CLIProxyAPI v8.0.35. Each source is read at start and every three hours: a URL is fetched and an absolute path read from disk, at most 8 MiB, and the data must validate before it replaces the running catalog; a failed refresh keeps the last valid one. With `--local-model`, an empty source means the embedded catalog and nothing is fetched for it, while a source set here is still read, as in CLIProxyAPI. In Home mode `catalog` and `devin-catalog` are off and `codex-catalog` follows the setting. |
 
 ## worker-threads
 
@@ -195,4 +206,4 @@ This setting exists only in cliproxy-rs. CLIProxyAPI starts with it in the file 
 - `TOKIO_WORKER_THREADS`: the number of request threads, instead of `worker-threads`.
 - `RUST_LOG`: overrides the log level, for example `RUST_LOG=debug`.
 - A `.env` file in the working directory is loaded at start, as in CLIProxyAPI.
-- `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI. When the store has no config yet, the local one (or `config.example.yaml`) seeds it after a plaintext management key is replaced with its bcrypt hash and legacy settings that a v8 setting overrides are removed. A file in which the key's value would still appear as another setting's value, for example through a YAML anchor, is refused and the server does not start; comments and keys are not checked.
+- `PGSTORE_*`, `OBJECTSTORE_*` and `GITSTORE_*` keep the config and the account files in PostgreSQL, an S3-compatible bucket or a git repository, as in CLIProxyAPI, with bounds CLIProxyAPI does not set: the PostgreSQL store connects within 10 s unless the DSN or `PGCONNECT_TIMEOUT` says otherwise, gives each job 60 s and queues at most 256 jobs, and each git subprocess of the git store is killed after 120 s. When the store has no config yet, the local one (or `config.example.yaml`) seeds it after a plaintext management key is replaced with its bcrypt hash and legacy settings that a v8 setting overrides are removed. A file in which the key's value would still appear as another setting's value, for example through a YAML anchor, is refused and the server does not start; comments and keys are not checked.

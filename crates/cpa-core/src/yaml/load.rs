@@ -20,9 +20,12 @@
 //!   string-keyed map). An integer key past 64 bits is a float when decimal and text
 //!   otherwise, as yaml.v3 resolves it.
 //! - `<<` stays a key; [`crate::config::expand_merges`] applies merges.
-//! - Aliases are copied. Two keys with the same text are an error, as in yaml.v3, and so
-//!   are two that resolve to the same key (yaml.v3 keeps the second; refused so a
-//!   mapping keeps one entry per key event, which `config::binary` relies on).
+//! - Aliases are copied, within yaml.v3's bound on their expansion ([`Decodes`]). Two
+//!   keys with the same text are an error, as in yaml.v3, and so are two that resolve
+//!   to the same key (yaml.v3 keeps the second; refused so a mapping keeps one entry
+//!   per key event, which `config::binary` relies on).
+//! - A NEL (U+0085) is a line break, as libyaml reads it. U+2028 and U+2029, which
+//!   libyaml also breaks at, are refused (docs/DIFFERENCES-FROM-GO.md).
 //! - [`from_str`] reads the first document, as `yaml.Unmarshal` does; [`from_str_multi`]
 //!   reads them all, as a `yaml.Decoder` does.
 
@@ -38,10 +41,13 @@ use super::{Error, Mapping, Tag, TaggedValue, Value, ng};
 /// ponytail: yaml.v3 allows 10 000 flow levels; [`Value`]'s recursive drop, equality
 /// and serde impls cap it here. Raise it once those walk iteratively.
 pub(crate) const MAX_DEPTH: usize = 512;
-/// Nodes a document may hold once its aliases are copied out (yaml.v3 refuses
-/// "excessive aliasing" by a ratio of alias copies to nodes).
-/// ponytail: a fixed memory bound; yaml.v3's ratio would refuse earlier.
-const MAX_NODES: usize = 1 << 24;
+/// Alias-produced nodes a document may hold, checked as each alias is consumed: a hard
+/// ceiling under yaml.v3's ratio rule ([`Decodes`]), which on its own allows about
+/// 1.2 million of them in a document of 2 million nodes. The same bound as
+/// `config::binary` puts on the copies it keeps.
+const MAX_ALIAS_NODES: usize = 1 << 20;
+/// The refusal of a document holding U+2028 or U+2029 (see [`compose`]).
+pub(crate) const LINE_SEPARATORS: &str = "yaml: the line separators U+2028 and U+2029 are not supported";
 
 const TIMESTAMP_TAG: &str = crate::config::TIMESTAMP_TAG;
 
@@ -131,10 +137,9 @@ impl Node {
 /// What a node costs once its aliases are copied out.
 #[derive(Clone, Copy, Default)]
 struct Size {
-    /// Nodes, alias copies included.
+    /// Nodes, alias copies included: the decodes yaml.v3's `unmarshal` makes for the
+    /// node (an alias is one decode plus its anchor's).
     nodes: usize,
-    /// Alias uses, those inside alias copies included (serde_yaml_ng's `jumpcount`).
-    jumps: usize,
     /// Levels from this node down to its deepest scalar, alias copies included, so an
     /// alias cannot compose a tree deeper than [`MAX_DEPTH`] out of shallow syntax (the
     /// walkers over the composed tree recurse once per level).
@@ -145,8 +150,53 @@ impl std::ops::AddAssign for Size {
     /// Adds a child: `other` is the child's size, one level below.
     fn add_assign(&mut self, other: Size) {
         self.nodes = self.nodes.saturating_add(other.nodes);
-        self.jumps = self.jumps.saturating_add(other.jumps);
         self.depth = self.depth.max(other.depth.saturating_add(1));
+    }
+}
+
+/// yaml.v3's running count of a document's decodes (decode.go `decoder.unmarshal`) and
+/// its refusal of excessive aliasing: once more than 100 decodes were made inside an
+/// alias and more than 1,000 in all, their share may not pass [`allowed_alias_ratio`].
+/// yaml.v3 checks at every node; checking at every scalar, collection start and whole
+/// alias copy refuses the same documents, since within one copy the share only rises
+/// and the allowance only falls. Refusing at the alias, as yaml.v3 does while decoding,
+/// keeps a 5 KB document from composing millions of values before any limit applies.
+#[derive(Default)]
+struct Decodes {
+    /// Decodes so far, alias copies included.
+    total: usize,
+    /// Of those, the ones made inside an alias: the anchor's nodes, nested copies
+    /// included, each time an alias copies it.
+    copies: usize,
+}
+
+impl Decodes {
+    /// `nodes` more decodes, `copies` of them inside an alias.
+    fn add(&mut self, nodes: usize, copies: usize) -> Result<(), Error> {
+        self.total = self.total.saturating_add(nodes);
+        self.copies = self.copies.saturating_add(copies);
+        let excessive = self.copies > 100
+            && self.total > 1000
+            && self.copies as f64 / self.total as f64 > allowed_alias_ratio(self.total);
+        if excessive || self.copies > MAX_ALIAS_NODES {
+            return Err(Error::msg("yaml: document contains excessive aliasing"));
+        }
+        Ok(())
+    }
+}
+
+/// yaml.v3's `allowedAliasRatio`: the share of decodes aliases may produce, 99% up to
+/// 400,000 decodes, falling evenly to 10% at 4,000,000 (about 400,000 alias decodes
+/// over that range) and 10% beyond.
+fn allowed_alias_ratio(decodes: usize) -> f64 {
+    const LOW: usize = 400_000;
+    const HIGH: usize = 4_000_000;
+    if decodes <= LOW {
+        0.99
+    } else if decodes >= HIGH {
+        0.10
+    } else {
+        0.99 - 0.89 * ((decodes - LOW) as f64 / (HIGH - LOW) as f64)
     }
 }
 
@@ -176,30 +226,33 @@ impl Frame {
 /// The documents of `text` (the first only, when `first_only`, as `yaml.Unmarshal`
 /// reads it without parsing further).
 pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Error> {
+    // libyaml, and so yaml.v3, end a line at U+2028 and U+2029 too; granit-parser reads
+    // them as content, and replacing them (three bytes each) would move every later
+    // byte offset that `config::binary` maps back to the file. Refused instead.
+    if text.contains(['\u{2028}', '\u{2029}']) {
+        return Err(Error::msg(LINE_SEPARATORS));
+    }
     let text = nel_as_crlf(text);
     let mut docs = Vec::new();
     let mut stack: Vec<Frame> = Vec::new();
     // Each anchor id's finished node and its size.
     let mut anchors: HashMap<usize, (Rc<Node>, Size)> = HashMap::new();
     let mut root: Option<(Rc<Node>, Size)> = None;
-    let mut events = 0usize;
+    let mut decodes = Decodes::default();
     for event in parser(&text) {
         let (event, _span) = event.map_err(|e| Error::msg(format!("yaml: {e}")))?;
-        events += 1;
         // A finished node, its anchor and its size.
         let done: Option<(Rc<Node>, usize, Size)> = match event {
             Event::StreamStart | Event::StreamEnd => None,
             Event::DocumentStart(..) => {
                 anchors.clear();
                 root = None;
+                // The document node is yaml.v3's first decode.
+                decodes = Decodes { total: 1, copies: 0 };
                 None
             }
             Event::DocumentEnd => {
-                let (node, size) = root.take().unwrap_or_else(|| (Rc::new(Node::empty()), Size::default()));
-                // serde_yaml_ng's bound on alias uses, and a bound on the copies they make.
-                if size.jumps > events.saturating_mul(100) || size.nodes > MAX_NODES {
-                    return Err(Error::msg("yaml: document contains excessive aliasing"));
-                }
+                let (node, _) = root.take().unwrap_or_else(|| (Rc::new(Node::empty()), Size::default()));
                 docs.push(node);
                 if first_only {
                     break;
@@ -219,45 +272,37 @@ pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Err
                     plain: style == ScalarStyle::Plain,
                     tag: tag.map(|t| format!("{}{}", t.handle(), t.suffix())),
                 };
-                Some((
-                    Rc::new(Node::Scalar(scalar)),
-                    anchor,
-                    Size {
-                        nodes: 1,
-                        jumps: 0,
-                        depth: 1,
-                    },
-                ))
+                decodes.add(1, 0)?;
+                Some((Rc::new(Node::Scalar(scalar)), anchor, Size { nodes: 1, depth: 1 }))
             }
             Event::Alias(id) => {
-                let (node, size) = anchors
+                let (node, anchored) = anchors
                     .get(&id)
                     .ok_or_else(|| Error::msg("yaml: anchor value contains itself"))?;
-                let mut size = *size;
-                size.jumps = size.jumps.saturating_add(1);
+                // yaml.v3 decodes the alias node, then its anchor's nodes again, every one
+                // of those inside the alias (decode.go `alias`, `unmarshal`).
+                let size = Size {
+                    nodes: anchored.nodes.saturating_add(1),
+                    depth: anchored.depth,
+                };
+                decodes.add(size.nodes, anchored.nodes)?;
                 Some((node.clone(), 0, size))
             }
             Event::SequenceStart(_, anchor, _) => {
+                decodes.add(1, 0)?;
                 stack.push(Frame::Sequence {
                     items: Vec::new(),
                     anchor,
-                    size: Size {
-                        nodes: 1,
-                        jumps: 0,
-                        depth: 1,
-                    },
+                    size: Size { nodes: 1, depth: 1 },
                 });
                 None
             }
             Event::MappingStart(_, anchor, _) => {
+                decodes.add(1, 0)?;
                 stack.push(Frame::Mapping {
                     entries: Vec::new(),
                     anchor,
-                    size: Size {
-                        nodes: 1,
-                        jumps: 0,
-                        depth: 1,
-                    },
+                    size: Size { nodes: 1, depth: 1 },
                     key: None,
                     texts: HashSet::new(),
                 });
@@ -309,9 +354,11 @@ pub(crate) fn compose(text: &str, first_only: bool) -> Result<Vec<Rc<Node>>, Err
     Ok(docs)
 }
 
-/// `text` with each NEL (U+0085) as CRLF, which is as long. libyaml, which yaml.v3 is
-/// a port of, reads a NEL as a line break and as LF in content; granit-parser follows
-/// YAML 1.2, where it is an ordinary character.
+/// `text` with each NEL (U+0085) as CRLF, which is as long, so byte offsets into the
+/// result are offsets into `text`. libyaml, which yaml.v3 is a port of, reads a NEL as a
+/// line break and as LF in content; granit-parser follows YAML 1.2, where it is an
+/// ordinary character. U+2028 and U+2029 have no replacement of their length, so
+/// [`compose`] refuses them.
 pub(crate) fn nel_as_crlf(text: &str) -> Cow<'_, str> {
     if text.contains('\u{85}') {
         Cow::Owned(text.replace('\u{85}', "\r\n"))
@@ -997,5 +1044,76 @@ b: {}
             ));
         }
         assert!(from_str(&chain).is_err(), "a 601-level alias chain");
+    }
+
+    /// yaml.v3's bound on alias expansion (decode.go `allowedAliasRatio`): a 5 KB
+    /// document whose aliases would copy out 16 million nodes is refused at the first
+    /// alias that takes alias-produced decodes past 99% of all decodes, before any
+    /// value is built; a document under that line loads however many aliases it has.
+    #[test]
+    fn alias_expansion_is_bounded_as_in_yaml_v3() {
+        let list = |n: usize| (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let aliases = |name: &str, n: usize| vec![format!("*{name}"); n].join(", ");
+        let thousand = list(1000);
+        // `a` is 1,001 nodes; each `*a` copies them and is one decode itself.
+        let bomb = format!(
+            "a: &a [{thousand}]\nb: &b [{}]\nc: [{}]\n",
+            aliases("a", 100),
+            aliases("b", 160)
+        );
+        assert!(bomb.len() < 6 * 1024, "{}", bomb.len());
+        let err = compose(&bomb, true).err().expect("refused");
+        assert_eq!(err.to_string(), "yaml: document contains excessive aliasing");
+        // Without `c`: 100,100 alias decodes of 101,206, under the 99% line, as in Go.
+        let under = format!("a: &a [{thousand}]\nb: &b [{}]\n", aliases("a", 100));
+        assert_eq!(from_str(&under).unwrap()["b"][99][999], Value::from(999));
+        // Ordinary use: a dozen aliases of a 50-item list, under 1,000 decodes.
+        let fifty = list(50);
+        let ordinary = format!(
+            "base: &b [{fifty}]\n{}",
+            (0..12).map(|i| format!("k{i}: *b\n")).collect::<String>()
+        );
+        assert_eq!(from_str(&ordinary).unwrap()["k11"][49], Value::from(49));
+        // The same aliases past 1,000 decodes: 612 alias decodes of about 1,700.
+        let padded = format!("pad: [{thousand}]\n{ordinary}");
+        assert_eq!(from_str(&padded).unwrap()["k11"][49], Value::from(49));
+    }
+
+    /// The hard ceiling on alias-produced nodes, under the ratio: 600,000 padding
+    /// numbers let yaml.v3's rule accept 1,048 copies of a 1,001-node list (a 64% share
+    /// where 68% is allowed), and the ceiling refuses them; 1,040 copies compose.
+    #[test]
+    fn alias_copies_have_a_hard_ceiling() {
+        let padding = vec!["0"; 600_000].join(", ");
+        let thousand = (0..1000).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let doc = |n: usize| {
+            format!(
+                "pad: [{padding}]\na: &a [{thousand}]\nb: [{}]\n",
+                vec!["*a"; n].join(", ")
+            )
+        };
+        assert!(compose(&doc(1040), true).is_ok(), "1,041,040 alias-produced nodes");
+        let err = compose(&doc(1048), true).err().expect("refused");
+        assert_eq!(err.to_string(), "yaml: document contains excessive aliasing");
+    }
+
+    /// libyaml and yaml.v3 end a line at U+2028 and U+2029; granit-parser does not, and
+    /// replacing them would move the byte offsets `config::binary` relies on, so a
+    /// document holding one is refused (docs/DIFFERENCES-FROM-GO.md). A NEL stays a line
+    /// break, and the escapes `\L` and `\P` still put the characters in a string.
+    #[test]
+    fn unicode_line_separators_are_refused() {
+        for separator in ['\u{2028}', '\u{2029}'] {
+            for text in [
+                format!("a: 1 #{separator}b: 2\n"),
+                format!("a: x{separator}b\n"),
+                format!("a: \"x{separator}y\"\n"),
+            ] {
+                let err = from_str(&text).unwrap_err();
+                assert_eq!(err.to_string(), LINE_SEPARATORS, "{text:?}");
+            }
+        }
+        assert_eq!(untyped("a: 1\u{85}b: 2\n")["b"], Value::from(2));
+        assert_eq!(untyped("a: \"x\\Ly\\Pz\"\n")["a"], Value::from("x\u{2028}y\u{2029}z"));
     }
 }

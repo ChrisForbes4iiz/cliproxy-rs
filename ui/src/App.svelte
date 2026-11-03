@@ -124,8 +124,9 @@
         >
       </div>
       <p class="small muted">
-        Use <code>management.secret-key</code> from the server’s config.yaml. It stays in this tab’s memory only; reloading
-        signs you out.
+        Use the management key: with the install script, the <code>CLIPROXY_MANAGEMENT_KEY</code> line in <code>keys.env</code>
+        next to the server’s config.yaml, which keeps only a hash of the key after the first start. It stays in this tab’s
+        memory only; reloading signs you out.
       </p>
     </form>
   </main>

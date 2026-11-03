@@ -1352,3 +1352,72 @@ payload:
     assert_eq!(gj::get(&first, "input.#").int(), 1, "{text}");
     assert_eq!(gj::get(&first, "type").str(), "response.create", "{text}");
 }
+
+/// An upstream event nested as deep as the parser accepts (10,000 levels) has its IDs
+/// rewritten on the default test stack: the rewrite walks on a heap stack, not one native
+/// frame per level.
+#[test]
+fn id_rewrite_survives_a_10000_level_event() {
+    let depth = 9_998;
+    let payload = format!(
+        r#"{{"id":"resp_up-1","nested":{}{{"item_id":"resp_up-1_item"}}{}}}"#,
+        "[".repeat(depth),
+        "]".repeat(depth)
+    );
+    assert!(
+        GoValue::parse(payload.as_bytes()).is_some(),
+        "within encoding/json's limit"
+    );
+    let out = rewrite_ids(payload.clone().into_bytes(), "resp_up-1", "resp_down-1", "", "");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.starts_with(r#"{"id":"resp_down-1","nested":"#), "{}", &text[..64]);
+    assert!(
+        text.contains(r#"{"item_id":"resp_down-1_item"}"#),
+        "the deepest object too"
+    );
+    assert_eq!(
+        rewrite_ids(payload.clone().into_bytes(), "resp_up-1", "resp_up-1", "", ""),
+        payload.into_bytes(),
+        "unchanged ids keep the payload bytes"
+    );
+}
+
+/// A rejected upgrade's body reaches the error (and the request log) cut to 1 KiB, as
+/// gorilla's dialer keeps at most 1024 bytes of it.
+#[tokio::test]
+async fn rejected_upgrade_bodies_are_cut_to_1_kib() {
+    let app = axum::Router::new().fallback(|| async {
+        (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "text/plain")],
+            "x".repeat(5000),
+        )
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let attrs =
+        serde_json::json!({"base_url": "http://UPSTREAM/v1", "websockets": "true", "access_token": "xai-token"});
+    let credential = credential("xai-reject-body", &attrs, &addr);
+    let executor = XaiExecutor::with_client(wreq::Client::new());
+    let turn = serde_json::json!({"payload": r#"{"model":"grok-4.3","input":"hello"}"#});
+    let session = ExecSession {
+        id: "sess-reject-body".into(),
+        continuation: false,
+        lease: None,
+    };
+    let error = executor
+        .execute_in_session(
+            &credential,
+            request(&turn, "sess-reject-body", Default::default()),
+            &Config::default(),
+            &session,
+        )
+        .await
+        .err()
+        .expect("rejected upgrade");
+    assert_eq!(error.status, 503);
+    assert_eq!(error.body.len(), 1024, "{}", error.body.len());
+    assert!(error.body.iter().all(|&b| b == b'x'));
+    server.abort();
+}

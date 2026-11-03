@@ -722,6 +722,261 @@ fn an_option_like_remote_default_branch_is_refused() {
     assert_eq!(head_branch(&ws), "master");
 }
 
+/// cliproxy-rs-zlj.8: a remote whose history gained a tree entry named `.git` is refused
+/// by the fetch's fsck (`hasDotgit` raised to an error) instead of warning and relying on
+/// `safe_tree_path` alone.
+#[test]
+fn a_fetch_bringing_a_dotgit_tree_entry_is_refused() {
+    let root = scratch("fsck-dotgit");
+    let remote = setup_remote(&root, "master", &[("master", "remote master branch\n")]);
+    let a = store(&remote, "", &root.join("workspace-a"));
+    a.ensure_repository().unwrap();
+    // Built in another workspace, so the fetch has to transfer the objects.
+    let owner_ws = root.join("owner");
+    let owner = store(&remote, "", &owner_ws);
+    owner.ensure_repository().unwrap();
+    let commit = hostile_commit(&owner_ws);
+    git(
+        &owner_ws,
+        &["push", "-q", "-f", "origin", &format!("{commit}:refs/heads/master")],
+    );
+    let error = format!("{:#}", a.ensure_repository().unwrap_err());
+    assert!(error.contains("pull"), "{error}");
+    assert!(error.contains("hasDotgit"), "{error}");
+    assert!(!root.join("workspace-a/.git/evil").exists());
+    assert!(
+        !root.join("workspace-a/safe.txt").exists(),
+        "nothing of the refused tip lands"
+    );
+}
+
+/// The requests a mock HTTP server saw: `(request target, Authorization header value)`.
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
+
+/// A loopback HTTP server standing in for a git remote: `(base URL, requests seen)`.
+/// `respond(own base URL, target, Authorization)` gives `(status line, extra header
+/// lines, body)`; every response closes the connection.
+fn mock_http(
+    respond: impl Fn(&str, &str, Option<&str>) -> (&'static str, String, String) + Send + 'static,
+) -> (String, Seen) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let seen: Seen = Default::default();
+    let served = seen.clone();
+    let own = base.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let Ok(n) = stream.read(&mut buf) else { break };
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..n]);
+            }
+            let text = String::from_utf8_lossy(&head).into_owned();
+            let target = text.split_whitespace().nth(1).unwrap_or_default().to_owned();
+            let authorization = text
+                .lines()
+                .find_map(|line| line.strip_prefix("Authorization: "))
+                .map(|value| value.trim_end().to_owned());
+            served.lock().unwrap().push((target.clone(), authorization.clone()));
+            let (status, headers, body) = respond(&own, &target, authorization.as_deref());
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (base, seen)
+}
+
+const MOCK_HASH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// A dumb-HTTP remote under `/tokens.git/` (`info/refs` is a plain list, so no pack is
+/// needed) that challenges every request without the `expected` Basic credential; a
+/// `/tokens/...` target (the remote written without its `.git` suffix) redirects to
+/// `redirect_base/tokens.git/...`.
+fn dumb_remote(
+    redirect_base: &str,
+    target: &str,
+    authorization: Option<&str>,
+    expected: &str,
+) -> (&'static str, String, String) {
+    if let Some(rest) = target.strip_prefix("/tokens/") {
+        return (
+            "301 Moved Permanently",
+            format!("Location: {redirect_base}/tokens.git/{rest}\r\n"),
+            String::new(),
+        );
+    }
+    if authorization != Some(expected) {
+        return (
+            "401 Unauthorized",
+            "WWW-Authenticate: Basic realm=\"tokens\"\r\n".to_owned(),
+            String::new(),
+        );
+    }
+    if target.starts_with("/tokens.git/info/refs") {
+        (
+            "200 OK",
+            "Content-Type: text/plain\r\n".to_owned(),
+            format!("{MOCK_HASH}\trefs/heads/main\n"),
+        )
+    } else if target == "/tokens.git/HEAD" {
+        (
+            "200 OK",
+            "Content-Type: text/plain\r\n".to_owned(),
+            "ref: refs/heads/main\n".to_owned(),
+        )
+    } else {
+        ("404 Not Found", String::new(), String::new())
+    }
+}
+
+/// The Basic credential git derives from user `git` and `secret-token`.
+fn expected_basic() -> String {
+    use base64::Engine;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("git:secret-token")
+    )
+}
+
+/// cliproxy-rs-zlj.2: with a token configured, a same-host redirect (a GitLab remote
+/// written without its `.git` suffix) is followed on the first request, the later
+/// requests go to the URL it landed on, and the credential arrives there as Basic auth
+/// once that host has challenged. `http.followRedirects=false` refused the redirect.
+#[test]
+fn a_same_host_redirect_is_followed_with_the_token() {
+    let root = scratch("redirect");
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    let expected = expected_basic();
+    let (base, seen) = {
+        let expected = expected.clone();
+        mock_http(move |own, target, authorization| dumb_remote(own, target, authorization, &expected))
+    };
+    let url = format!("{base}/tokens");
+    let s = GitStore::new(&url, "", "secret-token", "", &ws);
+    let listed = s.run_in(&ws, &["ls-remote", "--", &url]).unwrap();
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    let out = String::from_utf8_lossy(&listed.stdout);
+    assert!(out.contains(&format!("{MOCK_HASH}\trefs/heads/main")), "{out}");
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() >= 2, "{seen:?}");
+    assert!(
+        seen[0].0.starts_with("/tokens/info/refs") && seen[0].1.is_none(),
+        "the first request carries no credential before a challenge: {seen:?}"
+    );
+    assert!(
+        seen[1..].iter().all(|(target, _)| target.starts_with("/tokens.git/")),
+        "later requests go to the URL the redirect landed on: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|(target, auth)| target.starts_with("/tokens.git/info/refs") && auth.as_deref() == Some(&*expected)),
+        "the credential arrives at the rebased same-host URL: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|(_, auth)| auth.is_none() || auth.as_deref() == Some(&*expected)),
+        "{seen:?}"
+    );
+}
+
+/// cliproxy-rs-zlj.2: the credential is scoped to the configured remote's host and port,
+/// so a first request redirected to another host leaves that host without any
+/// Authorization header; git has nothing to offer it and the command fails there.
+#[test]
+fn a_cross_host_redirect_gets_no_credential() {
+    let root = scratch("cross-redirect");
+    let ws = root.join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    let expected = expected_basic();
+    // The host the redirect lands on: another loopback port, which is another host to
+    // git's credential matching.
+    let (other, other_seen) = {
+        let expected = expected.clone();
+        mock_http(move |own, target, authorization| dumb_remote(own, target, authorization, &expected))
+    };
+    // The configured remote: every request is sent on to the other host.
+    let (base, seen) = {
+        let other = other.clone();
+        mock_http(move |_, target, _| {
+            let rest = target.strip_prefix("/tokens/").unwrap_or(target);
+            (
+                "301 Moved Permanently",
+                format!("Location: {other}/tokens.git/{rest}\r\n"),
+                String::new(),
+            )
+        })
+    };
+    let url = format!("{base}/tokens");
+    let s = GitStore::new(&url, "", "secret-token", "", &ws);
+    let listed = s.run_in(&ws, &["ls-remote", "--", &url]).unwrap();
+    assert!(!listed.status.success(), "{}", String::from_utf8_lossy(&listed.stdout));
+    let other_seen = other_seen.lock().unwrap();
+    assert!(!other_seen.is_empty(), "the redirect was followed");
+    assert!(
+        other_seen.iter().all(|(_, auth)| auth.is_none()),
+        "no credential reaches the other host: {other_seen:?}"
+    );
+    let seen = seen.lock().unwrap();
+    assert!(seen.iter().all(|(_, auth)| auth.is_none()), "{seen:?}");
+    assert!(
+        !String::from_utf8_lossy(&listed.stderr).contains("secret-token"),
+        "the token is in no error text"
+    );
+}
+
+/// cliproxy-rs-zlj.7: a git killed at the deadline leaves its lock files behind; the
+/// ones it created are removed, so the next save proceeds, while a lock older than the
+/// killed command is left alone.
+#[test]
+fn locks_left_by_a_killed_git_are_removed() {
+    use std::process::Stdio;
+    use std::time::{Duration, SystemTime};
+    let root = scratch("killed-locks");
+    let remote = setup_remote(&root, "master", &[("master", "remote master branch\n")]);
+    let ws = root.join("workspace");
+    let s = store(&remote, "", &ws);
+    s.ensure_repository().unwrap();
+    let elder = ws.join(".git/refs/heads/elder.lock");
+    std::fs::write(&elder, "").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&elder)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(600))
+        .unwrap();
+    // Stands in for a git that took its locks and then stalled.
+    let mut stalled = Command::new("sh");
+    stalled
+        .current_dir(&ws)
+        .args([
+            "-c",
+            "touch .git/index.lock .git/packed-refs.lock .git/refs/heads/master.lock; sleep 30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let error = super::output_with_timeout_in(&ws, &mut stalled, Duration::from_millis(500)).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    for lock in ["index.lock", "packed-refs.lock", "refs/heads/master.lock"] {
+        assert!(!ws.join(".git").join(lock).exists(), "{lock} is removed");
+    }
+    assert!(elder.exists(), "a lock older than the killed command is kept");
+    std::fs::remove_file(&elder).unwrap();
+    save(&s, "after.json", r#"{"access_token":"after"}"#);
+    assert!(remote_file(&remote, "master", "auths/after.json").is_some());
+}
+
 /// cliproxy-rs-7ea.23: a stalled git is killed at the deadline; a finished one returns
 /// both streams.
 #[test]

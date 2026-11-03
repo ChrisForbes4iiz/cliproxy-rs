@@ -446,6 +446,12 @@ fn scalar(value: &Value, raw: Option<&Value>) -> String {
             Value::String(text) => text.clone(),
             other => scalar(other, None),
         },
+        // Without the raw node, a plain timestamp (which the loader tags privately) is its
+        // RFC 3339 text, plain: yaml.v3 reads it as the time Go's raw node reads as.
+        (Value::Tagged(t), _) if t.tag == cpa_core::config::TIMESTAMP_TAG => match &t.value {
+            Value::String(text) => text.clone(),
+            other => scalar(other, None),
+        },
         (Value::String(s), _) => quoted(s),
         (Value::Mapping(_), _) => "{}".to_owned(),
         (Value::Sequence(_), _) => "[]".to_owned(),
@@ -626,6 +632,24 @@ mod tests {
         assert!(rc.items.is_empty());
         assert_eq!(rc.dir, PathBuf::from("plugins"));
         assert!(!runtime_config(&doc("port: 1\n"), &Value::Null).unwrap().enabled);
+    }
+
+    /// Without raw plugin configs, a plain timestamp (which the loader tags privately) is
+    /// written as its RFC 3339 text, plain, so a plugin reads the time Go's raw node
+    /// gives it, not a `!cpa-timestamp` tag.
+    #[test]
+    fn timestamp_without_raw_node_is_its_text() {
+        let rc = runtime_config(
+            &doc(
+                "plugins:\n  enabled: true\n  configs:\n    a:\n      at: 2001-12-14\n      when: [2001-12-14T21:59:43.10-05:00]\n",
+            ),
+            &Value::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&rc.items["a"].config_yaml),
+            "at: 2001-12-14T00:00:00Z\nwhen:\n  - 2001-12-14T21:59:43.1-05:00\nenabled: false\npriority: 0\n"
+        );
     }
 
     #[test]

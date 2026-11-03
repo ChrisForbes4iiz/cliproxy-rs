@@ -603,11 +603,18 @@ impl Runtime {
         self.flush_persistence().await;
     }
 
-    /// Waits for the cooldown and credential writes recorded results queued
+    /// Waits for the cooldown snapshots recorded results queued
     /// ([`CredentialStore::flush_persistence`]) without blocking a worker.
     pub async fn flush_persistence(&self) {
         let store = self.store.clone();
         let _ = tokio::task::spawn_blocking(move || store.flush_persistence()).await;
+    }
+
+    /// [`Runtime::flush_persistence`] from outside the tokio runtime: after the runtime
+    /// that served requests has shut down, so a lease dropped with its tasks has queued
+    /// its snapshot. Blocking.
+    pub fn flush_persistence_blocking(&self) {
+        self.store.flush_persistence();
     }
 
     /// The credential lock of the Codex file at `path`, for a write that is not a refresh
@@ -1692,15 +1699,16 @@ pub struct CredentialStore {
 /// Ends the upstream WebSocket sessions of one removed credential.
 type SessionCloser = Box<dyn Fn(&str) + Send + Sync>;
 
-/// The cooldown snapshot and credential saves recorded results ask for. Go MarkResult
-/// persists from the request's goroutine; here a lease ends on whichever tokio worker
-/// dropped it, so the fsyncs and the auth-dir walk move to one worker thread.
+/// The cooldown snapshot recorded results, resets, reconciles and policy changes ask
+/// for. Go MarkResult persists from the request's goroutine; here a lease ends on
+/// whichever tokio worker dropped it, so the fsyncs (a file per credential) move to one
+/// worker thread. The credential save a result asks for is written inline by
+/// [`CredentialStore::persist_credential`]: it is one file, written only while the
+/// credential is still current.
 ///
-/// Requests coalesce: one pending cooldown snapshot (taken when it is written, so the
-/// last write is the newest state, as `cooldown_write` already guarantees) and the
-/// newest revision asked for per credential (written only while still current, by
-/// [`CredentialStore::persist_credential`]). One worker drains them at a time, so the
-/// writes to one file keep their order.
+/// Requests coalesce into one pending snapshot, taken when it is written, so the last
+/// write is the newest state, as `cooldown_write` already guarantees. One worker drains
+/// at a time, so the writes keep their order.
 #[derive(Default)]
 struct Persister {
     queue: Mutex<PersistQueue>,
@@ -1711,7 +1719,6 @@ struct Persister {
 #[derive(Default)]
 struct PersistQueue {
     cooldowns: bool,
-    credentials: HashMap<String, Arc<Credential>>,
     /// A worker is draining the queue. It clears this under the lock when it finds the
     /// queue empty, so nothing queued is left without a worker.
     running: bool,
@@ -1719,7 +1726,7 @@ struct PersistQueue {
 
 impl PersistQueue {
     fn pending(&self) -> bool {
-        self.cooldowns || !self.credentials.is_empty()
+        self.cooldowns
     }
 }
 
@@ -2178,7 +2185,7 @@ impl CredentialStore {
                 .clear_disabled(&inner.creds, &policy)
         };
         if cleared {
-            self.persist_later(true, None);
+            self.persist_later();
         }
     }
 
@@ -2346,7 +2353,7 @@ impl CredentialStore {
     pub fn reset_cooldown(&self, id: &str) -> Vec<String> {
         let models = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner).reset(id);
         if !models.is_empty() {
-            self.persist_later(true, None);
+            self.persist_later();
         }
         models
     }
@@ -2506,42 +2513,27 @@ impl CredentialStore {
             if self.needs_persist(&lease.credential) {
                 self.persist_credential(&lease.credential);
             }
-            self.persist_later(changed, None);
+            if changed {
+                self.persist_later();
+            }
         }
     }
 
-    /// Runs the cooldown snapshot (`cooldowns`) and the credential save a recorded
-    /// result asks for on the persistence worker ([`Persister`]), so the tokio worker
-    /// that ended the lease never blocks on a file. Management resets, reconciles,
-    /// patches and policy changes queue their cooldown snapshot here too. Outside a
-    /// tokio runtime (a plain test, a drop after shutdown) they run here, as before.
-    fn persist_later(&self, cooldowns: bool, credential: Option<&Arc<Credential>>) {
-        if !cooldowns && credential.is_none() {
-            return;
-        }
+    /// Runs the cooldown snapshot on the persistence worker ([`Persister`]), so the tokio
+    /// worker that ended the lease never blocks on a file. Management resets, reconciles,
+    /// patches and policy changes queue their snapshot here too. Outside a tokio runtime
+    /// (a plain test, a drop after shutdown) it is written here, as before.
+    fn persist_later(&self) {
         let me = match self.me.upgrade() {
             Some(me) if tokio::runtime::Handle::try_current().is_ok() => me,
             _ => {
-                if cooldowns {
-                    self.persist_cooldowns();
-                }
-                if let Some(credential) = credential {
-                    self.persist_credential(credential);
-                }
+                self.persist_cooldowns();
                 return;
             }
         };
         let start = {
             let mut queue = self.persister.queue.lock().unwrap_or_else(PoisonError::into_inner);
-            queue.cooldowns |= cooldowns;
-            if let Some(credential) = credential {
-                match queue.credentials.get(&credential.id) {
-                    Some(queued) if queued.revision >= credential.revision => {}
-                    _ => {
-                        queue.credentials.insert(credential.id.clone(), credential.clone());
-                    }
-                }
-            }
+            queue.cooldowns = true;
             !std::mem::replace(&mut queue.running, true)
         };
         if start {
@@ -2564,7 +2556,7 @@ impl CredentialStore {
             armed: true,
         };
         loop {
-            let (cooldowns, credentials) = {
+            {
                 let mut queue = self.persister.queue.lock().unwrap_or_else(PoisonError::into_inner);
                 if !queue.pending() {
                     queue.running = false;
@@ -2572,22 +2564,14 @@ impl CredentialStore {
                     self.persister.idle.notify_all();
                     return;
                 }
-                (
-                    std::mem::take(&mut queue.cooldowns),
-                    std::mem::take(&mut queue.credentials),
-                )
-            };
-            if cooldowns {
-                self.persist_cooldowns();
+                queue.cooldowns = false;
             }
-            for credential in credentials.into_values() {
-                self.persist_credential(&credential);
-            }
+            self.persist_cooldowns();
         }
     }
 
-    /// Blocks until every write a recorded result, reset or reconcile queued has landed:
-    /// at shutdown, and in tests that read the `.cds` or credential files (or a cooldown
+    /// Blocks until every cooldown snapshot a recorded result, reset or reconcile queued
+    /// has landed: at shutdown, and in tests that read the `.cds` files (or a cooldown
     /// backend) right after one. Blocking:
     /// call it from `spawn_blocking` or outside the runtime.
     #[doc(hidden)]
@@ -3029,7 +3013,7 @@ impl CredentialStore {
         self.changed.send_replace(());
         drop(inner);
         if cleared {
-            self.persist_later(true, None);
+            self.persist_later();
         }
         // Go `Manager.Update` clears the cooldowns of an auth it stores disabled (or
         // with cooling off), so a later re-enable routes to it at once.
@@ -3131,7 +3115,7 @@ impl CredentialStore {
         )?;
         self.close_sessions(removed.unwrap_or_default());
         self.clear_disabled_cooldowns();
-        self.persist_later(true, None);
+        self.persist_later();
         Ok(())
     }
 
@@ -3382,7 +3366,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
-        self.persist_later(true, None);
+        self.persist_later();
         rejected
     }
 
@@ -3433,7 +3417,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
-        self.persist_later(true, None);
+        self.persist_later();
     }
 
     /// Inserts or replaces one credential (a plugin's `host.auth.save`) under a single
@@ -3507,7 +3491,7 @@ impl CredentialStore {
         drop(reload);
         self.close_sessions(removed);
         self.clear_disabled_cooldowns();
-        self.persist_later(true, None);
+        self.persist_later();
     }
 
     /// Adds a runtime-only credential (Go's auth add for a `/v1/ws` relay session)
@@ -3628,7 +3612,7 @@ impl CredentialStore {
             .reset_cooldowns(id);
         if had {
             // Go `ResetQuota` persists the cleared state.
-            self.persist_later(true, None);
+            self.persist_later();
         }
         models
     }
@@ -3647,7 +3631,7 @@ impl CredentialStore {
             .unwrap_or_else(PoisonError::into_inner)
             .clear_unauthorized(id, Instant::now());
         if cleared {
-            self.persist_later(true, None);
+            self.persist_later();
         }
     }
 }

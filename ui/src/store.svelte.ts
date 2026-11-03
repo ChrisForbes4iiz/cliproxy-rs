@@ -208,12 +208,12 @@ function signInHelp(e: unknown): string {
   if (!(e instanceof ApiError)) return e instanceof Error ? e.message : String(e);
   const m = e.message;
   if (e.status === 404 || /key not set/.test(m))
-    return "The management API is off on this server. Set management.secret-key in the server's config.yaml (or start it with MANAGEMENT_PASSWORD), then restart it.";
+    return "The management API is off on this server. Set management.secret-key in the server's config.yaml, which it applies without a restart, or start it with MANAGEMENT_PASSWORD.";
   if (/remote management disabled/.test(m))
-    return "This server accepts the dashboard only from its own machine. Open it there, or set management.allow-remote: true in config.yaml with a strong key.";
+    return 'This server accepts the dashboard only from its own machine, and a request relayed by a proxy or tunnel counts as remote. Behind a proxy or tunnel on the same machine, set server.trusted-proxies: [127.0.0.1, "::1"] in config.yaml and restart the server. From another machine, open the dashboard on the server itself, or set management.allow-remote: true with a strong key.';
   if (/banned/i.test(m)) return `${m}. Too many wrong keys came from this address.`;
   if (e.status === 401)
-    return "That key is not right. Use the plain text you set as management.secret-key: on first start the server replaces it in config.yaml with a hash, so the file no longer shows it.";
+    return "That key is not right. Use the plain management key, not the hash: on first start the server replaces management.secret-key in config.yaml with a bcrypt hash. With the install script, the plain key is the CLIPROXY_MANAGEMENT_KEY line in keys.env next to config.yaml.";
   return m;
 }
 

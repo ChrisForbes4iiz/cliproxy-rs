@@ -586,7 +586,7 @@ impl AntigravityExecutor {
                 info,
             )
         })
-        .map_err(|e| ExecError::local(400, cpa_core::exec::FailureScope::Request, e.to_string()))
+        .map_err(|e| crate::translate::translator_error(400, cpa_core::exec::FailureScope::Request, e))
     }
 
     /// `buildRequest` and the send: the envelope, the payload rules on the finished

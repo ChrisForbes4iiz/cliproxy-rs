@@ -210,6 +210,30 @@ use cpa_core::format::Format;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
+impl Error {
+    /// The text every [`Error::stack_reservation`] starts with; nothing else uses it.
+    const STACK_RESERVATION: &str = "translator: cannot reserve a ";
+
+    /// [`deep_stack`] could not reserve the stack `levels` of nesting need: a host
+    /// resource fault (memory limits on a small host), not a fault in the request.
+    /// Callers answer [`Error::is_stack_reservation`] with a retryable 5xx of Transport
+    /// scope instead of a client error.
+    // Decision (review 2026-11-03): the kind lives in the text, behind this constructor
+    // and its classifier, so that the many `Error(text)` constructors across the
+    // translators stay as they are; nothing wraps a deep_stack error in another message.
+    pub fn stack_reservation(size: usize, levels: usize, cause: &str) -> Self {
+        Self(format!(
+            "{}{size}-byte stack for JSON nested {levels} levels deep: {cause}",
+            Self::STACK_RESERVATION
+        ))
+    }
+
+    /// Whether this is a [`deep_stack`] reservation failure.
+    pub fn is_stack_reservation(&self) -> bool {
+        self.0.starts_with(Self::STACK_RESERVATION)
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -531,12 +555,11 @@ pub fn translate_token_count(client: Format, upstream: Format, count: i64, body:
 }
 
 /// Bracket nesting Go's recursive JSON walkers may go through after reading some bytes:
-/// the deepest nesting outside strings, and every bracket opened inside a string (JSON
+/// the deepest nesting outside strings, plus every bracket opened inside a string (JSON
 /// text, such as tool arguments, that a translator may parse, or accumulate from stream
-/// deltas and parse later). Counting string brackets without closing them keeps the bound
-/// sound for any split, and string brackets written as `\u005b`/`\u007b` count too (text
-/// escaped twice, JSON inside a string inside a string, is not decoded); a body with
-/// much code in its strings over-counts and just runs on a larger stack. Fed in pieces,
+/// deltas and parse later) up to [`Depth::STRING_LEVELS`]. Counting string brackets
+/// without closing them keeps the bound sound for any split, and string brackets written as `\u005b`/`\u007b` count too (text
+/// escaped twice, JSON inside a string inside a string, is not decoded). Fed in pieces,
 /// it covers what a stream retains.
 #[derive(Default)]
 pub(crate) struct Depth {
@@ -590,8 +613,16 @@ impl Depth {
         }
     }
 
+    /// The most nesting JSON parsed out of a string can add: every parser here refuses a
+    /// document nested deeper than 10,000 levels (encoding/json's limit, `std_valid` and
+    /// `GoValue::parse` in cpa-common), so a string holding 200,000 brackets (a coding
+    /// agent's source text) is parsed at most this deep, or not at all.
+    const STRING_LEVELS: usize = 10_000;
+
+    /// Structural depth plus the bounded string brackets: a walker at the deepest
+    /// structural level may parse a string's JSON and recurse further from there.
     pub(crate) fn levels(&self) -> usize {
-        self.max.max(self.string_opens)
+        self.max + self.string_opens.min(Self::STRING_LEVELS)
     }
 }
 
@@ -616,31 +647,32 @@ pub fn levels(bodies: &[&[u8]]) -> usize {
 /// cannot be reserved (memory limits on a small host) is an error, not a panic. Public so
 /// that callers outside the crate (cpa-exec's translators) share this guard and its
 /// per-thread flag instead of nesting a second one.
-// Decision (review 2026-11-02): `Depth` keeps counting every bracket opened inside a
-// string. Counting only structural brackets under-counts JSON text that a translator
-// parses out of strings, and a stream's tool arguments arrive split across many delta
-// strings that are joined before parsing, so no per-string bound is sound; the cost is a
-// larger stack reservation for bracket-heavy text, not a refusal.
+// Decision (review 2026-11-02, bounded 2026-11-03): `Depth` keeps counting every bracket
+// opened inside a string, up to `Depth::STRING_LEVELS`. Counting only structural brackets
+// under-counts JSON text that a translator parses out of strings, and a stream's tool
+// arguments arrive split across many delta strings that are joined before parsing, so no
+// per-string bound is sound; but no parser here accepts more than 10,000 levels, so
+// brackets beyond that (source code in a 3 MB coding-agent body held ~131k) bought a 1 GiB
+// reservation that failed on a 1 GiB host and nothing else.
 // ponytail: the stack is sized from a measured per-level cost of the deepest walkers
 // (under 2 KiB in debug builds, which use more stack than release; 4x margin), clamped
 // to Go's 1 GiB maximum. Once a stream's strings have held more than 256 brackets (code
 // in text deltas), each later event runs on a new thread (about 32 us measured); a
 // per-stream worker thread would remove that cost if it ever matters.
 pub fn deep_stack<T: Send>(levels: usize, f: impl FnOnce() -> Result<T, Error> + Send) -> Result<T, Error> {
-    const DEEP: usize = 256;
-    const PER_LEVEL: usize = 8 << 10;
-    const MIN_STACK: usize = 8 << 20;
     thread_local! {
         static ON_DEEP_STACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
-    if ON_DEEP_STACK.with(std::cell::Cell::get) || levels <= DEEP {
+    let Some(size) = stack_size(levels) else {
+        return f();
+    };
+    if ON_DEEP_STACK.with(std::cell::Cell::get) {
         return f();
     }
     #[cfg(test)]
     if FAIL_SPAWN.with(std::cell::Cell::get) {
-        return Err(Error("translator: test stack reservation failure".into()));
+        return Err(Error::stack_reservation(size, levels, "test stack reservation failure"));
     }
-    let size = levels.saturating_mul(PER_LEVEL).clamp(MIN_STACK, 1 << 30);
     std::thread::scope(|scope| {
         let worker = std::thread::Builder::new().stack_size(size).spawn_scoped(scope, || {
             ON_DEEP_STACK.with(|flag| flag.set(true));
@@ -648,11 +680,19 @@ pub fn deep_stack<T: Send>(levels: usize, f: impl FnOnce() -> Result<T, Error> +
         });
         match worker {
             Ok(handle) => handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
-            Err(e) => Err(Error(format!(
-                "translator: cannot reserve a {size}-byte stack for JSON nested {levels} levels deep: {e}"
-            ))),
+            Err(e) => Err(Error::stack_reservation(size, levels, &e.to_string())),
         }
     })
+}
+
+/// The stack [`deep_stack`] reserves for `levels` of nesting: `None` when the caller's
+/// own stack holds it (at most 256 levels), else 8 KiB per level within 8 MiB and Go's
+/// 1 GiB maximum. Public so tests can assert what a body costs.
+pub fn stack_size(levels: usize) -> Option<usize> {
+    const DEEP: usize = 256;
+    const PER_LEVEL: usize = 8 << 10;
+    const MIN_STACK: usize = 8 << 20;
+    (levels > DEEP).then(|| levels.saturating_mul(PER_LEVEL).clamp(MIN_STACK, 1 << 30))
 }
 
 #[cfg(test)]
@@ -666,7 +706,42 @@ mod go_helper_tests;
 
 #[cfg(test)]
 mod depth_tests {
-    use super::{Depth, levels};
+    use super::{Depth, Error, deep_stack, levels, stack_size};
+
+    /// Brackets inside strings reserve for at most the nesting a parser accepts, on top of
+    /// the structural depth: a 200k-bracket string (source code in a tool argument) costs
+    /// 80 MiB, not the 1 GiB clamp that fails on a small host.
+    #[test]
+    fn string_brackets_reserve_a_bounded_stack() {
+        let body = format!(r#"{{"text":"{}"}}"#, "[".repeat(200_000));
+        assert_eq!(levels(&[body.as_bytes()]), 1 + 10_000);
+        let size = stack_size(levels(&[body.as_bytes()])).unwrap();
+        assert_eq!(size, 10_001 * (8 << 10));
+        assert!(size < 1 << 30, "{size} bytes");
+        // Structural depth is never bounded by the string cap, and adds to it.
+        let deep = format!("{}{}{}", "[".repeat(12_000), body, "]".repeat(12_000));
+        assert_eq!(levels(&[deep.as_bytes()]), 12_001 + 10_000);
+        assert_eq!(stack_size(200), None, "shallow bodies run in place");
+        assert_eq!(stack_size(300), Some(8 << 20), "the minimum reservation");
+        assert_eq!(stack_size(1 << 20), Some(1 << 30), "Go's maximum");
+    }
+
+    /// A stack that cannot be reserved is its own error kind, distinct from a translator
+    /// refusing the body, so executors can answer a retryable 5xx instead of a 400.
+    #[test]
+    fn a_failed_reservation_is_its_own_error_kind() {
+        super::FAIL_SPAWN.with(|f| f.set(true));
+        let error = deep_stack(1000, || Ok::<(), Error>(())).unwrap_err();
+        super::FAIL_SPAWN.with(|f| f.set(false));
+        assert!(error.is_stack_reservation(), "{error}");
+        assert!(error.0.contains("1000 levels"), "{error}");
+        assert!(!Error("translator: bad body".into()).is_stack_reservation());
+        assert!(!Error("cannot reserve".into()).is_stack_reservation());
+        // Shallow bodies never reserve, so they cannot fail this way.
+        super::FAIL_SPAWN.with(|f| f.set(true));
+        assert_eq!(deep_stack(10, || Ok::<u8, Error>(7)), Ok(7));
+        super::FAIL_SPAWN.with(|f| f.set(false));
+    }
 
     #[test]
     fn depth_counts_string_brackets_written_as_escapes() {

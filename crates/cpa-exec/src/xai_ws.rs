@@ -44,8 +44,9 @@ const WS_USAGE_EVENTS: [&str; 2] = ["response.completed", "response.done"];
 
 /// `codexResponsesWebsocketHandshakeTO`.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on a handshake rejection body.
-const MAX_HANDSHAKE_BODY: usize = 64 * 1024;
+/// gorilla's dialer keeps at most 1 KiB of a rejected handshake's body (`client.go`), and
+/// that is all of it Go's error text and request logs ever hold.
+const MAX_HANDSHAKE_BODY: usize = 1024;
 /// `buildXAIWebsocketWarmupCompletedPayload`'s empty usage.
 const EMPTY_USAGE: &str = r#"{"input_tokens":0,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":0}"#;
 
@@ -412,31 +413,24 @@ struct Ids<'a> {
 }
 
 impl Ids<'_> {
+    /// Rewrites the string members of every object, on a heap stack: an upstream event
+    /// may be nested as deep as `GoValue::parse` accepts (10,000 levels), more frames than
+    /// a 2 MiB worker stack holds, and the upstream (or a configured base URL) is not
+    /// trusted to stay shallow.
     fn rewrite(&self, value: &mut GoValue) -> bool {
-        match value {
-            GoValue::Object(map) => {
-                let mut changed = false;
-                for (key, child) in map.iter_mut() {
-                    if let GoValue::String(s) = child {
-                        if let Some(replaced) = self.string(key, s) {
-                            *s = replaced;
-                            changed = true;
-                        }
-                        continue;
-                    }
-                    changed |= self.rewrite(child);
+        let mut changed = false;
+        value.visit_mut(|value| {
+            let GoValue::Object(map) = value else { return };
+            for (key, child) in map.iter_mut() {
+                if let GoValue::String(s) = child
+                    && let Some(replaced) = self.string(key, s)
+                {
+                    *s = replaced;
+                    changed = true;
                 }
-                changed
             }
-            GoValue::Array(items) => {
-                let mut changed = false;
-                for item in items {
-                    changed |= self.rewrite(item);
-                }
-                changed
-            }
-            _ => false,
-        }
+        });
+        changed
     }
 
     /// `rewriteXAIWebsocketDownstreamIDString`; `None` when unchanged.

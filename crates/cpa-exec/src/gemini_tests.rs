@@ -1150,12 +1150,30 @@ fn deep_stack_runs_deep_bodies() {
     }
     let nested = format!("{}{}", "[".repeat(300), "]".repeat(300));
     let in_string = format!(r#"{{"schema":"{}"}}"#, "[".repeat(300));
-    for body in [nested, in_string] {
-        assert_eq!(cpa_translate::levels(&[body.as_bytes()]), 300);
+    // The string's brackets count on top of the object holding them.
+    for (body, levels) in [(nested, 300), (in_string, 301)] {
+        assert_eq!(cpa_translate::levels(&[body.as_bytes()]), levels);
         assert_eq!(deep_stack(body.as_bytes(), || Ok(walk(300))).unwrap(), 300);
         let inner = deep_stack(body.as_bytes(), || deep_stack(body.as_bytes(), || Ok(walk(300))));
         assert_eq!(inner.unwrap(), 300);
     }
     let error = deep_stack(b"[[1]]", || Err::<(), _>(cpa_translate::Error("bad".into()))).unwrap_err();
     assert_eq!(error.0, "bad");
+}
+
+/// A stack the guard could not reserve is the host's fault, not the request's: the
+/// executors answer a retryable 503 with Transport scope (the attempt fails over) where a
+/// translator's own refusal keeps its status and Request scope.
+#[test]
+fn a_failed_stack_reservation_is_a_transport_503() {
+    use crate::translate::translator_error;
+    let reservation = cpa_translate::Error::stack_reservation(1 << 30, 131_072, "out of memory");
+    for status in [400, 502] {
+        let error = translator_error(status, FailureScope::Request, reservation.clone());
+        assert_eq!((error.status, error.scope), (503, FailureScope::Transport));
+        assert!(String::from_utf8_lossy(&error.body).contains("1073741824-byte stack"));
+    }
+    let refused = translator_error(400, FailureScope::Request, cpa_translate::Error("bad body".into()));
+    assert_eq!((refused.status, refused.scope), (400, FailureScope::Request));
+    assert_eq!(&refused.body[..], b"bad body");
 }

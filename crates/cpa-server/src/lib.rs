@@ -32,6 +32,7 @@ pub mod persist;
 pub mod plugins;
 pub mod pprof;
 mod realtime;
+pub mod recovery;
 mod refresh;
 pub mod registry;
 mod relay;

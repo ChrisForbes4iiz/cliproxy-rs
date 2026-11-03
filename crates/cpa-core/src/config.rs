@@ -680,14 +680,15 @@ pub fn prepare_for_upload(path: &Path) -> anyhow::Result<()> {
 }
 
 fn prepared_for_upload(text: &str) -> anyhow::Result<String> {
-    decode(text, Decode::Upload).context("failed to parse config file")?;
     // yaml.v3 and libyaml end a line at NEL, LS and PS too; yaml-edit, which places
     // the edits and reads the secret's tag, does not, so a comment would hide what
-    // follows it. Refuse rather than misread the file.
+    // follows it. Refuse rather than misread the file, ahead of the parse, which
+    // refuses LS and PS with its own message.
     anyhow::ensure!(
         !text.contains(['\u{85}', '\u{2028}', '\u{2029}']),
         "the config file contains a Unicode line separator yaml-edit cannot read"
     );
+    decode(text, Decode::Upload).context("failed to parse config file")?;
     let mut tree = scalar_texts(text).context("failed to parse config file")?;
     expand_merges(&mut tree).context("failed to parse config file")?;
     let mut secret = effective_secret(&tree).into_bytes();
@@ -995,20 +996,24 @@ fn looks_like_bcrypt(key: &[u8]) -> bool {
 fn decode_section<T: serde::de::DeserializeOwned + Default>(root: &Mapping, name: &str) -> anyhow::Result<T> {
     match lookup(root, name) {
         None | Some(Value::Null) => Ok(T::default()),
-        Some(value) => Ok(crate::yaml::from_value(null_scalars_to_zero(value.clone()))?),
+        Some(value) => {
+            let mut value = value.clone();
+            null_scalars_to_zero(&mut value);
+            Ok(crate::yaml::from_value(value)?)
+        }
     }
 }
 
 // Go YAML decoding null into a non-pointer field leaves its zero/default value.
 // Omit nulls when decoding the typed runtime view; the document keeps them intact.
-fn null_scalars_to_zero(mut value: Value) -> Value {
-    if let Value::Mapping(ref mut map) = value {
+// In place: a copy of the subtree at every level cost O(n x depth) on a deep section.
+fn null_scalars_to_zero(value: &mut Value) {
+    if let Value::Mapping(map) = value {
         map.retain(|_, v| !v.is_null());
-        for (_, v) in map {
-            *v = null_scalars_to_zero(v.clone());
+        for (_, v) in map.iter_mut() {
+            null_scalars_to_zero(v);
         }
     }
-    value
 }
 
 fn validate_shape(root: &Mapping) -> anyhow::Result<()> {
@@ -1125,6 +1130,34 @@ mod tests {
         assert!(cfg.management.disable_auto_update_panel);
         let cfg = Config::parse("api-keys: [legacy]\naccess: {api-keys: null}\n").unwrap();
         assert!(cfg.api_keys.is_empty(), "present null list beats legacy");
+    }
+
+    /// A section 300 mappings deep with a null beside each level decodes with one pass
+    /// over it: the null removal works in place rather than copying every subtree at
+    /// every level, and the typed decode ignores the unknown keys.
+    #[test]
+    fn null_removal_handles_a_deep_comb_section() {
+        let depth = 300;
+        let mut section = Value::from(1);
+        for i in 0..depth {
+            let mut map = Mapping::new();
+            map.insert(format!("unset{i}").into(), Value::Null);
+            map.insert("deeper".into(), section);
+            section = Value::Mapping(map);
+        }
+        let mut cleaned = section.clone();
+        null_scalars_to_zero(&mut cleaned);
+        let mut node = &cleaned;
+        for _ in 0..depth {
+            let map = node.as_mapping().unwrap();
+            assert_eq!(map.len(), 1, "the null sibling is gone");
+            node = map.get("deeper").unwrap();
+        }
+        assert_eq!(*node, Value::from(1));
+        let mut root = Mapping::new();
+        root.insert("routing".into(), section);
+        let routing: RoutingConfig = decode_section(&root, "routing").unwrap();
+        assert_eq!(routing, RoutingConfig::default());
     }
 
     /// `worker-threads` is cliproxy-rs only: a whole-file upload through the Management
@@ -1439,32 +1472,33 @@ mod tests {
         );
     }
 
-    /// The aliases of an anchored list of numbers count toward the alias limit only where
-    /// they land in a model name, alias or exclusion. (yaml.v3 refuses this many aliases
-    /// as excessive aliasing; the limit here is the copies they make.)
+    /// The aliases of an anchored list of numbers count toward the binary pass's copy
+    /// limit only where they land in a model name, alias or exclusion: a million copies
+    /// of numbers outside those load. The 600,000 padding numbers keep the document
+    /// under yaml.v3's alias ratio, as they do in Go (docs/DIFFERENCES-FROM-GO.md).
     #[test]
     fn unused_number_aliases_do_not_expand_too_far() {
         let numbers: Vec<String> = (0..1024).map(|i| i.to_string()).collect();
         let text = format!(
-            "a: &l [{}]\nb: [{}]\noauth-excluded-models: {{c: *l}}\n",
+            "pad: [{}]\na: &l [{}]\nb: [{}]\noauth-excluded-models: {{c: *l}}\n",
+            vec!["0"; 600_000].join(", "),
             numbers.join(", "),
-            vec!["*l"; 1024].join(", ")
+            vec!["*l"; 1000].join(", ")
         );
         let doc = config_value(&text).unwrap();
-        assert_eq!(doc["b"][1023][1023], Value::from(1023));
+        assert_eq!(doc["b"][999][1023], Value::from(1023));
         assert_eq!(doc["oauth-excluded-models"]["c"][7], Value::from("7"));
     }
 
     /// Aliases whose copies no string setting keeps are bounded too: 2,048 aliases of a
-    /// 2,049-number anchor outside any string setting visit just over the limit and are
-    /// refused, where each would otherwise copy the whole anchor. Go refuses such a file
-    /// as excessive aliasing.
+    /// 2,049-number anchor outside any string setting are refused as yaml.v3 refuses
+    /// them, as excessive aliasing at the 105th alias, before any copy is made.
     #[test]
     fn dropped_alias_copies_are_bounded() {
         let numbers = vec!["0"; 2049].join(", ");
         let text = format!("x: &x [{numbers}]\nzz-ignored: [{}]\n", vec!["*x"; 2048].join(", "));
         let err = config_value(&text).unwrap_err();
-        assert_eq!(err.to_string(), "config YAML aliases expand too far");
+        assert_eq!(err.to_string(), "yaml: document contains excessive aliasing");
     }
 
     /// Only alias copies count toward the alias limit: a list of more numbers than that,
@@ -1773,8 +1807,8 @@ oauth-excluded-models: {{c: [{numbers}]}}
             assert_eq!(json, want, "{text}");
         }
         // U+2028 and U+2029 end a line for libyaml and yaml.v3 (YAML 1.1) but not for
-        // granit-parser (YAML 1.2): after an anchor they belong to its name, so the alias
-        // names no anchor and the file is refused (docs/DIFFERENCES-FROM-GO.md).
+        // granit-parser (YAML 1.2), so the loader refuses a file holding one
+        // (docs/DIFFERENCES-FROM-GO.md).
         for separator in ['\u{2028}', '\u{2029}'] {
             let text = format!("x: &a{separator}  2001-12-14\n  21:59:43\ny: *a\n");
             assert!(yaml_value(&text).is_err(), "{text:?}");

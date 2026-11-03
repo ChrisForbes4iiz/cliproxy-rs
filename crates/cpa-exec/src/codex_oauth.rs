@@ -253,6 +253,43 @@ pub struct CodexOAuth {
     siwc_token_url: String,
     refreshes: Refreshes,
     retry_delay: Duration,
+    /// Bound on one refresh attempt (Go's per-request context deadline).
+    attempt_timeout: Duration,
+}
+
+/// A failed token request: the status the endpoint answered with, when it answered, and
+/// the error reported for it. The refreshes retry only an answered 5xx.
+pub(crate) struct TokenFailure {
+    pub(crate) status: Option<u16>,
+    pub(crate) error: ExecError,
+}
+
+impl TokenFailure {
+    /// The endpoint answered `status` and the request failed on it.
+    pub(crate) fn answered(status: u16, error: ExecError) -> Self {
+        Self {
+            status: Some(status),
+            error,
+        }
+    }
+
+    /// A server fault the endpoint reported, worth another attempt with the same token.
+    fn retryable(&self) -> bool {
+        self.status.is_some_and(|status| status >= 500)
+    }
+}
+
+/// A transport fault, a timeout or a bad body: the endpoint answered no status.
+impl From<ExecError> for TokenFailure {
+    fn from(error: ExecError) -> Self {
+        Self { status: None, error }
+    }
+}
+
+impl From<TokenFailure> for ExecError {
+    fn from(failure: TokenFailure) -> Self {
+        failure.error
+    }
 }
 
 impl CodexOAuth {
@@ -270,7 +307,15 @@ impl CodexOAuth {
             siwc_token_url: crate::codex_siwc::TOKEN_URL.into(),
             refreshes: Refreshes::default(),
             retry_delay: Duration::from_secs(1),
+            attempt_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Tests shorten the 30 s bound on one refresh attempt.
+    #[cfg(test)]
+    pub(crate) fn with_attempt_timeout(mut self, timeout: Duration) -> Self {
+        self.attempt_timeout = timeout;
+        self
     }
 
     /// The Sign in with ChatGPT token endpoint, for local mocks.
@@ -319,7 +364,7 @@ impl CodexOAuth {
 
     /// `exchange` keeps Go's `ExchangeCodeForTokens` error texts (status and body);
     /// refreshes keep the sanitized refresh error.
-    async fn token_request(&self, form: &[(&str, &str)], exchange: bool) -> Result<Tokens, ExecError> {
+    async fn token_request(&self, form: &[(&str, &str)], exchange: bool) -> Result<Tokens, TokenFailure> {
         // url.Values.Encode sorts keys; callers pass them sorted.
         let body = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(form)
@@ -335,10 +380,10 @@ impl CodexOAuth {
             } else {
                 format!("token exchange failed with status {status}: {code}")
             };
-            return Err(oauth_error(status, &message));
+            return Err(TokenFailure::answered(status, oauth_error(status, &message)));
         }
         if status != 200 {
-            return Err(token_error(status, &body));
+            return Err(TokenFailure::answered(status, token_error(status, &body)));
         }
         // Go appends the decoder error (`failed to parse token response: %w`); serde's
         // diagnostics can quote response values such as tokens, so only the prefix is kept.
@@ -351,7 +396,11 @@ impl CodexOAuth {
         })?;
         let id_token = parsed.id_token.unwrap_or_default();
         let claims = parse_jwt(&id_token).unwrap_or_default();
-        let expires = chrono::TimeDelta::try_seconds(parsed.expires_in.unwrap_or(0)).unwrap_or_default();
+        // Go adds `expires_in` seconds to now unchecked; here a value the clock cannot
+        // hold (chrono's `+` would panic and take the login task with it) fails the request.
+        let expired = chrono::TimeDelta::try_seconds(parsed.expires_in.unwrap_or(0))
+            .and_then(|lifetime| Local::now().checked_add_signed(lifetime))
+            .ok_or_else(|| oauth_error(502, "invalid token expiry"))?;
         Ok(Tokens {
             plan_type: claims.plan_type(),
             account_id: claims.account_id,
@@ -359,7 +408,7 @@ impl CodexOAuth {
             id_token,
             access_token: parsed.access_token.unwrap_or_default(),
             refresh_token: parsed.refresh_token.unwrap_or_default(),
-            expired: rfc3339(Local::now() + expires),
+            expired: rfc3339(expired),
         })
     }
 
@@ -379,6 +428,7 @@ impl CodexOAuth {
             true,
         )
         .await
+        .map_err(ExecError::from)
     }
 
     /// `RefreshTokensWithRetry(ctx, token, 3)`, single-flighted per refresh token and
@@ -419,6 +469,8 @@ impl CodexOAuth {
         single_flight(&self.refreshes.siwc, key, run, false).await
     }
 
+    /// `RefreshSIWCTokensWithRetry`'s three attempts under the same retry policy as
+    /// [`CodexOAuth::refresh_with_retry`]: only a 5xx answer is retried.
     async fn refresh_siwc_with_retry(
         &self,
         refresh_token: &str,
@@ -431,7 +483,7 @@ impl CodexOAuth {
                 tokio::time::sleep(self.retry_delay * attempt).await;
             }
             let once = tokio::time::timeout(
-                Duration::from_secs(30),
+                self.attempt_timeout,
                 self.siwc_token_request(
                     &[
                         ("client_id", client_id),
@@ -445,13 +497,11 @@ impl CodexOAuth {
                 ),
             )
             .await
-            .unwrap_or_else(|_| Err(oauth_error(504, "SIWC token refresh timed out")));
+            .unwrap_or_else(|_| Err(oauth_error(504, "SIWC token refresh timed out").into()));
             match once {
                 Ok(tokens) => return Ok(tokens),
-                Err(error) if String::from_utf8_lossy(&error.body).contains("refresh_token_reused") => {
-                    return Err(error);
-                }
-                Err(error) => last = Some(error),
+                Err(failure) if failure.retryable() => last = Some(failure.error),
+                Err(failure) => return Err(failure.error),
             }
         }
         let mut error = last.expect("three attempts ran");
@@ -463,6 +513,12 @@ impl CodexOAuth {
         Err(error)
     }
 
+    /// `RefreshTokensWithRetry`'s three attempts with one-second steps. Go re-posts the
+    /// token after any failure but `refresh_token_reused`; here only a 5xx answer from the
+    /// endpoint is retried (DIFFERENCES-FROM-GO). A timeout, a transport fault or a bad
+    /// body is ambiguous: the endpoint may already have rotated the token, and posting it
+    /// again then earns `refresh_token_reused`, cooling the credential as 401 while the
+    /// rotated tokens are never received. The Claude port (`oauth.rs`) decided the same.
     async fn refresh_with_retry(&self, refresh_token: &str) -> Result<Tokens, ExecError> {
         let mut last = None;
         for attempt in 0..3u32 {
@@ -470,7 +526,7 @@ impl CodexOAuth {
                 tokio::time::sleep(self.retry_delay * attempt).await;
             }
             let once = tokio::time::timeout(
-                Duration::from_secs(30),
+                self.attempt_timeout,
                 self.token_request(
                     &[
                         ("client_id", CLIENT_ID),
@@ -482,13 +538,11 @@ impl CodexOAuth {
                 ),
             )
             .await
-            .unwrap_or_else(|_| Err(oauth_error(504, "codex token refresh timed out")));
+            .unwrap_or_else(|_| Err(oauth_error(504, "codex token refresh timed out").into()));
             match once {
                 Ok(tokens) => return Ok(tokens),
-                Err(error) if String::from_utf8_lossy(&error.body).contains("refresh_token_reused") => {
-                    return Err(error);
-                }
-                Err(error) => last = Some(error),
+                Err(failure) if failure.retryable() => last = Some(failure.error),
+                Err(failure) => return Err(failure.error),
             }
         }
         let mut error = last.expect("three attempts ran");
@@ -1007,26 +1061,54 @@ pub async fn login(auth_dir: &Path, options: &LoginOptions) -> Result<PathBuf, E
             Err(_) => Err(oauth_error(400, "failed to read callback URL")),
         }
     };
-    let callback = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(300), callback(&listener)) => {
-            result.map_err(|_| oauth_error(408, "timeout waiting for OAuth callback"))?
+    // Go's callback server runs until Login returns (sdk/auth/codex.go), so the browser's
+    // redirect to /success after the callback is answered; the first callback wins.
+    let (server, mut callbacks) = serve_callbacks(listener);
+    let result: Result<PathBuf, ExecError> = async {
+        let callback = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(300), callbacks.recv()) => {
+                result
+                    .map_err(|_| oauth_error(408, "timeout waiting for OAuth callback"))?
+                    .ok_or_else(|| oauth_error(500, "callback listener failed"))
+            }
+            result = manual => result,
+        }?;
+        if let Some(error) = callback.error {
+            return Err(oauth_error(400, &format!("codex oauth error: {error}")));
         }
-        result = manual => result,
-    }?;
-    if let Some(error) = callback.error {
-        return Err(oauth_error(400, &format!("codex oauth error: {error}")));
+        if callback.state != state {
+            return Err(oauth_error(400, "state mismatch"));
+        }
+        let client = plain_client()?;
+        let tokens = CodexOAuth::new(client)
+            .exchange(&callback.code, &redirect_uri(port), &verifier)
+            .await?;
+        let dir = auth_dir.to_owned();
+        tokio::task::spawn_blocking(move || write_login(&dir, &tokens))
+            .await
+            .map_err(|_| oauth_error(500, "credential publication failed"))?
     }
-    if callback.state != state {
-        return Err(oauth_error(400, "state mismatch"));
-    }
-    let client = plain_client()?;
-    let tokens = CodexOAuth::new(client)
-        .exchange(&callback.code, &redirect_uri(port), &verifier)
-        .await?;
-    let dir = auth_dir.to_owned();
-    tokio::task::spawn_blocking(move || write_login(&dir, &tokens))
-        .await
-        .map_err(|_| oauth_error(500, "credential publication failed"))?
+    .await;
+    // Give the browser's /success a moment before the listener closes.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    server.abort();
+    result
+}
+
+/// Serves `listener` until the returned task is aborted, handing each callback it parses
+/// to the receiver (the first is the one that counts; later ones are dropped when the
+/// channel is full). Go's callback server runs until `Login` returns (sdk/auth/codex.go),
+/// so a browser's redirect to /success after the callback is answered rather than refused.
+pub(crate) fn serve_callbacks(
+    listener: tokio::net::TcpListener,
+) -> (tokio::task::JoinHandle<()>, tokio::sync::mpsc::Receiver<Callback>) {
+    let (results, callbacks) = tokio::sync::mpsc::channel(1);
+    let server = tokio::spawn(async move {
+        while let Ok(callback) = callback(&listener).await {
+            let _ = results.try_send(callback);
+        }
+    });
+    (server, callbacks)
 }
 
 /// One prompt on a detached OS thread (`misc.AsyncPrompt`). Unlike `spawn_blocking`, an

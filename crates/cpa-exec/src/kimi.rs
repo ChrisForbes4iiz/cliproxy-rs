@@ -628,7 +628,7 @@ fn translate_lines(
 }
 
 fn translate_error(error: cpa_translate::Error) -> ExecError {
-    ExecError::local(502, FailureScope::Request, error.to_string())
+    crate::translate::translator_error(502, FailureScope::Request, error)
 }
 
 /// Native Responses streaming: Go writes every scanned line plus `\n` as one chunk and

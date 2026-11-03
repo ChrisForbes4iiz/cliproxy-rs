@@ -1,9 +1,11 @@
 //! Local ephemeral keys (client_secret.go): `POST /v1/realtime/client_secrets` and the
 //! legacy `POST /v1/realtime/sessions`. A key is `ek_` + 32 random bytes, lives 10 s to
 //! 2 h (default 10 min) and carries the session config every call made with it uses.
-//! At most 1024 keys exist, 64 per issuing client key.
+//! At most 1024 keys exist, 64 per issuing client key (per issuing peer address when
+//! there is no client key).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +36,10 @@ pub(crate) struct Grant {
     pub issuer_provider: String,
     /// The upstream (Codex model) session config.
     pub session: Vec<u8>,
+    /// What the per-issuer cap counts: the issuer key, else (no `api-keys`, so every
+    /// caller shares the empty key) the issuing peer's address. Go skips the cap for an
+    /// empty key, so one anonymous client could mint the whole store and 429 everyone.
+    issuer: String,
 }
 
 #[derive(Default)]
@@ -49,13 +55,25 @@ struct Created {
 
 impl Secrets {
     /// `clientSecretStore.create`: `None` when the store or the issuer is at capacity.
-    fn create(&self, session: Vec<u8>, lifetime: Duration, issuer_key: &str, issuer_provider: &str) -> Option<Created> {
+    fn create(
+        &self,
+        session: Vec<u8>,
+        lifetime: Duration,
+        issuer_key: &str,
+        issuer_provider: &str,
+        peer: Option<SocketAddr>,
+    ) -> Option<Created> {
         let token = random_id(PREFIX, 32);
+        let issuer = match issuer_key.trim() {
+            "" => peer.map(|peer| peer.ip().to_string()).unwrap_or_default(),
+            key => key.to_owned(),
+        };
         let grant = Arc::new(Grant {
             principal: random_id("sess_", 18),
             issuer_key: issuer_key.trim().to_owned(),
             issuer_provider: issuer_provider.trim().to_owned(),
             session,
+            issuer,
         });
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
@@ -63,10 +81,10 @@ impl Secrets {
         if entries.len() >= MAX_ENTRIES {
             return None;
         }
-        if !grant.issuer_key.is_empty()
+        if !grant.issuer.is_empty()
             && entries
                 .values()
-                .filter(|(g, _)| g.issuer_key == grant.issuer_key && g.issuer_provider == grant.issuer_provider)
+                .filter(|(g, _)| g.issuer == grant.issuer && g.issuer_provider == grant.issuer_provider)
                 .count()
                 >= MAX_PER_ISSUER
         {
@@ -132,6 +150,7 @@ fn body_error(error: super::http::ReadError) -> Response {
 pub(super) async fn create(
     Extension(live): Extension<Arc<Live>>,
     Extension(principal): Extension<Principal>,
+    peer: crate::dispatch::Peer,
     body: Body,
 ) -> Response {
     let body = match super::http::read_limited(body, MAX_BODY).await {
@@ -149,6 +168,7 @@ pub(super) async fn create(
     issue(
         &live,
         &principal,
+        crate::dispatch::peer(peer),
         &request.session,
         request.expires_after.as_ref(),
         false,
@@ -159,10 +179,11 @@ pub(super) async fn create(
 pub(super) async fn legacy(
     Extension(live): Extension<Arc<Live>>,
     Extension(principal): Extension<Principal>,
+    peer: crate::dispatch::Peer,
     body: Body,
 ) -> Response {
     match super::http::read_limited(body, MAX_BODY).await {
-        Ok(body) => issue(&live, &principal, &body, None, true),
+        Ok(body) => issue(&live, &principal, crate::dispatch::peer(peer), &body, None, true),
         Err(error) => body_error(error),
     }
 }
@@ -171,6 +192,7 @@ pub(super) async fn legacy(
 fn issue(
     live: &Live,
     principal: &Principal,
+    peer: Option<SocketAddr>,
     session: &[u8],
     expires_after: Option<&(String, i64)>,
     legacy: bool,
@@ -188,7 +210,7 @@ fn issue(
     };
     let Some(created) = live
         .secrets
-        .create(upstream, lifetime, &principal.key, &principal.provider)
+        .create(upstream, lifetime, &principal.key, &principal.provider, peer)
     else {
         let mut response = realtime_error(
             429,
@@ -242,7 +264,7 @@ mod tests {
     fn keys_expire_and_capacity_is_bounded() {
         let secrets = Secrets::default();
         let created = secrets
-            .create(b"{}".to_vec(), Duration::from_secs(60), "issuer", "config-inline")
+            .create(b"{}".to_vec(), Duration::from_secs(60), "issuer", "config-inline", None)
             .unwrap();
         assert!(created.token.starts_with("ek_") && created.token.len() == 3 + 43);
         assert!(created.grant.principal.starts_with("sess_") && created.grant.principal.len() == 5 + 24);
@@ -255,29 +277,86 @@ mod tests {
         // Expiry on its own token: a slow runner can never see this one still valid,
         // nor the long-lived one above already expired.
         let short = secrets
-            .create(b"{}".to_vec(), Duration::from_millis(1), "issuer", "config-inline")
+            .create(
+                b"{}".to_vec(),
+                Duration::from_millis(1),
+                "issuer",
+                "config-inline",
+                None,
+            )
             .unwrap();
         std::thread::sleep(Duration::from_millis(20));
         assert!(secrets.authenticate(&short.token).is_none(), "expired");
 
         for _ in 0..MAX_PER_ISSUER {
-            assert!(secrets.create(vec![], Duration::from_secs(60), "busy", "p").is_some());
+            assert!(
+                secrets
+                    .create(vec![], Duration::from_secs(60), "busy", "p", None)
+                    .is_some()
+            );
         }
         assert!(
-            secrets.create(vec![], Duration::from_secs(60), "busy", "p").is_none(),
+            secrets
+                .create(vec![], Duration::from_secs(60), "busy", "p", None)
+                .is_none(),
             "per issuer"
         );
         assert!(
             secrets
-                .create(vec![], Duration::from_secs(60), "busy", "other")
+                .create(vec![], Duration::from_secs(60), "busy", "other", None)
                 .is_some(),
             "issuer is key and provider"
         );
         assert!(
-            secrets.create(vec![], Duration::from_secs(60), "", "").is_some(),
-            "no issuer, no per-issuer limit"
+            secrets.create(vec![], Duration::from_secs(60), "", "", None).is_some(),
+            "no issuer and no peer, no per-issuer limit"
         );
-        while secrets.create(vec![], Duration::from_secs(60), "", "").is_some() {}
+        while secrets.create(vec![], Duration::from_secs(60), "", "", None).is_some() {}
         assert_eq!(secrets.entries.lock().unwrap().len(), MAX_ENTRIES, "store-wide cap");
+    }
+
+    /// Without `api-keys` every caller shares the empty issuer key; the per-issuer cap
+    /// then counts the issuing peer's address (ports differ per connection), so one
+    /// anonymous client cannot mint the whole store and 429 everyone else.
+    #[test]
+    fn anonymous_issuers_are_capped_per_peer_address() {
+        let secrets = Secrets::default();
+        let peer = |addr: &str| Some(addr.parse::<SocketAddr>().unwrap());
+        for port in 0..MAX_PER_ISSUER {
+            assert!(
+                secrets
+                    .create(
+                        vec![],
+                        Duration::from_secs(60),
+                        "",
+                        "",
+                        peer(&format!("10.0.0.1:{port}"))
+                    )
+                    .is_some()
+            );
+        }
+        assert!(
+            secrets
+                .create(vec![], Duration::from_secs(60), " ", "", peer("10.0.0.1:9"))
+                .is_none(),
+            "the peer is at its cap whatever its port"
+        );
+        assert!(
+            secrets
+                .create(vec![], Duration::from_secs(60), "", "", peer("10.0.0.2:9"))
+                .is_some(),
+            "another peer has its own cap"
+        );
+        assert!(
+            secrets
+                .create(vec![], Duration::from_secs(60), "key", "", peer("10.0.0.1:9"))
+                .is_some(),
+            "a client key is counted by key, not by peer"
+        );
+        assert_eq!(
+            secrets.entries.lock().unwrap().len(),
+            MAX_PER_ISSUER + 2,
+            "the store is nowhere near its cap"
+        );
     }
 }

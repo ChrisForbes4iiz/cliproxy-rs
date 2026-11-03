@@ -115,11 +115,13 @@ pub fn overlay(raw: &[u8], base: Option<&Config>) -> anyhow::Result<Config> {
 }
 
 /// Go main's Home bootstrap: Home's config, with its plugins synced and reported. The
-/// error is the line Go logs before exiting.
+/// error is the line Go logs before exiting. `local_store_auth` are the node's own
+/// plugin store rules ([`crate::home_plugins::local_store_auth`]).
 pub async fn bootstrap(
     jwt: &str,
     disable_discovery: bool,
     plugins: &cpa_plugin::Host,
+    local_store_auth: &[cpa_plugin::store::AuthConfig],
 ) -> Result<(HomeConfig, Config, crate::home_plugins::Bootstrap), String> {
     let mut home = tokio::time::timeout(BOOTSTRAP_TIMEOUT, cpa_home::cert::config_from_jwt(jwt))
         .await
@@ -136,7 +138,10 @@ pub async fn bootstrap(
         .map_err(|e| format!("failed to fetch config from home: {e}"))
         .and_then(|raw| {
             let config = overlay(&raw, None).map_err(|e| format!("failed to parse config payload from home: {e:#}"))?;
-            Ok((crate::home_plugins::sync_config(&raw, &config), config))
+            Ok((
+                crate::home_plugins::sync_config(&raw, &config, local_store_auth),
+                config,
+            ))
         });
     let (sync, config) = match parsed {
         Ok(parsed) => parsed,
@@ -801,6 +806,7 @@ pub fn spawn_subscriber(
     rt: Arc<Runtime>,
     dispatcher: Arc<Dispatcher>,
     shutdown: CancellationToken,
+    local_store_auth: Vec<cpa_plugin::store::AuthConfig>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Go `StartHomeAppLogForwarder` (process-wide logrus hook): bound to each
@@ -810,7 +816,15 @@ pub fn spawn_subscriber(
             let app_log = app_log.clone();
             Arc::new(move |e: &cpa_server::logging::Entry<'_>| app_log.fire(e.line, e.level, e.time, e.request_id))
         });
-        run_lifetimes(home, rt, dispatcher, shutdown, app_log.clone()).await;
+        run_lifetimes(
+            home,
+            rt,
+            dispatcher,
+            shutdown,
+            app_log.clone(),
+            Arc::new(local_store_auth),
+        )
+        .await;
         cpa_server::logging::remove_hook(hook);
         app_log.stop().await;
     })
@@ -822,6 +836,7 @@ async fn run_lifetimes(
     dispatcher: Arc<Dispatcher>,
     shutdown: CancellationToken,
     app_log: Arc<cpa_home::applog::Forwarder>,
+    local_store_auth: Arc<Vec<cpa_plugin::store::AuthConfig>>,
 ) {
     let mut registry = Registry::new();
     let mut flusher = ReleaseFlusher::new();
@@ -862,6 +877,7 @@ async fn run_lifetimes(
             );
             let (lifetime, published, publisher) = (lifetime.clone(), published.clone(), publisher.clone());
             let plugins = plugins.clone();
+            let local_store_auth = local_store_auth.clone();
             async move {
                 // Go `runHomeConfigWorkerWithSupervisor`: the lifetime's in-flight
                 // publisher and usage forwarder, awaited before it is torn down.
@@ -880,7 +896,7 @@ async fn run_lifetimes(
                             let payload = raw.as_deref().unwrap_or_default();
                             let staged = async {
                                 let cfg = overlay(payload, Some(rt.config().as_ref()))?;
-                                let sync = crate::home_plugins::sync_config(payload, &cfg);
+                                let sync = crate::home_plugins::sync_config(payload, &cfg, &local_store_auth);
                                 let work = plugins.stage(&sync, &client).await.map_err(anyhow::Error::msg)?;
                                 anyhow::Ok((cfg, work))
                             };
@@ -1307,7 +1323,7 @@ mod tests {
         // main.rs: the plugin worker runs; each lifetime waits for it to apply.
         cpa_server::plugins::start(&rt).await;
         let shutdown = CancellationToken::new();
-        let subscriber = spawn_subscriber(home.config(), rt.clone(), dispatcher, shutdown.clone());
+        let subscriber = spawn_subscriber(home.config(), rt.clone(), dispatcher, shutdown.clone(), Vec::new());
         let task = tokio::spawn(async move {
             let _guard = guard;
             subscriber.await.unwrap();
@@ -5842,7 +5858,13 @@ mod tests {
             let guard = ONE_NODE.lock().await;
             let dispatcher = Arc::new(Dispatcher::new(&rt));
             let shutdown = CancellationToken::new();
-            let task = spawn_subscriber(home.config(), rt.clone(), dispatcher.clone(), shutdown.clone());
+            let task = spawn_subscriber(
+                home.config(),
+                rt.clone(),
+                dispatcher.clone(),
+                shutdown.clone(),
+                Vec::new(),
+            );
             Self {
                 _rt: rt,
                 dispatcher,

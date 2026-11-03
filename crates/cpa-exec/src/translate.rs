@@ -346,11 +346,22 @@ fn streaming(
 /// A response translator rejecting upstream data: a bad gateway, never the client's fault,
 /// classified by status like Go's plain `statusErr`.
 fn stream_error(error: cpa_translate::Error) -> ExecError {
-    ExecError::local(502, crate::upstream::scope_for(502), error.to_string())
+    translator_error(502, crate::upstream::scope_for(502), error)
 }
 
 fn error(error: cpa_translate::Error) -> ExecError {
-    ExecError::local(400, FailureScope::Request, error.to_string())
+    translator_error(400, FailureScope::Request, error)
+}
+
+/// A translator's error as the executor's local error: `status` and `scope` for what the
+/// translator refused, but a stack `cpa_translate::deep_stack` could not reserve is a
+/// host fault, not the request's, answered as a 503 with Transport scope so the attempt
+/// fails over and the client sees a retryable error instead of a 400 it cannot fix.
+pub(crate) fn translator_error(status: u16, scope: FailureScope, error: cpa_translate::Error) -> ExecError {
+    if error.is_stack_reservation() {
+        return ExecError::local(503, FailureScope::Transport, error.to_string());
+    }
+    ExecError::local(status, scope, error.to_string())
 }
 
 #[cfg(test)]

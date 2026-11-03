@@ -378,15 +378,22 @@ impl From<f64> for Number {
     }
 }
 
-// This is fine, because we don't _really_ implement hash for floats
-// all other hash functions should work as expected
+// Consistent with `N::eq`: integers by value, floats by the bits of the one value
+// `eq` treats as equal (every NaN is one NaN, and -0.0 == 0.0). serde_yaml_ng hashed
+// every float to one constant, which made N distinct float keys cost O(N) each.
 #[allow(clippy::derived_hash_with_manual_eq)]
 impl Hash for Number {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self.n {
-            N::Float(_) => {
-                // you should feel bad for using f64 as a map key
-                3.hash(state);
+            N::Float(f) => {
+                let bits = if f.is_nan() {
+                    f64::NAN.to_bits()
+                } else if f == 0.0 {
+                    0u64
+                } else {
+                    f.to_bits()
+                };
+                bits.hash(state);
             }
             N::PosInt(u) => u.hash(state),
             N::NegInt(i) => i.hash(state),
@@ -399,5 +406,61 @@ pub(crate) fn unexpected(number: &Number) -> Unexpected<'_> {
         N::PosInt(u) => Unexpected::Unsigned(u),
         N::NegInt(i) => Unexpected::Signed(i),
         N::Float(f) => Unexpected::Float(f),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::yaml::{Mapping, Value};
+    use std::hash::DefaultHasher;
+
+    fn hashed(n: &Number) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        n.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Hash agrees with Eq on the floats Eq folds together: one NaN, and -0.0 == 0.0.
+    #[test]
+    fn float_hash_agrees_with_eq() {
+        let (zero, neg_zero) = (Number::from(0.0), Number::from(-0.0));
+        assert!(zero == neg_zero);
+        assert_eq!(hashed(&zero), hashed(&neg_zero));
+        let nan = Number::from(f64::NAN);
+        for other in [
+            f64::from_bits(0x7ff8_0000_dead_beef),
+            f64::from_bits(0x7ff0_0000_0000_0001),
+            -f64::NAN,
+        ] {
+            let other = Number::from(other);
+            assert!(nan == other);
+            assert_eq!(hashed(&nan), hashed(&other));
+        }
+        assert_ne!(hashed(&Number::from(1.5)), hashed(&Number::from(2.5)));
+        assert_ne!(hashed(&Number::from(1.5)), hashed(&zero));
+        assert_ne!(
+            hashed(&Number::from(1.0)),
+            hashed(&Number::from(1)),
+            "an integer is not a float"
+        );
+    }
+
+    /// 100,000 distinct float keys hash apart, so the mapping stays O(1) per insert
+    /// (hashed to one constant they took minutes), and the keys Eq folds together find
+    /// each other.
+    #[test]
+    fn float_keys_hash_apart() {
+        let mut map = Mapping::with_capacity(100_000);
+        for i in 0..100_000u32 {
+            map.insert(Value::from(f64::from(i) + 0.5), Value::from(i));
+        }
+        assert_eq!(map.len(), 100_000);
+        assert_eq!(map.get(Value::from(99_999.5)), Some(&Value::from(99_999u32)));
+        map.insert(Value::from(0.0), Value::Null);
+        assert!(map.contains_key(Value::from(-0.0)));
+        assert!(!map.contains_key(Value::from(0)), "an integer key is not a float key");
+        map.insert(Value::from(f64::NAN), Value::Null);
+        assert!(map.contains_key(Value::from(f64::from_bits(0x7ff8_0000_dead_beef))));
     }
 }

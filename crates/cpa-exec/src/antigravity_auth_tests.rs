@@ -405,3 +405,44 @@ fn retry_delays_match_go() {
         assert_eq!(got, want, "{body}");
     }
 }
+
+/// The login flow's success bodies (token exchange, userinfo, loadCodeAssist, onboardUser)
+/// and a refresh grant's answer are read like every other 2xx body: one over
+/// `proxy::MAX_SUCCESS_BODY` fails its step cleanly instead of being buffered without bound.
+#[tokio::test]
+async fn oversize_login_bodies_fail_cleanly() {
+    const CAP: usize = 64 << 10;
+    let big = format!(r#"{{"access_token":"t","pad":"{}"}}"#, "x".repeat(CAP));
+    // loadCodeAssist answers without a project, so project_id goes on to onboardUser.
+    let replies = vec![
+        (200, big.clone()),
+        (200, big.clone()),
+        (200, "{}".to_owned()),
+        (200, big.clone()),
+        (200, big),
+    ];
+    let mock = Mock::start(replies).await;
+    let oauth = OAuth::new(mock.clients().get(&Proxy::Direct)).with_poll_delay(Duration::ZERO);
+    crate::proxy::SUCCESS_BODY_CAP.with(|cap| cap.set(CAP));
+    let exchange = oauth
+        .exchange_code("4/fake-code", "http://localhost:51121/oauth-callback")
+        .await;
+    let user = oauth.user_info("access").await;
+    let project = oauth.project_id("access").await;
+    let refresh = oauth.refresh("refresh").await;
+    crate::proxy::SUCCESS_BODY_CAP.with(|cap| cap.set(crate::proxy::MAX_SUCCESS_BODY));
+    let exceeds = format!("upstream response body exceeds {CAP} bytes");
+    assert_eq!(
+        exchange.unwrap_err().message,
+        format!("antigravity token exchange: decode response: {exceeds}")
+    );
+    assert_eq!(
+        user.unwrap_err().message,
+        format!("antigravity userinfo: decode response: {exceeds}")
+    );
+    assert_eq!(project.unwrap_err().message, format!("read response: {exceeds}"));
+    let refresh = refresh.unwrap_err();
+    assert_eq!((refresh.status, refresh.scope), (502, FailureScope::Transport));
+    assert_eq!(String::from_utf8_lossy(&refresh.body), exceeds);
+    assert_eq!(mock.requests.lock().unwrap().len(), 5, "every step was sent once");
+}

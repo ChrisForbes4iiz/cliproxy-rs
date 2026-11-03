@@ -24,7 +24,8 @@
     "fixture/binary_strings[73] missing padding": "go-error",
     "fixture/binary_strings[74] space in base64": "go-error",
     "fixture/binary_strings[75] invalid base64 in an unknown setting": "go-error",
-    "fixture/binary_strings[77] not UTF-8": "value"
+    "fixture/binary_strings[77] not UTF-8": "value",
+    "fixture/prepare_upload[51] line separator in a string": "rust-error"
   },
   "stream": {
     "corpus/dup_keys_int_forms": "rust-error",
@@ -67,6 +68,7 @@
     "fixture/binary_strings[82] binary plugin pin through a merge": "value",
     "fixture/binary_strings[83] shadowed binary plugin pin": "value",
     "fixture/prepare_upload[17] merge key": "value",
+    "fixture/prepare_upload[51] line separator in a string": "rust-error",
     "fixture/prepare_upload[59] binary secret through a merge beside a copy": "value",
     "fixture/prepare_upload[71] binary host beside a merged secret": "value",
     "fixture/prepare_upload[72] hex key beside a merged secret": "value",
@@ -86,7 +88,8 @@
     "fixture/binary_strings[51] merge of a locally tagged mapping": "value",
     "fixture/binary_strings[52] merge of a list holding a locally tagged mapping": "value",
     "fixture/binary_strings[53] merge of a locally tagged sequence": "value",
-    "fixture/binary_strings[54] nested locally tagged merge": "value"
+    "fixture/binary_strings[54] nested locally tagged merge": "value",
+    "fixture/prepare_upload[51] line separator in a string": "rust-error"
   },
   "yaml": {
     "corpus/dup_keys_int_forms": "rust-error",
@@ -129,6 +132,7 @@
     "fixture/binary_strings[82] binary plugin pin through a merge": "value",
     "fixture/binary_strings[83] shadowed binary plugin pin": "value",
     "fixture/prepare_upload[17] merge key": "value",
+    "fixture/prepare_upload[51] line separator in a string": "rust-error",
     "fixture/prepare_upload[59] binary secret through a merge beside a copy": "value",
     "fixture/prepare_upload[71] binary host beside a merged secret": "value",
     "fixture/prepare_upload[72] hex key beside a merged secret": "value",

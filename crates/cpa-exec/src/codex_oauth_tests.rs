@@ -145,14 +145,19 @@ async fn exchange_and_refresh_wire_and_results_match_go() {
     assert_eq!(tokens_json(&tokens), go["result"]);
 }
 
+/// Go's attempt counts for a 5xx (retried) and `refresh_token_reused` (not). A rejected
+/// grant such as `invalid_grant`, which Go re-posts three times, is posted once here: only
+/// a 5xx answer is retried (DIFFERENCES-FROM-GO), so the error is the first attempt's,
+/// without Go's "after 3 attempts" wrapper.
 #[tokio::test]
 async fn refresh_retry_policy_matches_go_attempt_counts() {
     let mock = Mock::start().await;
-    for (name, replies, refresh) in [
+    for (name, replies, refresh, attempts) in [
         (
             "refresh_retry",
             vec![json(500, r#"{"error":"server_error"}"#), json(200, &token_body())],
             "rt-a",
+            None,
         ),
         (
             "refresh_reused",
@@ -161,22 +166,21 @@ async fn refresh_retry_policy_matches_go_attempt_counts() {
                 json(200, &token_body()),
             ],
             "rt-b",
+            None,
         ),
         (
             "refresh_invalid_grant",
             vec![json(400, r#"{"error":"invalid_grant"}"#); 3],
             "rt-c",
+            Some(1),
         ),
     ] {
         let oauth = oauth(&mock).await;
         mock.script("/oauth/token", replies);
         let result = oauth.refresh(refresh).await;
         let go = go_exchange(name);
-        assert_eq!(
-            mock.take().len(),
-            go["requests"].as_array().unwrap().len(),
-            "{name} attempts"
-        );
+        let go_attempts = go["requests"].as_array().unwrap().len();
+        assert_eq!(mock.take().len(), attempts.unwrap_or(go_attempts), "{name} attempts");
         match go["error"].as_str() {
             None => assert!(result.is_ok(), "{name}"),
             Some(go_error) => {
@@ -184,12 +188,106 @@ async fn refresh_retry_policy_matches_go_attempt_counts() {
                 let text = String::from_utf8_lossy(&error.body).into_owned();
                 // Go appends the raw body; only its OAuth error code is kept here.
                 let prefix = go_error.split(": {").next().unwrap();
+                let prefix = match attempts {
+                    Some(_) => prefix.rsplit("attempts: ").next().unwrap(),
+                    None => prefix,
+                };
                 assert!(text.starts_with(prefix), "{name}: {text} vs {go_error}");
                 assert_eq!(error.status, 401, "a rejected grant marks the credential unusable");
                 assert_eq!(error.scope, FailureScope::Credential);
             }
         }
     }
+}
+
+/// A refresh attempt that times out is not posted again: the endpoint may have rotated the
+/// token already, so a second post would earn `refresh_token_reused` (Go re-posts it;
+/// DIFFERENCES-FROM-GO). The mock stalls the first request and would answer a second.
+#[tokio::test]
+async fn a_timed_out_refresh_is_not_resent() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/oauth/token", listener.local_addr().unwrap());
+    let posts = Arc::new(AtomicUsize::new(0));
+    let seen = posts.clone();
+    let server = tokio::spawn(async move {
+        let mut stalled = Vec::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; 8192];
+            let _ = socket.read(&mut head).await;
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                stalled.push(socket);
+                continue;
+            }
+            let body = token_body();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes()).await;
+        }
+    });
+    let oauth = CodexOAuth::with_endpoints(wreq::Client::new(), &url, &url, &url)
+        .with_retry_delay(Duration::from_millis(1))
+        .with_attempt_timeout(Duration::from_millis(200));
+    let error = oauth.refresh("rt-stalled").await.unwrap_err();
+    assert_eq!(error.status, 504, "{error}");
+    assert_eq!(&error.body[..], b"codex token refresh timed out");
+    // A retry would have reached the mock well within this.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(posts.load(Ordering::SeqCst), 1, "the refresh token was posted once");
+    server.abort();
+}
+
+/// An `expires_in` the clock cannot add (chrono's `+` panics between about 8.3e12 and
+/// 9.2e15 seconds) fails the exchange as an invalid expiry instead of taking the login
+/// task down with it.
+#[tokio::test]
+async fn a_huge_expires_in_is_an_invalid_expiry_not_a_panic() {
+    let mock = Mock::start().await;
+    let oauth = oauth(&mock).await;
+    mock.script(
+        "/oauth/token",
+        vec![json(
+            200,
+            r#"{"access_token":"at","refresh_token":"rt","expires_in":9000000000000000}"#,
+        )],
+    );
+    let error = oauth
+        .exchange("code", "http://localhost:1455/auth/callback", "verifier")
+        .await
+        .unwrap_err();
+    assert_eq!((error.status, error.scope), (502, FailureScope::Credential));
+    assert_eq!(&error.body[..], b"invalid token expiry");
+    assert_eq!(mock.take().len(), 1);
+}
+
+/// The login's listener keeps serving after the callback, as Go's server runs until
+/// `Login` returns: the browser's redirect to /success is answered, not refused.
+#[tokio::test]
+async fn callback_listener_serves_success_after_the_callback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (server, mut callbacks) = serve_callbacks(listener);
+    let client = plain_client().unwrap();
+    let redirect = client
+        .get(format!("http://127.0.0.1:{port}/auth/callback?code=c1&state=s1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status().as_u16(), 302);
+    let callback = callbacks.recv().await.unwrap();
+    assert_eq!((callback.code.as_str(), callback.state.as_str()), ("c1", "s1"));
+    let success = client
+        .get(format!("http://127.0.0.1:{port}/success"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(success.status().as_u16(), 200);
+    assert!(success.text().await.unwrap().contains("Authentication successful"));
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
 
 /// Go's code exchange error appends the token endpoint's body; only its OAuth error

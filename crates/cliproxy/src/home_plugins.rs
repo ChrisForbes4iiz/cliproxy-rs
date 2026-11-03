@@ -12,7 +12,7 @@ use cpa_home::Client;
 use cpa_home::client::PluginTask;
 use cpa_plugin::gojson;
 use cpa_plugin::homeplugins::{self, PluginRuntime, SyncConfig, SyncReport};
-use cpa_plugin::store::{self, Doer, PluginSyncRequest, PluginSyncResponse};
+use cpa_plugin::store::{self, AuthConfig, Doer, PluginSyncRequest, PluginSyncResponse};
 use tokio_util::sync::CancellationToken;
 
 /// Go main's 30-second context around the bootstrap sync.
@@ -25,21 +25,83 @@ fn doer(cfg: &SyncConfig) -> Arc<dyn Doer> {
     Arc::new(store::WreqDoer::new(CLIENTS.get(&Proxy::parse(&cfg.proxy_url))))
 }
 
-/// The plugin config Home sent: `cfg` as the node runs it, with the `plugins.store-auth`
-/// that Home mode strips from it before applying (Go syncs with a copy that keeps it).
-pub fn sync_config(raw: &[u8], cfg: &cpa_core::config::Config) -> SyncConfig {
+/// The only environment variables a Home-supplied `plugins.store-auth` rule may name.
+pub const HOME_STORE_ENV_PREFIX: &str = "CPA_PLUGIN_STORE_";
+
+/// The plugin config Home sent: `cfg` as the node runs it (Home mode strips
+/// `plugins.store-auth` before applying it), with the store credentials an install may
+/// use: the node's own rules (`local`, from its config file) first, then Home's rules,
+/// each kept only when every environment variable it names starts with
+/// [`HOME_STORE_ENV_PREFIX`]. Go syncs with Home's rules as sent, so a Home payload could
+/// name any variable of the node process (`AWS_SECRET_ACCESS_KEY`) and have its value
+/// sent as a header to an artifact URL the same payload chooses
+/// (docs/DIFFERENCES-FROM-GO.md).
+pub fn sync_config(raw: &[u8], cfg: &cpa_core::config::Config, local: &[AuthConfig]) -> SyncConfig {
     let mut out = SyncConfig::from_document(&cfg.document);
     out.raw_configs = cfg.plugin_configs.clone();
+    let mut rules = local.to_vec();
     // As Go's typed decode reads it: `!!binary` values decoded, merges expanded.
-    let document = std::str::from_utf8(raw).ok().and_then(|text| {
-        let mut value = cpa_core::config::config_value(text).ok()?;
-        cpa_core::config::expand_merges(&mut value).ok()?;
-        Some(value)
-    });
-    if let Some(document) = document {
-        out.store_auth = cpa_plugin::config::store_auth(&document);
+    if let Some(document) = store_auth_document(raw) {
+        rules.extend(
+            cpa_plugin::config::store_auth(&document)
+                .into_iter()
+                .filter(home_rule_allowed),
+        );
     }
+    out.store_auth = rules;
     out
+}
+
+/// Whether a Home-supplied rule names only variables set aside for Home's use.
+fn home_rule_allowed(rule: &AuthConfig) -> bool {
+    let fields = [
+        ("token-env", &rule.token_env),
+        ("username-env", &rule.username_env),
+        ("password-env", &rule.password_env),
+        ("header-value-env", &rule.header_value_env),
+    ];
+    for (field, name) in fields {
+        let name = name.trim();
+        if !name.is_empty() && !name.starts_with(HOME_STORE_ENV_PREFIX) {
+            tracing::warn!(
+                rule = %rule.matches,
+                field,
+                env = name,
+                "ignoring plugin store-auth rule from Home: only {HOME_STORE_ENV_PREFIX}* variables may be named"
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// A config text as Go's typed decode reads it, when it parses.
+fn store_auth_document(raw: &[u8]) -> Option<cpa_core::yaml::Value> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut value = cpa_core::config::config_value(text).ok()?;
+    cpa_core::config::expand_merges(&mut value).ok()?;
+    Some(value)
+}
+
+/// The node's own `plugins.store-auth` rules: those in the config file at `path` (the
+/// `-config` file, which Home mode otherwise leaves unread), none when there is no such
+/// file. These rules name the operator's variables and are honoured as written.
+pub fn local_store_auth(path: &std::path::Path) -> Vec<AuthConfig> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "local config unread; no local plugin store-auth rules");
+            return Vec::new();
+        }
+    };
+    match store_auth_document(&raw) {
+        Some(document) => cpa_plugin::config::store_auth(&document),
+        None => {
+            tracing::warn!(path = %path.display(), "local config unparsed; no local plugin store-auth rules");
+            Vec::new()
+        }
+    }
 }
 
 /// Go `homePluginSyncKey`: what decides whether a config needs a new plugin sync.
@@ -412,7 +474,7 @@ mod tests {
         let key = |threshold: &str| {
             let raw = format!("plugins:\n  enabled: true\n  configs:\n    p: {{threshold: {threshold}}}\n");
             let cfg = crate::home::overlay(raw.as_bytes(), None).unwrap();
-            sync_key(&sync_config(raw.as_bytes(), &cfg))
+            sync_key(&sync_config(raw.as_bytes(), &cfg, &[]))
         };
         assert_eq!(key("1.50"), key("1.50"));
         assert_ne!(key("1.50"), key("1.5"));
@@ -614,22 +676,66 @@ mod tests {
         assert_ne!(first, sync_key(&cfg));
     }
 
+    /// Home mode strips `plugins.store-auth` from the config the node runs; the plugin
+    /// sync sees the node's own rules first, then Home's, and a Home rule naming a
+    /// variable outside `CPA_PLUGIN_STORE_*` (any secret of the node process) is not
+    /// applied. Deliberately unlike Go, which syncs with Home's rules as sent.
     #[test]
-    fn force_home_runtime_config_clears_store_auth() {
-        let raw = b"plugins:\n  store-auth:\n    - match: https://downloads.example/\n      type: bearer\n      token-env: PLUGIN_TOKEN\n";
+    fn home_store_auth_rules_apply_only_to_their_own_variables() {
+        let raw = b"plugins:\n  store-auth:\n    - match: https://downloads.example/\n      type: bearer\n      token-env: AWS_SECRET_ACCESS_KEY\n    - match: https://downloads.example/\n      type: header\n      header-name: X-Token\n      header-value-env: CPA_PLUGIN_STORE_DOWNLOADS\n    - match: https://other.example/\n      type: basic\n      username-env: CPA_PLUGIN_STORE_USER\n      password-env: PASSWORD\n";
         let cfg = crate::home::overlay(raw, None).unwrap();
         assert!(cpa_plugin::config::store_auth(&cfg.document).is_empty());
-        // The plugin sync still sees it.
-        assert_eq!(sync_config(raw, &cfg).store_auth.len(), 1);
+        let local = AuthConfig {
+            matches: "https://downloads.example/".into(),
+            auth_type: "bearer".into(),
+            token_env: "OPERATOR_TOKEN".into(),
+            ..Default::default()
+        };
+        let rules = sync_config(raw, &cfg, std::slice::from_ref(&local)).store_auth;
+        let got: Vec<_> = rules
+            .iter()
+            .map(|r| (r.auth_type.as_str(), r.token_env.as_str(), r.header_value_env.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                // The local rule, as written and first.
+                ("bearer", "OPERATOR_TOKEN", ""),
+                // Home's rule on a CPA_PLUGIN_STORE_ variable; the AWS one and the one
+                // with a bare password variable are gone.
+                ("header", "", "CPA_PLUGIN_STORE_DOWNLOADS"),
+            ]
+        );
+        assert_eq!(sync_config(raw, &cfg, &[]).store_auth.len(), 1, "no local rules");
+    }
+
+    /// The node's own rules come from its config file, unread by Home mode otherwise;
+    /// no file, no rules.
+    #[test]
+    fn local_store_auth_rules_come_from_the_config_file() {
+        let dir = tempdir();
+        let path = dir.join("config.yaml");
+        assert!(local_store_auth(&path).is_empty());
+        std::fs::write(
+            &path,
+            "plugins:\n  store-auth:\n    - match: https://downloads.example/\n      type: bearer\n      token-env: OPERATOR_TOKEN\n",
+        )
+        .unwrap();
+        let rules = local_store_auth(&path);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].token_env, "OPERATOR_TOKEN");
+        std::fs::write(&path, "plugins: [not a mapping\n").unwrap();
+        assert!(local_store_auth(&path).is_empty(), "unparsed file, no rules");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Go decodes the rules into typed fields, so a `!!binary` env name is its decoded
     /// text, through an alias too, and merge keys expand.
     #[test]
     fn store_auth_rules_read_binary_values_decoded() {
-        let raw = b"plugins:\n  store-auth:\n    - match: &m !!binary aHR0cHM6Ly9kb3dubG9hZHMuZXhhbXBsZS8=\n      type: bearer\n      token-env: !!binary UExVR0lOX1RPS0VO\n    - match: *m\n      type: basic\n      username-env: USER_ENV\n      password-env: PASS_ENV\n    - <<: [{match: https://a.example/, type: bearer, token-env: FIRST}, {token-env: SECOND}]\n      match: https://b.example/\n";
+        let raw = b"plugins:\n  store-auth:\n    - match: &m !!binary aHR0cHM6Ly9kb3dubG9hZHMuZXhhbXBsZS8=\n      type: bearer\n      token-env: !!binary Q1BBX1BMVUdJTl9TVE9SRV9UT0tFTg==\n    - match: *m\n      type: basic\n      username-env: CPA_PLUGIN_STORE_USER\n      password-env: CPA_PLUGIN_STORE_PASS\n    - <<: [{match: https://a.example/, type: bearer, token-env: CPA_PLUGIN_STORE_FIRST}, {token-env: CPA_PLUGIN_STORE_SECOND}]\n      match: https://b.example/\n";
         let cfg = crate::home::overlay(raw, None).unwrap();
-        let rules = sync_config(raw, &cfg).store_auth;
+        let rules = sync_config(raw, &cfg, &[]).store_auth;
         let got: Vec<_> = rules
             .iter()
             .map(|r| (r.matches.as_str(), r.token_env.as_str(), r.username_env.as_str()))
@@ -637,10 +743,10 @@ mod tests {
         assert_eq!(
             got,
             [
-                ("https://downloads.example/", "PLUGIN_TOKEN", ""),
-                ("https://downloads.example/", "", "USER_ENV"),
+                ("https://downloads.example/", "CPA_PLUGIN_STORE_TOKEN", ""),
+                ("https://downloads.example/", "", "CPA_PLUGIN_STORE_USER"),
                 // yaml.v3 merges: the explicit key wins, then the earlier mapping.
-                ("https://b.example/", "FIRST", "")
+                ("https://b.example/", "CPA_PLUGIN_STORE_FIRST", "")
             ]
         );
     }

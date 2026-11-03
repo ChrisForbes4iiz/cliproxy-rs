@@ -9,6 +9,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rtc::sdp::SessionDescription;
 use rtc::stun::attributes::{ATTR_FINGERPRINT, ATTR_MESSAGE_INTEGRITY, ATTR_MESSAGE_INTEGRITY_SHA256, ATTR_USERNAME};
@@ -27,6 +28,11 @@ const MAX_TUNNELS: usize = 16;
 const MAX_UNAUTHENTICATED: usize = 4;
 const MAX_FRAME: usize = 4096;
 const STUN_HEADER: usize = 20;
+/// How long a candidate connection may take to send its binding request. Go reads with
+/// no deadline, so four silent connections hold the `maxUnauthenticatedTCPConns` slots
+/// for the tunnel's whole life; here they are dropped and the slots freed (an ICE agent
+/// sends its first binding request at once).
+const VALIDATION_DEADLINE: Duration = Duration::from_secs(10);
 
 /// `nonRoutableProxyTargetPrefixes`.
 const V4_PREFIXES: [(Ipv4Addr, u8); 15] = [
@@ -227,6 +233,18 @@ pub(super) fn open(
     password: &str,
     on_forwarding: OnForwarding,
 ) -> Result<(SocketAddr, AbortHandle), String> {
+    open_with(target, dialer, user, password, on_forwarding, VALIDATION_DEADLINE)
+}
+
+/// [`open`] with the time a candidate connection gets to authenticate.
+pub(super) fn open_with(
+    target: SocketAddr,
+    dialer: Arc<dyn Dial>,
+    user: &str,
+    password: &str,
+    on_forwarding: OnForwarding,
+    deadline: Duration,
+) -> Result<(SocketAddr, AbortHandle), String> {
     if !is_public_target(target.ip()) || target.port() != 443 {
         return Err("Codex live TCP proxy target is not allowed".into());
     }
@@ -252,6 +270,7 @@ pub(super) fn open(
         user.to_owned(),
         password.to_owned(),
         on_forwarding,
+        deadline,
     ))
     .abort_handle();
     Ok((address, task))
@@ -712,6 +731,7 @@ async fn serve(
     user: String,
     password: String,
     on_forwarding: OnForwarding,
+    deadline: Duration,
 ) {
     let mut validating: JoinSet<Option<(TcpStream, Vec<u8>)>> = JoinSet::new();
     let (client, frame) = loop {
@@ -734,7 +754,10 @@ async fn serve(
                 let (user, password) = (user.clone(), password.clone());
                 validating.spawn(async move {
                     let mut conn = conn;
-                    match read_validated_frame(&mut conn, &user, &password).await {
+                    let validated = tokio::time::timeout(deadline, read_validated_frame(&mut conn, &user, &password))
+                        .await
+                        .unwrap_or_else(|_| Err("initial ICE-TCP STUN frame did not arrive in time".to_owned()));
+                    match validated {
                         Ok(frame) => Some((conn, frame)),
                         Err(e) => {
                             tracing::warn!(error = %e, "codex live TCP proxy: rejected unauthenticated candidate connection");

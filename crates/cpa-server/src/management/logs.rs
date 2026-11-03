@@ -693,11 +693,23 @@ fn get_logs_sync(dir: &Path, cursor: &str, after: &str, limit: &str, zone: Zone)
     }
 }
 
+/// Runs a directory walk or file removal off the runtime workers, as `auth_files` does;
+/// the answer is unchanged.
+async fn blocking(work: impl FnOnce() -> Response + Send + 'static) -> Response {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal error"))
+}
+
 /// Go `DeleteLogs`: truncates `main.log`, removes its rotations.
 pub(crate) async fn delete_logs(State(state): State<Arc<Management>>) -> Response {
     if !setting(&state, "logging-to-file") {
         return fail(StatusCode::BAD_REQUEST, "logging to file disabled");
     }
+    blocking(move || delete_logs_sync(&state)).await
+}
+
+fn delete_logs_sync(state: &Management) -> Response {
     let dir = state.log_dir.clone();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -757,10 +769,14 @@ pub(crate) async fn delete_logs(State(state): State<Arc<Management>>) -> Respons
 /// Go `GetRequestErrorLogs`: `error-*.log`, newest first; none while request logging
 /// is on.
 pub(crate) async fn error_logs(State(state): State<Arc<Management>>) -> Response {
-    let empty = || reply(StatusCode::OK, [("files", Value::Array(Vec::new()))]);
     if setting(&state, "request-log") {
-        return empty();
+        return reply(StatusCode::OK, [("files", Value::Array(Vec::new()))]);
     }
+    blocking(move || error_logs_sync(&state)).await
+}
+
+fn error_logs_sync(state: &Management) -> Response {
+    let empty = || reply(StatusCode::OK, [("files", Value::Array(Vec::new()))]);
     let entries = match std::fs::read_dir(&state.log_dir) {
         Ok(e) => e,
         Err(e) if not_found(&e) => return empty(),
@@ -1020,6 +1036,10 @@ pub(crate) async fn request_log(State(state): State<Arc<Management>>, UrlPath(id
     if id.contains(['/', '\\']) {
         return fail(StatusCode::BAD_REQUEST, "invalid request ID");
     }
+    blocking(move || request_log_sync(&state, id)).await
+}
+
+fn request_log_sync(state: &Management, id: String) -> Response {
     let entries = match std::fs::read_dir(&state.log_dir) {
         Ok(e) => e,
         Err(e) if not_found(&e) => return fail(StatusCode::NOT_FOUND, "log directory not found"),

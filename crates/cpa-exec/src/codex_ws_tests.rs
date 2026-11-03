@@ -1441,3 +1441,21 @@ fn ws_url_follows_go() {
         }
     }
 }
+
+/// A rejected upgrade's body reaches the error (and the request log) cut to 1 KiB, as
+/// gorilla's dialer keeps at most 1024 bytes of it.
+#[tokio::test]
+async fn rejected_upgrade_bodies_are_cut_to_1_kib() {
+    let (up, url) = upstream(vec![]).await;
+    let body: &'static str = Box::leak("x".repeat(5000).into_boxed_str());
+    *up.reject.lock().unwrap() = Some((503, body));
+    let executor = CodexExecutor::new().unwrap();
+    let error = executor
+        .execute_in_session(&credential(&url), request(BODY), &Config::default(), &session(false))
+        .await
+        .err()
+        .expect("503 handshake");
+    assert_eq!(error.status, 503);
+    assert_eq!(error.body.len(), 1024, "{error}");
+    assert!(error.body.iter().all(|&b| b == b'x'));
+}

@@ -53,6 +53,12 @@ pub fn from_slice<T: DeserializeOwned + 'static>(bytes: &[u8]) -> Result<T, Erro
 }
 
 /// `value` as one YAML document, written as serde_yaml_ng 0.10 wrote it.
+///
+/// Not round-trip safe through [`from_str`]: a string that yaml.v3 resolves to something
+/// else is written plain (`1_000`, `0X1F`, `007`, `0b-1`, `2001-12-14`) and reads back
+/// as a number or a timestamp, and a [`crate::config::TIMESTAMP_TAG`] value is written
+/// with that private tag. [`crate::config::yaml_string`] quotes those strings and writes
+/// a timestamp as its text; config files are written with it.
 pub fn to_string<T: ?Sized + Serialize>(value: &T) -> Result<String, Error> {
     emit::to_string(&to_value(value)?)
 }

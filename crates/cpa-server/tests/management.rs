@@ -2124,6 +2124,34 @@ async fn github_token_stays_out_of_the_v0_config_json() {
     }
 }
 
+/// Go `GetConfigYAML` (config_basic.go): the raw file, which holds the management hash
+/// and every key, goes out with `Cache-Control: no-store` and
+/// `X-Content-Type-Options: nosniff`, as the v8 YAML view does.
+#[tokio::test]
+async fn legacy_config_yaml_is_neither_cached_nor_sniffed() {
+    let f = Fixture::new("legacy-yaml-headers");
+    let (base, server) = f.server().await;
+    let r = wreq::Client::new()
+        .get(format!("{base}/v0/management/config.yaml"))
+        .bearer_auth("fake-management-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let header = |name: &str| {
+        r.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert_eq!(header("content-type"), "application/yaml; charset=utf-8");
+    assert_eq!(header("cache-control"), "no-store");
+    assert_eq!(header("x-content-type-options"), "nosniff");
+    assert_eq!(r.text().await.unwrap(), f.file(), "the raw file, byte for byte");
+    server.abort();
+}
+
 /// Go v8.0.35 `TestModelCatalogConfigRoundTrip` with `migrate` false: a v0 save keeps
 /// the `models` sources, which load back unchanged. `models` is a v8 root that Go's
 /// `IsV8ConfigLayout` does not share with the legacy layout, so the save writes v8. The

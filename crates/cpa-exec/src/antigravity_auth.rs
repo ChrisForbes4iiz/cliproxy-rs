@@ -328,7 +328,7 @@ impl OAuth {
                 status_message(STEP, status, &token_error_code(&body)),
             ));
         }
-        let body = proxy::read_all(upstream.body, usize::MAX, false)
+        let body = proxy::read_success(upstream.body)
             .await
             .map_err(|e| AuthError::plain(format!("{STEP}: decode response: {}", transport_text(&e))))?;
         Tokens::decode(&body, true, "TokenResponse")
@@ -365,7 +365,7 @@ impl OAuth {
                 status_message(STEP, status, &token_error_code(&body)),
             ));
         }
-        let body = proxy::read_all(upstream.body, usize::MAX, false)
+        let body = proxy::read_success(upstream.body)
             .await
             .map_err(|e| AuthError::plain(format!("{STEP}: decode response: {}", transport_text(&e))))?;
         let mut email = String::new();
@@ -394,7 +394,7 @@ impl OAuth {
             .await
             .map_err(|e| AuthError::plain(format!("execute request: {}", transport_text(&e))))?;
         let status = upstream.status;
-        let data = proxy::read_all(upstream.body, usize::MAX, false)
+        let data = proxy::read_success(upstream.body)
             .await
             .map_err(|e| AuthError::plain(format!("read response: {}", transport_text(&e))))?;
         if !(200..300).contains(&status) {
@@ -453,7 +453,7 @@ impl OAuth {
                     .await
                     .map_err(|e| AuthError::plain(format!("execute request: {}", transport_text(&e))))?;
                 let status = upstream.status;
-                let data = proxy::read_all(upstream.body, usize::MAX, false)
+                let data = proxy::read_success(upstream.body)
                     .await
                     .map_err(|e| AuthError::plain(format!("read response: {}", transport_text(&e))))?;
                 Ok::<_, AuthError>((status, data))
@@ -509,7 +509,7 @@ impl OAuth {
             .post(&self.token_endpoint, headers, form.into_bytes(), None)
             .await?;
         let status = upstream.status;
-        let data = proxy::read_all(upstream.body, usize::MAX, false).await?;
+        let data = proxy::read_success(upstream.body).await?;
         if !(200..300).contains(&status) {
             let code = token_error_code(&data);
             let message = if code.is_empty() {

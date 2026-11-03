@@ -775,6 +775,7 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
     let worker = state.clone();
     let flow = sid.clone();
     tokio::spawn(async move {
+        let guard = LoginGuard::new(worker.clone(), &flow, CODEX_CALLBACK_PORT, forwarder);
         if let Some(code) = wait_for_callback(&worker, &flow, "codex", "Bad Request").await {
             let client = login_client(&worker);
             let oauth = match &worker.login_base {
@@ -809,9 +810,49 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
             };
             settle(&worker, &flow, outcome).await;
         }
-        stop_forwarder(&worker, CODEX_CALLBACK_PORT, forwarder);
+        guard.finish();
     });
     started(url, sid)
+}
+
+/// Settles a login whose task ends without settling it. A panic in the exchange or the
+/// save (a hostile token endpoint once crashed the Codex expiry arithmetic) would
+/// otherwise leave the session pending, polled as `wait` until it expires, with its
+/// callback forwarder bound. [`LoginGuard::finish`] is the normal end; dropping an
+/// unfinished guard fails the session and stops the forwarder.
+struct LoginGuard {
+    state: Arc<Management>,
+    sid: String,
+    port: u16,
+    forwarder: Option<u64>,
+    armed: bool,
+}
+
+impl LoginGuard {
+    fn new(state: Arc<Management>, sid: &str, port: u16, forwarder: Option<u64>) -> Self {
+        Self {
+            state,
+            sid: sid.to_owned(),
+            port,
+            forwarder,
+            armed: true,
+        }
+    }
+
+    /// The task settled the session itself; only the forwarder is left to stop.
+    fn finish(mut self) {
+        self.armed = false;
+        stop_forwarder(&self.state, self.port, self.forwarder.take());
+    }
+}
+
+impl Drop for LoginGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            fail_session(&self.state, &self.sid, "Authentication failed");
+            stop_forwarder(&self.state, self.port, self.forwarder.take());
+        }
+    }
 }
 
 /// Go `RequestAntigravityToken`: reuse the CLI exchange and storage, but unlike
@@ -1601,6 +1642,73 @@ fn redirect_query(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn management() -> (Arc<Management>, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("cpa-oauth-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, format!("oauth: {{auth-dir: {}}}\n", dir.display())).unwrap();
+        let rt = Arc::new(crate::testing::runtime(
+            cpa_core::config::Config::load(&path).unwrap(),
+            Vec::new(),
+            cpa_exec::Executors {
+                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        ));
+        (Management::new(rt, path), dir)
+    }
+
+    /// A forwarder entry whose task only holds a listener open.
+    async fn fake_forwarder(state: &Management, id: u64) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
+        state.forwarders.lock().unwrap().insert(port, Forwarder { id, task });
+        port
+    }
+
+    /// A login task that unwinds (a panic in the exchange or the save) fails its session
+    /// and releases its callback forwarder, instead of leaving the session pending, polled
+    /// as `wait` until it expires, with the forwarder's port bound. A task that settled
+    /// its session itself only releases the forwarder.
+    #[tokio::test]
+    async fn an_unwinding_login_task_fails_its_session_and_stops_its_forwarder() {
+        let (state, dir) = management();
+        state.oauth.register("st", "codex");
+        let port = fake_forwarder(&state, 7).await;
+        let worker = state.clone();
+        let unwound = tokio::spawn(async move {
+            let guard = LoginGuard::new(worker, "st", port, Some(7));
+            if std::hint::black_box(true) {
+                panic!("token exchange panicked");
+            }
+            guard.finish();
+        })
+        .await;
+        assert!(unwound.is_err(), "the task unwound");
+        assert_eq!(
+            state.oauth.get("st"),
+            Some(("codex".into(), "Authentication failed".into(), false)),
+            "the session failed instead of staying pending"
+        );
+        assert!(
+            !state.forwarders.lock().unwrap().contains_key(&port),
+            "the forwarder was released"
+        );
+
+        state.oauth.register("ok", "codex");
+        let port = fake_forwarder(&state, 8).await;
+        let guard = LoginGuard::new(state.clone(), "ok", port, Some(8));
+        state.oauth.complete("ok");
+        guard.finish();
+        assert_eq!(state.oauth.get("ok"), Some(("codex".into(), String::new(), true)));
+        assert!(!state.forwarders.lock().unwrap().contains_key(&port));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn session_causes_drop_upstream_bodies_and_descriptions() {

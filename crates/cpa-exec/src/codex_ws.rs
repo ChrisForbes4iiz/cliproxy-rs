@@ -71,8 +71,9 @@ impl WriteLimit {
 }
 /// Go's per-turn read channel capacity.
 const TURN_BUFFER: usize = 4096;
-/// Bound on a handshake rejection body.
-const MAX_HANDSHAKE_BODY: usize = 64 * 1024;
+/// gorilla's dialer keeps at most 1 KiB of a rejected handshake's body (`client.go`), and
+/// that is all of it Go's error text and request logs ever hold.
+const MAX_HANDSHAKE_BODY: usize = 1024;
 /// Largest upstream frame or message read.
 // ponytail: Go sets no read limit; 64 MiB (the HTTP body cap) keeps one socket's memory
 // bounded while fitting image-bearing output items.

@@ -678,9 +678,19 @@ fn main() -> anyhow::Result<()> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     runtime.spawn(heap_trim::run());
     let file_log = args.log_file.is_some();
-    let result = runtime.block_on(run(args, host, builtin));
+    let (served_tx, mut served_rx) = tokio::sync::oneshot::channel();
+    let result = runtime.block_on(run(args, host, builtin, served_tx));
     if file_log && let Err(error) = &result {
         tracing::error!("{error:#}");
+    }
+    // The tasks the server left running (a refresh, a request still holding a lease) are
+    // dropped with the tokio runtime, inside its context: a lease dropped there records
+    // its cancellation and queues one more cooldown snapshot on the persistence worker,
+    // after the flush `serve` did. Shut the runtime down first, then wait for that write
+    // before the process exit would kill it.
+    drop(runtime);
+    if let Ok(rt) = served_rx.try_recv() {
+        rt.flush_persistence_blocking();
     }
     result
 }
@@ -777,7 +787,14 @@ mod heap_trim {
     }
 }
 
-async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String)>) -> anyhow::Result<()> {
+/// `served` receives the runtime the plain server runs on, for the flush after the tokio
+/// runtime shuts down; the other commands never send.
+async fn run(
+    args: Args,
+    plugins: cpa_plugin::Host,
+    builtin: Vec<(String, String)>,
+    served: tokio::sync::oneshot::Sender<Arc<Runtime>>,
+) -> anyhow::Result<()> {
     for warning in secret_flag_warnings(&args) {
         tracing::warn!("{warning}");
     }
@@ -828,7 +845,14 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
     // Go main: with a Home JWT the config comes from Home; the config path stays for
     // downstream components but need not exist.
     let (mut config, home_config, home_plugins) = match &home_jwt {
-        Some(jwt) => match home::bootstrap(jwt, args.home_disable_cluster_discovery, &plugins).await {
+        Some(jwt) => match home::bootstrap(
+            jwt,
+            args.home_disable_cluster_discovery,
+            &plugins,
+            &home_plugins::local_store_auth(&config_path),
+        )
+        .await
+        {
             Ok((home_config, config, home_plugins)) => (config, Some(home_config), Some(home_plugins)),
             Err(line) => {
                 tracing::error!("{line}");
@@ -933,6 +957,7 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
         plugins,
         shutdown_signal(),
         None,
+        Some(served),
     )
     .await
 }
@@ -1113,6 +1138,7 @@ async fn standalone_tui(
         plugins,
         shutdown,
         Some(listening),
+        None,
     ));
     // No listener means serve failed; its error is logged below.
     let base = match listener.await {
@@ -1247,8 +1273,14 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
             Err(cpa_exec::codex_siwc_bind::BindError::Log(line)) => tracing::error!("{line}"),
             Err(cpa_exec::codex_siwc_bind::BindError::Print(line)) => println!("{line}"),
             Err(cpa_exec::codex_siwc_bind::BindError::PortInUse) => {
+                // Go's ErrPortInUse text names port 3000 whatever port was bound; the
+                // real one is named here.
                 tracing::error!(
-                    "The required port is already in use. Please close any applications using port 3000 and try again."
+                    "{}",
+                    port_in_use(match args.oauth_callback_port {
+                        0 => cpa_exec::codex_siwc_bind::CALLBACK_PORT,
+                        port => port,
+                    })
                 );
                 std::process::exit(13);
             }
@@ -1302,9 +1334,7 @@ async fn command(args: &Args, config: &Config) -> anyhow::Result<Ran> {
             let message = String::from_utf8_lossy(&error.body).into_owned();
             // DoClaudeLogin: a busy callback port exits with ErrPortInUse's code 13.
             if message.starts_with(cpa_exec::claude_login::PORT_IN_USE) {
-                tracing::error!(
-                    "The required port is already in use. Please close any applications using port 3000 and try again."
-                );
+                tracing::error!("{}", port_in_use(options.callback_port));
                 std::process::exit(13);
             }
             println!("Claude authentication failed: {message}");
@@ -1355,6 +1385,16 @@ fn standalone_base_url((addr, tls): (SocketAddr, bool)) -> Result<String, String
     Ok(format!("http://{}", SocketAddr::new(ip, addr.port())))
 }
 
+/// Go `ErrPortInUse`'s text (`internal/auth/{claude,codex}/errors.go`), which always says
+/// "port 3000"; here it names the port that was actually busy (54545 for Claude, 1455
+/// for Codex, or the one `--oauth-callback-port` chose) and the flag that moves it.
+fn port_in_use(port: u16) -> String {
+    format!(
+        "The required port is already in use. Please close any applications using port {port} and try again, \
+         or choose another port with --oauth-callback-port."
+    )
+}
+
 /// Go `Service.ensureAuthDir`.
 fn ensure_auth_dir(dir: &Path) -> anyhow::Result<()> {
     match std::fs::metadata(dir) {
@@ -1391,7 +1431,10 @@ fn app(rt: &Arc<Runtime>, management: &Arc<cpa_server::management::Management>, 
     let app = app.layer(axum::middleware::from_fn(cpa_server::management::cors));
     let app = cpa_server::request_logging::router(management, app);
     let app = cpa_server::body_limit::layer(rt, app);
-    cpa_server::observability::router(rt, app)
+    let app = cpa_server::observability::router(rt, app);
+    // Outermost, as Go's GinLogrusRecovery wraps every route: a panic anywhere below
+    // answers 500 instead of ending the connection.
+    app.layer(axum::middleware::from_fn(cpa_server::recovery::recover))
 }
 
 /// `listening` (standalone TUI only) receives the bound address and whether TLS is on.
@@ -1406,6 +1449,7 @@ async fn serve(
     plugins: cpa_plugin::Host,
     shutdown: impl std::future::Future<Output = ()>,
     listening: Option<tokio::sync::oneshot::Sender<(SocketAddr, bool)>>,
+    runtime_out: Option<tokio::sync::oneshot::Sender<Arc<Runtime>>>,
 ) -> anyhow::Result<()> {
     if config.api_keys.is_empty() && home_config.is_none() {
         tracing::warn!("access.api-keys is empty: the proxy API is open to anyone who can reach it");
@@ -1445,6 +1489,9 @@ async fn serve(
         google: Default::default(),
     };
     let rt = Arc::new(Runtime::new(config, credentials, executors).with_plugin_host(plugins));
+    if let Some(out) = runtime_out {
+        let _ = out.send(rt.clone());
+    }
     // What each file credential was loaded from, for Go-exact management saves.
     rt.store().note_loaded(&read);
     rt.set_local_model(local_model);
@@ -1457,7 +1504,10 @@ async fn serve(
         let dispatcher = Arc::new(home::Dispatcher::new(&rt));
         rt.set_remote_dispatch(Some(dispatcher.clone()));
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let task = home::spawn_subscriber(home_config, rt.clone(), dispatcher, shutdown.clone());
+        // The node's own plugin store rules, from the `-config` file Home mode otherwise
+        // leaves unread; Home's rules may name only CPA_PLUGIN_STORE_* variables.
+        let local_store_auth = home_plugins::local_store_auth(&config_path);
+        let task = home::spawn_subscriber(home_config, rt.clone(), dispatcher, shutdown.clone(), local_store_auth);
         (shutdown, task)
     });
     // Translators and thinking validation read model capabilities through the global
@@ -1553,7 +1603,8 @@ async fn serve(
     // Server.Stop closes the HTTP server without draining (http.Server.Close).
     drop(server);
     // Results recorded by requests that finished during cleanup are written off the
-    // request path; write them before the process exits.
+    // request path; write them before the process exits. `main` flushes once more after
+    // the tokio runtime has dropped the tasks still holding leases.
     rt.flush_persistence().await;
     served
 }
@@ -1561,6 +1612,24 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The busy-port line names the port that was bound, not Go's fixed "port 3000", and
+    /// the flag that moves it.
+    #[test]
+    fn busy_oauth_port_message_names_the_real_port() {
+        let claude = port_in_use(cpa_exec::claude_login::DEFAULT_CALLBACK_PORT);
+        assert!(
+            claude.starts_with(
+                "The required port is already in use. Please close any applications using port 54545 and try again"
+            ),
+            "{claude}"
+        );
+        assert!(claude.contains("-oauth-callback-port"), "{claude}");
+        let codex = port_in_use(cpa_exec::codex_siwc_bind::CALLBACK_PORT);
+        assert!(codex.contains("using port 1455 and try again"), "{codex}");
+        assert!(port_in_use(9000).contains("using port 9000 and try again"));
+        assert!(!claude.contains("3000"));
+    }
 
     /// After `-siwc-bind`, the remote store gets only the bound file, under the store's
     /// spelling of the auth directory, and nothing when the bind failed; a login still
@@ -1985,6 +2054,7 @@ mod tests {
                 let _ = stopped.await;
             },
             Some(listening),
+            None,
         ));
         let base = standalone_base_url(listener.await.unwrap()).unwrap();
         assert_ne!(base, "http://127.0.0.1:0");

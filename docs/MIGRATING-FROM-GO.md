@@ -1,6 +1,6 @@
 # Moving from CLIProxyAPI (Go) to cliproxy-rs
 
-cliproxy-rs follows CLIProxyAPI at commit `6fecc6e` (v8.0.10). It reads the same files, so switching is a matter of stopping one binary and starting the other on the same config. This page lists what carries over, what does not, and how to switch back.
+cliproxy-rs follows CLIProxyAPI v8.0.35, commit `ae3ee3be`. It reads the same files, so switching is a matter of stopping one binary and starting the other on the same config. This page lists what carries over, what does not, and how to switch back.
 
 ## What carries over
 
@@ -29,7 +29,9 @@ Do not run Go and cliproxy-rs with credentials for the same account at the same 
 
 ## Command-line flags
 
-cliproxy-rs accepts every CLIProxyAPI flag, in Go's single-dash spelling (`-config`) or with two dashes. These work as in Go: `-config`, `-claude-login`, `-codex-login`, `-codex-device-login`, `-antigravity-login`, `-kimi-login`, `-kimi-ai-login`, `-xai-login`, `-meta-login`, `-devin-login`, `-vertex-import` (with `-vertex-import-prefix`), `-no-browser`, `-oauth-callback-port`, `-password`, `--local-model`, `-home-jwt` (or `HOME_JWT`), and LAN discovery with `-discover` (or the `discover` subcommand) and its `-discover-*` options.
+cliproxy-rs accepts every CLIProxyAPI flag, in Go's single-dash spelling (`-config`) or with two dashes. These work as in Go: `-config`, `-claude-login`, `-codex-login`, `-codex-device-login`, `-antigravity-login`, `-kimi-login`, `-kimi-ai-login`, `-xai-login`, `-meta-login`, `-devin-login`, `-vertex-import` (with `-vertex-import-prefix`), `-siwc-bind`, `-no-browser`, `-oauth-callback-port`, `-password`, `-local-model`, `-home-jwt` (or `HOME_JWT`), `-home-disable-cluster-discovery`, `-tui`, `-standalone`, `-management-base-url`, and LAN discovery with `-discover` (or the `discover` subcommand) and its `-discover-*` options. As in Go, `-password` is left out of `--help`. It is visible in process listings, as is `-home-jwt`, so cliproxy-rs logs a warning when either is used; `MANAGEMENT_PASSWORD` and `HOME_JWT` are the better choice.
+
+Two flags exist only in cliproxy-rs: `-log-file <path>` writes the process log to that file, rotated at 10 MiB, and `-working-dir <dir>` changes to that directory before `.env`, plugins or any relative path is read. Both must come before any plugin flag that takes a value.
 
 `-tui` and `-tui -standalone` open the terminal UI as in Go, with the differences listed in [DIFFERENCES-FROM-GO.md](DIFFERENCES-FROM-GO.md).
 
@@ -39,7 +41,7 @@ These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs d
 
 | Go setting or feature | In cliproxy-rs |
 | --- | --- |
-| `pprof` | No profiling endpoint. |
+| `pprof` | `observability.pprof.enable` (or the legacy top-level `pprof` mapping) starts the separate debug listener at `observability.pprof.addr`, `127.0.0.1:8316` by default. It serves the index, `cmdline` (with the values of `-password` and `-home-jwt` redacted) and `symbol`; Go's runtime profiles answer `501`, and CPU `profile` needs a Unix build with `--features cpa-server/pprof`. See [CONFIGURATION.md](CONFIGURATION.md#observability). |
 | Plugins on the request path | Frontend auth, model routers, plugin catalogs and executors (with or without a router), plugin schedulers, request and response translators and normalizers, thinking appliers, request, response and stream-chunk interceptors, the WebSocket response observer, the request lifecycle and usage plugins run as in Go, and so do the `host.http.*`, `host.auth.*`, `host.model.*` and `host.affinity.lookup` callbacks. Auth files go to the plugin auth provider owning their type before the built-in loader (`auth.parse`), as in Go; plugins are trusted code, and an auth provider sees every auth file with no `type`. Not called yet: per-credential model discovery (`model.for_auth`), and the plugin response hooks on a Claude client's buffered Claude answer. |
 | Home-managed plugins | With `-home-jwt`, bootstrap, config updates, dispatch, usage, process and request logs, in-flight reporting and shared KV state work. Plugin binaries must already be installed locally; Home-supplied configuration can configure them, but Home-managed plugin sync, tasks and status reports are unavailable. |
 | `management.panel-github-repository`, `management.disable-auto-update-panel`, `MANAGEMENT_STATIC_PATH` | The dashboard is built into the binary and never downloaded or read from disk. `management.disable-control-panel` is honoured. |
@@ -51,11 +53,11 @@ These settings are accepted in `config.yaml` and kept on save, but cliproxy-rs d
 
 The v8 routes for config, credentials, OAuth sign-in, `requests/api-call`, cooldown reset, usage, logs, model definitions and plugins behave as in Go, and so do the older `/v0/management` routes, apart from those listed below. OAuth sign-in through the API works for Claude, Codex, Antigravity, Kimi, Meta, xAI and Devin, and `oauth/import?provider=vertex` (or `/v0/management/vertex/import`) imports a Vertex service account as in Go.
 
-Not available on cliproxy-rs:
+Different on cliproxy-rs:
 
-- `server/latest-version` answers `502` with "no release repository is configured" because cliproxy-rs doesn't check for its own releases yet. Go asks GitHub for the latest CLIProxyAPI release.
+- `server/latest-version` reports the latest cliproxy-rs release, not CLIProxyAPI's: one anonymous HEAD request to `https://github.com/vayungodara/cliproxy-rs/releases/latest`, cached for 12 hours, sent through `requests.proxy-url` (or the environment proxy when none is set) without redirects, cookies or tokens. With `CLIPROXY_NO_UPDATE_CHECK=1` in the server's environment the route answers `503` and nothing is sent. Go asks the GitHub API for the latest CLIProxyAPI release.
 
-The bundled dashboard checks which server it is talking to and marks these features as not available instead of failing.
+The bundled dashboard checks which server it is talking to and marks a feature one server lacks as not available instead of failing.
 
 ## Differences from Go
 

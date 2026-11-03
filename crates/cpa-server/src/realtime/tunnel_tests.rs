@@ -107,6 +107,51 @@ fn open_tunnel(dialer: Arc<dyn Dial>, on_forwarding: OnForwarding) -> Open {
     Open(address, task)
 }
 
+fn open_tunnel_with(dialer: Arc<dyn Dial>, on_forwarding: OnForwarding, deadline: Duration) -> Open {
+    let (address, task) = open_with(
+        TARGET.parse().unwrap(),
+        dialer,
+        "remote:local",
+        "remote-password",
+        on_forwarding,
+        deadline,
+    )
+    .unwrap();
+    Open(address, task)
+}
+
+/// A candidate connection that never sends its binding request is dropped at the
+/// validation deadline, so the `maxUnauthenticatedTCPConns` slots it held are free
+/// again for a connection that does authenticate.
+#[tokio::test]
+async fn silent_candidate_connections_are_dropped_at_the_deadline() {
+    let (dialer, mut dials) = recording(false);
+    let (on_forwarding, _started) = counter();
+    let tunnel = open_tunnel_with(dialer, on_forwarding, Duration::from_millis(200));
+    let mut silent = Vec::new();
+    for _ in 0..MAX_UNAUTHENTICATED {
+        let mut conn = TcpStream::connect(tunnel.0).await.unwrap();
+        // A partial frame header, never completed.
+        conn.write_all(&[0]).await.unwrap();
+        silent.push(conn);
+    }
+    for conn in &mut silent {
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(3), conn.read_to_end(&mut rest)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "closed at the deadline without an answer: {read:?}"
+        );
+    }
+    let mut client = TcpStream::connect(tunnel.0).await.unwrap();
+    client.write_all(&valid_frame()).await.unwrap();
+    let (target, _) = tokio::time::timeout(Duration::from_secs(1), dials.recv())
+        .await
+        .expect("the freed slot authenticates a real candidate")
+        .unwrap();
+    assert_eq!(target.to_string(), TARGET);
+}
+
 #[tokio::test]
 async fn answers_are_rewritten_like_go() {
     for case in golden()["prepare"].as_array().unwrap() {
