@@ -138,6 +138,8 @@ shasum -a 256 --check --ignore-missing SHA256SUMS  # macOS
 
 On Windows, compare the output of `Get-FileHash cliproxy-<version>-x86_64-pc-windows-msvc.zip` with the line in `SHA256SUMS`.
 
+The checksum proves the download is intact, not who published it: `SHA256SUMS` comes from the same release as the archive. Homebrew, the AUR, winget and Scoop pin the hashes in separate repositories; see [SECURITY.md](../SECURITY.md#verifying-a-release).
+
 Unpack and put the binary on your `PATH`:
 
 ```sh
