@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "cliproxy_rs",
+  "project_id": "8d9fd5cc-f410-4a20-ae2d-9b201ed913be"
+}
