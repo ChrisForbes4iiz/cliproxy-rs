@@ -343,7 +343,10 @@ mod sys {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: `raw` is a fresh descriptor nobody else owns.
-            let fd = AsyncFd::with_interest(unsafe { OwnedFd::from_raw_fd(raw) }, Interest::READABLE)?;
+            let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+            // SAFETY: an `OwnedFd` keeps its descriptor open and returns the same one from
+            // `as_raw_fd` until it is dropped with the `AsyncFd`.
+            let fd = unsafe { AsyncFd::register_with_interest(owned, Interest::READABLE) }?;
             let mut watch = Self {
                 fd,
                 watches: HashMap::new(),
@@ -604,7 +607,9 @@ mod sys {
             let mut watch = Self {
                 // Read interest only: a kqueue descriptor supports EVFILT_READ, and
                 // registering it for writes fails.
-                kq: AsyncFd::with_interest(owned, Interest::READABLE)?,
+                // SAFETY: an `OwnedFd` keeps its descriptor open and returns the same one
+                // from `as_raw_fd` until it is dropped with the `AsyncFd`.
+                kq: unsafe { AsyncFd::register_with_interest(owned, Interest::READABLE) }?,
                 open: HashMap::new(),
             };
             watch.retarget(targets)?;

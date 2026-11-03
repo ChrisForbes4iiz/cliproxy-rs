@@ -1210,6 +1210,11 @@ fn write_atomic(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<bool>
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let existing = std::fs::metadata(target).ok();
+    // A file this process may not write stays refused, as Go's in-place write refuses
+    // it: a rename would replace a read-only file the folder happens to allow.
+    if existing.is_some() {
+        std::fs::OpenOptions::new().write(true).open(target)?;
+    }
     let dir = match target.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
         _ => std::path::Path::new("."),
