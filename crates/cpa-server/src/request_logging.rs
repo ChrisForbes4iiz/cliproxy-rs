@@ -1946,7 +1946,8 @@ mod tests {
             if let Some(payload) = captured.first() {
                 let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
                 assert_eq!(payload["request_id"], "fixture-request-id");
-                assert_eq!(payload["headers"]["Authorization"][0], "Bearer 1234567890");
+                // Masked like the log text (DIFFERENCES-FROM-GO.md: Go forwards it raw).
+                assert_eq!(payload["headers"]["Authorization"][0], "Bearer 1234...7890");
                 let content = payload["request_log"].as_str().unwrap();
                 assert!(content.contains("Authorization: Bearer 1234...7890"));
                 assert!(content.contains(

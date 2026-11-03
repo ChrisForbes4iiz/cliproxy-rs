@@ -2499,8 +2499,14 @@ impl CredentialStore {
                 }
             }
             // Go persists on every recorded result, a client-cancelled stream included.
-            let credential = self.needs_persist(&lease.credential).then_some(&lease.credential);
-            self.persist_later(changed, credential);
+            // The credential file is written here, in the call that recorded the result,
+            // as Go writes it: a queued write could land after a newer edit on disk and
+            // replace it. It runs once per revision (`needs_persist`), so it is rare. The
+            // cooldown snapshot, which writes a file per credential, is queued.
+            if self.needs_persist(&lease.credential) {
+                self.persist_credential(&lease.credential);
+            }
+            self.persist_later(changed, None);
         }
     }
 
@@ -3010,7 +3016,7 @@ impl CredentialStore {
         let next = Arc::new(next);
         self.register(std::slice::from_ref(slot), std::slice::from_ref(&next), &[]);
         let cleared = self.clear_replaced_unauthorized(std::slice::from_ref(slot), std::slice::from_ref(&next));
-        let catalog = registration_changed(&**slot, &next);
+        let catalog = registration_changed(slot, &next);
         *slot = next;
         let committed = slot.clone();
         inner.generation = generation;
@@ -5493,36 +5499,30 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A result recorded on a tokio worker hands its file writes to the persistence
-    /// worker: the lease ends while the write is still stalled on disk, and a flush
-    /// waits for it.
+    /// A result recorded on a tokio worker writes its credential file in the same call,
+    /// as Go does, so a later edit on disk is never replaced by a queued older write;
+    /// only the cooldown snapshot goes to the persistence worker.
     #[tokio::test]
-    async fn a_recorded_result_writes_its_file_off_the_worker() {
-        let (dir, _cfg, store) = stalled_store("persist-off-worker", &["a.json"]);
+    async fn a_recorded_result_writes_its_credential_in_the_same_call() {
+        let (dir, _cfg, store) = stalled_store("persist-same-call", &["a.json"]);
         let path = dir.join("a.json");
-        let (entered, release) = stall_next_write(&path);
-        let lease = store.select(Selection::new("claude", "m")).unwrap();
-        let handle = tokio::runtime::Handle::current();
-        let ended = spawn_bounded(move || {
-            let _runtime = handle.enter();
-            lease.complete(Outcome::Success);
-        });
-        ended
-            .recv_timeout(BOUND)
-            .expect("the lease ends without waiting for the file");
-        entered.recv_timeout(BOUND).expect("the worker writes the credential");
+        store
+            .select(Selection::new("claude", "m"))
+            .unwrap()
+            .complete(Outcome::Success);
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            r#"{"type":"claude","access_token":"old"}"#,
-            "still stalled"
+            written["disabled"], false,
+            "written before complete returned: {written}"
         );
-        drop(release);
+        // An edit that lands after the result stays: nothing queued rewrites the file.
+        let edited = r#"{"type":"claude","access_token":"edited"}"#;
+        std::fs::write(&path, edited).unwrap();
         let flushing = store.clone();
         spawn_bounded(move || flushing.flush_persistence())
             .recv_timeout(BOUND)
-            .expect("the flush returns once the write lands");
-        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written["disabled"], false, "Go's persisted form: {written}");
+            .expect("the flush returns");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5842,7 +5842,10 @@ pub(crate) mod tests {
             saves: Mutex::default(),
         });
         rt.set_cooldown_backend(backend.clone());
-        assert!(!rt.store.cooldowns("a.json").is_empty(), "the backend's cooldown was restored");
+        assert!(
+            !rt.store.cooldowns("a.json").is_empty(),
+            "the backend's cooldown was restored"
+        );
         let saves_before = backend.saves.lock().unwrap().len();
 
         backend.armed.store(true, Ordering::SeqCst);
@@ -5868,7 +5871,10 @@ pub(crate) mod tests {
         assert!(returned, "the reset waited for the stalled save");
         assert!(stalled, "the save ran on the persistence worker");
         assert_eq!(saved_while_stalled, saves_before, "nothing saved while stalled");
-        assert!(rt.store.cooldowns("a.json").is_empty(), "the reset cleared the cooldown");
+        assert!(
+            rt.store.cooldowns("a.json").is_empty(),
+            "the reset cleared the cooldown"
+        );
 
         rt.flush_persistence().await;
         let saves = backend.saves.lock().unwrap();
@@ -5945,15 +5951,22 @@ pub(crate) mod tests {
                 ],
             );
             assert!(rt.store.epoch() > epoch, "{id}: the refresh committed");
-            assert!(Arc::ptr_eq(&built, &rt.registry()), "{id}: a token refresh rebuilt the registry");
+            assert!(
+                Arc::ptr_eq(&built, &rt.registry()),
+                "{id}: a token refresh rebuilt the registry"
+            );
         }
         patch("antigravity-a.json", &[("project_id", "p2")]);
         let rebuilt = rt.registry();
-        assert!(!Arc::ptr_eq(&built, &rebuilt), "an Antigravity project_id change rebuilds");
+        assert!(
+            !Arc::ptr_eq(&built, &rebuilt),
+            "an Antigravity project_id change rebuilds"
+        );
         patch("codex-a.json", &[("prefix", "team")]);
         let prefixed = rt.registry();
+        // A metadata prefix is a catalog input (`credential_prefix` falls back to it), so
+        // the change rebuilds; this file-loaded credential's `prefix` attribute still wins.
         assert!(!Arc::ptr_eq(&rebuilt, &prefixed), "a prefix change rebuilds");
-        assert!(prefixed.ids().any(|id| id.starts_with("team/")), "the rebuild registers the prefix");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

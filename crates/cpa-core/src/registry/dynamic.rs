@@ -1157,7 +1157,14 @@ pub fn models_for(cfg: &Config, aliases: &HashMap<String, Vec<OAuthAlias>>, c: &
 /// kind alone: `prefix` ([`credential_prefix`]), `models` and `model_aliases`
 /// ([`config_models`]), and the Vertex model lists (`openapi_models`, `openapi-models`,
 /// `models`).
-const CATALOG_METADATA: [&str; 6] = ["prefix", "models", "model_aliases", "openapi_models", "openapi-models", "auth_kind"];
+const CATALOG_METADATA: [&str; 6] = [
+    "prefix",
+    "models",
+    "model_aliases",
+    "openapi_models",
+    "openapi-models",
+    "auth_kind",
+];
 
 /// Whether [`models_for`] (and [`Registry::build`], which registers its result under
 /// the ID and [`provider_key`]) can give `after` other models than `before`, under the
@@ -1855,31 +1862,57 @@ mod tests {
             c
         };
         let refreshed = with(&|c| {
-            for (k, v) in [("access_token", "new"), ("refresh_token", "r2"), ("expired", "2026-02-01T00:00:00Z"), ("project_id", "p2"), ("last_refresh", "now")] {
+            for (k, v) in [
+                ("access_token", "new"),
+                ("refresh_token", "r2"),
+                ("expired", "2026-02-01T00:00:00Z"),
+                ("project_id", "p2"),
+                ("last_refresh", "now"),
+            ] {
                 c.metadata.insert(k.into(), v.into());
             }
             c.revision += 1;
         });
         assert!(!catalog_changed(&base, &refreshed), "a token refresh");
-        let ids = |c: &Credential| models_for(&cfg, &aliases, c, 0).into_iter().map(|m| m.id).collect::<Vec<_>>();
+        let ids = |c: &Credential| {
+            models_for(&cfg, &aliases, c, 0)
+                .into_iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids(&base), ids(&refreshed));
         for (what, changed) in [
-            ("plan", with(&|c| {
-                c.attributes.insert("plan_type".into(), "team".into());
-            })),
-            ("prefix", with(&|c| {
-                c.metadata.insert("prefix".into(), "team".into());
-            })),
+            (
+                "plan",
+                with(&|c| {
+                    c.attributes.insert("plan_type".into(), "team".into());
+                }),
+            ),
+            (
+                "prefix",
+                with(&|c| {
+                    c.metadata.insert("prefix".into(), "team".into());
+                }),
+            ),
             ("disabled", with(&|c| c.disabled = true)),
-            ("exclusions", with(&|c| {
-                c.attributes.insert("excluded_models".into(), "gpt-*".into());
-            })),
-            ("auth kind", with(&|c| {
-                c.metadata.insert("auth_kind".into(), "apikey".into());
-            })),
-            ("siwc", with(&|c| {
-                c.metadata.insert("use_siwc".into(), true.into());
-            })),
+            (
+                "exclusions",
+                with(&|c| {
+                    c.attributes.insert("excluded_models".into(), "gpt-*".into());
+                }),
+            ),
+            (
+                "auth kind",
+                with(&|c| {
+                    c.metadata.insert("auth_kind".into(), "apikey".into());
+                }),
+            ),
+            (
+                "siwc",
+                with(&|c| {
+                    c.metadata.insert("use_siwc".into(), true.into());
+                }),
+            ),
             ("label", with(&|c| c.label = "other".into())),
         ] {
             assert!(catalog_changed(&base, &changed), "{what}");

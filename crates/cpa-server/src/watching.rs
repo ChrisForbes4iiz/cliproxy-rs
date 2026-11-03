@@ -644,7 +644,10 @@ mod tests {
 
     pub(super) fn note_read(path: &Path) {
         if is_auth_json(path) {
-            READS.lock().unwrap_or_else(PoisonError::into_inner).push(path.to_owned());
+            READS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(path.to_owned());
         }
     }
 
@@ -1520,7 +1523,8 @@ mod tests {
         let old = SystemTime::now() - Duration::from_secs(60);
         for i in 0..FILES {
             let mut file = std::fs::File::create(auth.join(name(i))).unwrap();
-            file.write_all(doc(&format!("u{i}@example.invalid")).as_bytes()).unwrap();
+            file.write_all(doc(&format!("u{i}@example.invalid")).as_bytes())
+                .unwrap();
             file.set_modified(old).unwrap();
         }
         let store = state.rt.store().clone();
