@@ -154,7 +154,7 @@ The Linux binaries link against glibc and libstdc++ and run on current distribut
 
 ## From source
 
-For contributors, and for systems without a release binary such as Alpine or other musl systems. You need a Rust toolchain (stable, 1.88 or newer) and the tools to build BoringSSL: `cmake`, `clang` and `perl`. On Debian or Ubuntu:
+For contributors, and for systems without a release binary such as Alpine or other musl systems. You need a Rust toolchain (stable, 1.99 or newer) and the tools to build BoringSSL: `cmake`, `clang` and `perl`. On Debian or Ubuntu:
 
 ```sh
 sudo apt-get install -y build-essential cmake clang perl git

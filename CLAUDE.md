@@ -6,7 +6,7 @@ Read [AGENTS.md](AGENTS.md) first. It holds the project rules (the frozen Go ref
 
 ## Commands
 
-Toolchain: Rust stable 1.88 or newer (CI pins 1.99.0), plus `cmake`, `clang` and `perl` for the BoringSSL build. On Windows also LLVM (`LIBCLANG_PATH`) and NASM on `PATH`; native plugins and their tests are Unix-only.
+Toolchain: Rust stable 1.99 or newer (CI pins 1.99.1), plus `cmake`, `clang` and `perl` for the BoringSSL build. On Windows also LLVM (`LIBCLANG_PATH`) and NASM on `PATH`; native plugins and their tests are Unix-only.
 
 ```sh
 # The three CI gates, in order

@@ -42,7 +42,7 @@ env:
   CARGO_TERM_COLOR: always
   # One exact compiler for every job: the size and allocation budgets are exact numbers
   # from one compiler and std. Bumping it means re-measuring bench/budgets.txt.
-  RUST_TOOLCHAIN: "1.99.0"
+  RUST_TOOLCHAIN: "1.99.1"
   # The Go parity reference (AGENTS.md). Its release tag must resolve to this commit.
   GO_REF_VERSION: "8.0.35"
   GO_REF_COMMIT: ae3ee3be303fb07fb8173279923413005bf32177

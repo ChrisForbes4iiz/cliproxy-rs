@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
   # One exact compiler for every job: the size and allocation budgets are exact numbers
   # from one compiler and std. Bumping it means re-measuring bench/budgets.txt.
-  RUST_TOOLCHAIN: "1.99.0"
+  RUST_TOOLCHAIN: "1.99.1"
 
 jobs:
   dashboard:
