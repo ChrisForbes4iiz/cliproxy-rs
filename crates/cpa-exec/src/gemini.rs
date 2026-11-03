@@ -160,46 +160,16 @@ pub(crate) fn translate(
     .map_err(|e| ExecError::local(400, FailureScope::Request, e.to_string()))
 }
 
-/// Runs a translator on a thread with Go's maximum goroutine stack when the body nests
-/// deeply, as `cpa_translate::translate_request` does for registered pairs: the ported
-/// schema walkers recurse per nesting level like Go's, whose stacks grow.
-// ponytail: duplicate of cpa_translate's private guard until its exported `...WithCompat`
-// entry points guard themselves (owner: translators).
-pub(crate) fn deep_stack<T: Send>(body: &[u8], f: impl FnOnce() -> T + Send) -> T {
-    const DEEP: usize = 256;
-    let (mut depth, mut max, mut in_string, mut escaped) = (0usize, 0usize, false, false);
-    for &b in body {
-        if in_string {
-            match b {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' | b'[' => {
-                depth += 1;
-                max = max.max(depth);
-            }
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    if max <= DEEP {
-        return f();
-    }
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(1 << 30)
-            .spawn_scoped(scope, f)
-            .map(|handle| handle.join())
-    })
-    .ok()
-    .and_then(Result::ok)
-    .expect("deep JSON translation thread")
+/// Runs a translator under `cpa_translate::deep_stack`, sized for `body`'s nesting as
+/// `cpa_translate::translate_request` does for registered pairs: the ported schema walkers
+/// recurse per nesting level like Go's, whose stacks grow. The shared guard sizes the
+/// stack per level, answers an error (a local 400 at the callers) when the stack cannot
+/// be reserved, counts brackets inside strings and never nests a second deep thread.
+pub(crate) fn deep_stack<T: Send>(
+    body: &[u8],
+    f: impl FnOnce() -> Result<T, cpa_translate::Error> + Send,
+) -> Result<T, cpa_translate::Error> {
+    cpa_translate::deep_stack(cpa_translate::levels(&[body]), f)
 }
 
 /// `TranslateRequestPairWithAPIKeyModelCompatibility`: the payload-config baseline from
@@ -379,8 +349,18 @@ pub(crate) async fn send_captured(
 
 /// `io.ReadAll` of a response body, then `AppendAPIResponseChunk` of it, or
 /// `RecordAPIResponseError` when the read fails.
-pub(crate) async fn read_captured(capture: &CaptureSink, upstream: Upstream, limit: usize) -> Result<Bytes, ExecError> {
-    match proxy::read_all(upstream.body, limit, false).await {
+/// `limit` truncates an error body there; `None` reads a 2xx body whole, failing past
+/// `proxy::MAX_SUCCESS_BODY`.
+pub(crate) async fn read_captured(
+    capture: &CaptureSink,
+    upstream: Upstream,
+    limit: Option<usize>,
+) -> Result<Bytes, ExecError> {
+    let read = match limit {
+        Some(limit) => proxy::read_all(upstream.body, limit, false).await,
+        None => proxy::read_success(upstream.body).await,
+    };
+    match read {
         Ok(data) => {
             capture.record(CaptureEvent::ResponseChunk(&data));
             Ok(data)
@@ -423,7 +403,7 @@ async fn read_then_check(capture: &CaptureSink, upstream: Upstream) -> Result<(h
     let status = upstream.status;
     let headers = upstream.headers.clone();
     let ok = (200..300).contains(&status);
-    let limit = if ok { usize::MAX } else { proxy::MAX_ERROR_BODY };
+    let limit = (!ok).then_some(proxy::MAX_ERROR_BODY);
     let data = read_captured(capture, upstream, limit).await?;
     if !ok {
         return Err(status_err(status, data));
@@ -573,7 +553,7 @@ impl GeminiExecutor {
         }
         let response_headers = upstream.headers.clone();
         if !req.stream {
-            let data = read_captured(capture, upstream, usize::MAX).await?;
+            let data = read_captured(capture, upstream, None).await?;
             req.usage.response_body(to, &data);
             let out = translate_non_stream(req, to, &body, &data)?;
             claude_error(req, &out)?;

@@ -69,7 +69,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # As in release.yml: BoringSSL needs NASM on a native MSVC build; bindgen needs libclang.
       - name: NASM and libclang (Windows)
         if: runner.os == 'Windows'
@@ -109,7 +109,7 @@ jobs:
       GO_ARCHIVE: CLIProxyAPI_8.0.10_linux_amd64.tar.gz
       GO_SHA256: 6211e059951e83acffedac098ad44a8bc60b47a53988c8d34d44397bfabbf578
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build tools
         run: .github/scripts/apt-install.sh cmake clang libclang-dev perl
       - name: Rust
@@ -137,7 +137,7 @@ jobs:
             echo "| --- | --- | --- | --- | --- |"
             jq -r '"| \(.server) | \(.wakeups / (.seconds / 60) | . * 10 | round / 10) | \(.cpu_ticks * 10 * 3600 / .seconds | round) | \(.threads) | \(.rss_kb / 1024 | . * 10 | round / 10) |"' idle-compare.jsonl
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: idle-compare
           path: |

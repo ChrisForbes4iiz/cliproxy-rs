@@ -133,6 +133,13 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
     if eager {
         let limit = request.extensions().get::<crate::body_limit::Limit>().and_then(|l| l.0);
         let body = std::mem::replace(request.body_mut(), Body::empty());
+        // The configured limit already wraps the body. Without one, the read stops at the
+        // API's own ceiling: capture runs before client auth, so an unauthenticated body
+        // is never buffered without bound. Go's logging middleware reads it all.
+        let body = match limit {
+            Some(_) => body,
+            None => crate::body_limit::capped(body, crate::MAX_REQUEST_BYTES as u64),
+        };
         let bytes = match axum::body::to_bytes(body, usize::MAX).await {
             Ok(bytes) => bytes,
             // Go answers before it logs anything.
@@ -1192,13 +1199,7 @@ impl Record {
                 let mut content = Vec::new();
                 if self.format(&mut content, decompress_error).is_ok() {
                     let mut payload = serde_json::Map::new();
-                    let mut headers: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-                    for (name, value) in &self.headers {
-                        headers
-                            .entry(header_name(name.as_str()))
-                            .or_default()
-                            .push(String::from_utf8_lossy(value.as_bytes()).into_owned());
-                    }
+                    let headers = forwarded_headers(&self.headers);
                     if !headers.is_empty() {
                         payload.insert("headers".into(), serde_json::to_value(headers).unwrap());
                     }
@@ -1451,6 +1452,18 @@ fn masked_header(name: &str, value: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The request headers forwarded to Home beside the request log, masked like the log's
+/// own header section: client keys and cookies never reach Home KV in the clear.
+fn forwarded_headers(headers: &HeaderMap) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (name, value) in headers {
+        out.entry(header_name(name.as_str()))
+            .or_default()
+            .push(String::from_utf8_lossy(&masked_header(name.as_str(), value.as_bytes())).into_owned());
+    }
+    out
+}
+
 fn headers(out: &mut dyn Write, headers: &HeaderMap, mask: bool) -> io::Result<()> {
     for (name, value) in headers {
         write!(out, "{}: ", header_name(name.as_str()))?;
@@ -1546,8 +1559,10 @@ fn unique_file(dir: &Path, filename: &str) -> io::Result<File> {
         };
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
+        // Owner-only like the spools: a log holds request and response bodies. Go
+        // creates them 0644 (after the usual umask).
         #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o644);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         match options.open(dir.join(name)) {
             Ok(file) => return Ok(file),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
@@ -2259,6 +2274,37 @@ mod tests {
         }
     }
 
+    /// With request logging on and no configured body limit, the eager read stops at
+    /// MAX_REQUEST_BYTES: a chunked body (no Content-Length) over it gets the body-limit
+    /// 413 before anything downstream, client auth included, runs.
+    #[tokio::test]
+    async fn eager_capture_read_is_capped_without_a_configured_limit() {
+        static CHUNK: [u8; 1 << 20] = [b'a'; 1 << 20];
+        let dir = scratch();
+        let state = management(&dir, true, false);
+        // The handler would answer 200; the capture layer must answer first.
+        let app = axum::Router::new().fallback(|| async { StatusCode::OK });
+        let mut app = router(&state, app);
+        let chunks = crate::MAX_REQUEST_BYTES / CHUNK.len() + 1;
+        let body = Body::from_stream(futures_util::stream::iter(
+            (0..chunks).map(|_| Ok::<_, io::Error>(Bytes::from_static(&CHUNK))),
+        ));
+        let response = app
+            .call(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let text = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&text[..], br#"{"error":"http: request body too large"}"#);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[tokio::test]
     async fn capture_preserves_transport_errors_and_classifies_cancellation() {
         let dir = scratch();
@@ -2687,6 +2733,51 @@ mod tests {
             auth_label: "",
             auth_type: "",
             auth_value: "",
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_log_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch();
+        let _first = unique_file(&dir, "v1-messages-2026-01-01T000000-abc.log").unwrap();
+        let _second = unique_file(&dir, "v1-messages-2026-01-01T000000-abc.log").unwrap();
+        let logs = logs(&dir);
+        assert_eq!(logs.len(), 2);
+        for path in logs {
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode & 0o077, 0, "{} is {mode:o}", path.display());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn headers_forwarded_to_home_are_masked() {
+        let mut map = HeaderMap::new();
+        map.insert("authorization", "Bearer sk-FAKE-client-key-0123456789".parse().unwrap());
+        map.insert("x-api-key", "FAKE-api-key-0123456789".parse().unwrap());
+        map.insert("cookie", "session=FAKE-c00kie".parse().unwrap());
+        map.insert("content-type", "application/json".parse().unwrap());
+        let forwarded = forwarded_headers(&map);
+        let text = serde_json::to_string(&forwarded).unwrap();
+        for secret in [
+            "sk-FAKE-client-key-0123456789",
+            "FAKE-api-key-0123456789",
+            "FAKE-c00kie",
+        ] {
+            assert!(!text.contains(secret), "{secret} forwarded in the clear: {text}");
+        }
+        let one = |name: &str| forwarded.get(name).unwrap()[0].clone();
+        assert_eq!(one("Cookie"), REDACTED);
+        assert!(one("Authorization").starts_with("Bearer "));
+        assert_eq!(one("Content-Type"), "application/json");
+        // The same masking as the log's header section.
+        let mut section = Vec::new();
+        headers(&mut section, &map, true).unwrap();
+        let section = String::from_utf8(section).unwrap();
+        for (name, values) in &forwarded {
+            assert!(section.contains(&format!("{name}: {}\n", values[0])), "{name}");
         }
     }
 

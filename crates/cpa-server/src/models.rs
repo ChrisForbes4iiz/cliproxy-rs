@@ -80,7 +80,7 @@ async fn list(
     }
     if header("user-agent").is_some_and(|ua| ua.go_lower().contains("grok-shell")) {
         let registry = rt.registry();
-        let list = grok_list(registry.available_with(|c, m| rt.suspension(c, m)));
+        let list = grok_list(registry.available_with(rt.suspensions()));
         return intercept("openai", respond::gin_json(200, list)).await;
     }
     if let Some(version) = query_value(&uri, "client_version") {
@@ -90,13 +90,10 @@ async fn list(
     let (source, body) = if anthropic {
         (
             "claude",
-            claude_list(registry.available_with(|c, m| rt.suspension(c, m)), disable_cloaking()),
+            claude_list(registry.available_with(rt.suspensions()), disable_cloaking()),
         )
     } else {
-        (
-            "openai",
-            openai_list(registry.available_with(|c, m| rt.suspension(c, m))),
-        )
+        ("openai", openai_list(registry.available_with(rt.suspensions())))
     };
     intercept(source, respond::gin_json(200, body)).await
 }
@@ -365,7 +362,7 @@ pub async fn gemini_list(
     }
     let registry = rt.registry();
     let models: Vec<Value> = registry
-        .available_with(|c, m| rt.suspension(c, m))
+        .available_with(rt.suspensions())
         .map(|m| {
             let mut entry = gemini_entry(m);
             if let Some(name) = entry.get("name").and_then(Value::as_str).map(str::to_owned)
@@ -411,7 +408,7 @@ pub async fn gemini_get(
     }
     let registry = rt.registry();
     let found = registry
-        .available_with(|c, m| rt.suspension(c, m))
+        .available_with(rt.suspensions())
         .map(gemini_entry)
         .find(|entry| {
             let name = entry.get("name").and_then(Value::as_str).unwrap_or_default();

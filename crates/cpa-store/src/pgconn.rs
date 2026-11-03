@@ -21,6 +21,18 @@ use tokio_postgres::{Client, Socket};
 /// A job may not hold the worker longer than this; the connection is then replaced.
 const JOB_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The connect timeout when neither the DSN nor `PGCONNECT_TIMEOUT` sets one (libpq and
+/// pgx wait for the OS, which can take minutes against a host that drops SYNs).
+/// tokio-postgres applies it to each host of a multi-host DSN, so ten seconds lets a
+/// second host be tried well inside `JOB_TIMEOUT`, which also bounds the whole connect.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Jobs that may wait for the worker. Callers that wait for their answer (`run`) queue
+/// behind a full queue; fire-and-forget work (`submit`) is dropped with a log line, and
+/// cooldown saves coalesce so they hold at most one slot. Persists are rare management
+/// writes, so 256 is far above any burst.
+const JOB_QUEUE: usize = 256;
+
 /// Keys pgx consumes that tokio-postgres takes as they are. `dbname` stands for pgx's
 /// `database`.
 const NATIVE_KEYS: &[&str] = &[
@@ -313,6 +325,9 @@ impl Dsn {
         {
             config.connect_timeout(Duration::from_secs(secs));
         }
+        if config.get_connect_timeout().is_none() {
+            config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+        }
         for (key, var) in [
             ("sslmode", "PGSSLMODE"),
             ("sslrootcert", "PGSSLROOTCERT"),
@@ -494,19 +509,27 @@ impl tokio_postgres::tls::TlsStream for TlsStream {
     }
 }
 
-type Job = Box<dyn FnOnce(Result<Arc<Client>>) -> BoxFuture<'static, ()> + Send>;
+pub(crate) type Job = Box<dyn FnOnce(Result<Arc<Client>>) -> BoxFuture<'static, ()> + Send>;
 
 /// The worker owning the connection; jobs run one at a time, in order.
 #[derive(Clone)]
 pub(crate) struct Pg {
-    jobs: tokio::sync::mpsc::UnboundedSender<Job>,
+    jobs: tokio::sync::mpsc::Sender<Job>,
+}
+
+fn boxed<F, Fut>(f: F) -> Job
+where
+    F: FnOnce(Result<Arc<Client>>) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    Box::new(move |client| Box::pin(f(client)))
 }
 
 impl Pg {
     /// Starts the worker; the connection opens with the first job and reopens after it
     /// closes (Go's `database/sql` pool).
     pub(crate) fn start(dsn: Dsn) -> Result<Pg> {
-        let (jobs, mut queue) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        let (jobs, mut queue) = tokio::sync::mpsc::channel::<Job>(JOB_QUEUE);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         std::thread::Builder::new().name("pgstore".into()).spawn(move || {
             runtime.block_on(async move {
@@ -514,15 +537,24 @@ impl Pg {
                 while let Some(job) = queue.recv().await {
                     let current = match client.as_ref().filter(|c| !c.is_closed()) {
                         Some(c) => Ok(c.clone()),
-                        None => match dsn.connect().await {
-                            Ok(c) => {
+                        // A host that drops packets must not hold the worker, and every
+                        // job queued behind this one, past the job timeout.
+                        None => match tokio::time::timeout(JOB_TIMEOUT, dsn.connect()).await {
+                            Ok(Ok(c)) => {
                                 let c = Arc::new(c);
                                 client = Some(c.clone());
                                 Ok(c)
                             }
-                            Err(e) => {
+                            Ok(Err(e)) => {
                                 client = None;
                                 Err(e)
+                            }
+                            Err(_) => {
+                                client = None;
+                                Err(anyhow!(
+                                    "postgres store: connect timed out after {}s",
+                                    JOB_TIMEOUT.as_secs()
+                                ))
                             }
                         },
                     };
@@ -535,13 +567,35 @@ impl Pg {
         Ok(Pg { jobs })
     }
 
-    /// Queues `f` without waiting for it.
-    pub(crate) fn submit<F, Fut>(&self, f: F)
+    /// A worker that never runs a job, for queue tests: the receiver keeps the queue
+    /// open and undrained.
+    #[cfg(test)]
+    pub(crate) fn stalled(capacity: usize) -> (Pg, tokio::sync::mpsc::Receiver<Job>) {
+        let (jobs, queue) = tokio::sync::mpsc::channel(capacity);
+        (Pg { jobs }, queue)
+    }
+
+    /// Jobs waiting for the worker.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.jobs.max_capacity() - self.jobs.capacity()
+    }
+
+    /// Queues `f` without waiting for it. A full queue drops it with a log line (the
+    /// worker is stalled; queueing more would only grow memory); false when dropped.
+    pub(crate) fn submit<F, Fut>(&self, f: F) -> bool
     where
         F: FnOnce(Result<Arc<Client>>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let _ = self.jobs.send(Box::new(move |client| Box::pin(f(client))));
+        match self.jobs.try_send(boxed(f)) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("postgres store: job queue full; dropping a queued write");
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     pub(crate) async fn run<T, F, Fut>(&self, f: F) -> Result<T>
@@ -551,7 +605,7 @@ impl Pg {
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.submit(move |client| async move {
+        let job = boxed(move |client| async move {
             // Go's expired context never starts its statement: a caller that gave up
             // while this waited in the queue must not write stale data later.
             if tx.is_closed() {
@@ -563,6 +617,10 @@ impl Pg {
             };
             let _ = tx.send(result);
         });
+        // A caller that waits for its answer waits for a queue slot too.
+        if self.jobs.send(job).await.is_err() {
+            return Err(anyhow!("postgres store: request abandoned (timeout or shutdown)"));
+        }
         rx.await
             .unwrap_or_else(|_| Err(anyhow!("postgres store: request abandoned (timeout or shutdown)")))
     }
@@ -575,13 +633,18 @@ impl Pg {
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        self.submit(move |client| async move {
+        let queued = self.submit(move |client| async move {
             let result = match client {
                 Ok(client) => f(client).await,
                 Err(error) => Err(error),
             };
             let _ = tx.send(result);
         });
+        if !queued {
+            return Err(anyhow!(
+                "postgres store: request abandoned (job queue full or shutdown)"
+            ));
+        }
         rx.recv()
             .unwrap_or_else(|_| Err(anyhow!("postgres store: request abandoned (timeout or shutdown)")))
     }
@@ -594,6 +657,33 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    /// cliproxy-rs-7ea.22: a DSN without a connect timeout gets the default; one set by
+    /// the DSN or `PGCONNECT_TIMEOUT` is kept.
+    #[test]
+    fn connect_timeout_defaults_unless_set() {
+        let dsn = Dsn::parse("host=db user=u", &no_env).unwrap();
+        assert_eq!(dsn.config.get_connect_timeout(), Some(&DEFAULT_CONNECT_TIMEOUT));
+        let dsn = Dsn::parse("host=db user=u connect_timeout=3", &no_env).unwrap();
+        assert_eq!(dsn.config.get_connect_timeout(), Some(&Duration::from_secs(3)));
+        let env = |key: &str| (key == "PGCONNECT_TIMEOUT").then(|| "4".to_owned());
+        let dsn = Dsn::parse("host=db user=u", &env).unwrap();
+        assert_eq!(dsn.config.get_connect_timeout(), Some(&Duration::from_secs(4)));
+    }
+
+    /// cliproxy-rs-7ea.22: a stalled worker's queue stops growing; fire-and-forget work
+    /// is dropped and a synchronous caller gets an error instead of waiting forever.
+    #[test]
+    fn a_full_job_queue_drops_instead_of_growing() {
+        let (pg, _queue) = Pg::stalled(JOB_QUEUE);
+        for _ in 0..JOB_QUEUE {
+            assert!(pg.submit(|_| async {}));
+        }
+        assert!(!pg.submit(|_| async {}));
+        assert_eq!(pg.queued(), JOB_QUEUE);
+        let result: Result<()> = pg.run_blocking(|_| async { Ok(()) });
+        assert!(result.is_err());
     }
 
     #[test]

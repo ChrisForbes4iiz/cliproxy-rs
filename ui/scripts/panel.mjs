@@ -18,11 +18,15 @@ const [styleTag, styleHref] = take(/<link rel="stylesheet" crossorigin href="([^
 
 const js = read(scriptSrc).toString("utf8");
 if (/<\/script/i.test(js)) throw new Error("panel: script contains </script and cannot be inlined safely");
+// <!-- inside a script element moves the HTML parser into its escaped states, where a
+// later <script can keep the element open past its closing tag.
+if (js.includes("<!--")) throw new Error("panel: script contains <!-- and cannot be inlined safely");
 const font = `data:font/woff2;base64,${read("fonts/host-grotesk.woff2").toString("base64")}`;
 const css = read(`assets/${styleHref.split("/").pop()}`)
   .toString("utf8")
   .replace(/url\((["']?)\.\.\/fonts\/host-grotesk\.woff2\1\)/g, `url(${font})`);
 if (/url\((?!["']?data:)/.test(css)) throw new Error("panel: stylesheet still references an external file");
+if (/<\/style/i.test(css)) throw new Error("panel: stylesheet contains </style and cannot be inlined safely");
 const icon = `data:image/svg+xml,${encodeURIComponent(read("favicon.svg").toString("utf8").trim())}`;
 
 html = html

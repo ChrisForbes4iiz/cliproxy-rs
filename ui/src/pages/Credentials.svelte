@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, every, Res } from "../store.svelte";
   import { api, download } from "../api";
-  import { buckets, sum, credState, credName, provider, label, span, type Data } from "../core";
+  import { buckets, sum, credState, credName, provider, label, span, promptName, type Data } from "../core";
   import Grille from "../Grille.svelte";
   import Load from "../Load.svelte";
   import Missing from "../Missing.svelte";
@@ -100,7 +100,7 @@
     [a.disabled ? "Enable" : "Disable", "PATCH", "/credentials/status", { ...lookup(a), disabled: !a.disabled }, a.disabled ? "Enabled." : "Disabled.", "", false],
     ["Refresh token", "POST", "/credentials/refresh", lookup(a), "Token refreshed.", "", false],
     ["Reset cooldown", "POST", "/routing/cooldown/reset", { auth_index: a.auth_index }, "Cooldown cleared.", "Clear the local cooldown? Provider quota is not restored.", !a.auth_index],
-    ["Delete", "DELETE", "/credentials", { names: [a.name] }, "Credential deleted.", `Delete ${a.name}? The file is removed from the server.`, !!a.runtime_only],
+    ["Delete", "DELETE", "/credentials", { names: [a.name] }, "Credential deleted.", `Delete ${promptName(a.name)}? The file is removed from the server.`, !!a.runtime_only],
   ];
   const reload = () => store.creds.load(true);
 

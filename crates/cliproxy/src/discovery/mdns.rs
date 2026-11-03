@@ -541,6 +541,41 @@ impl Responder {
     }
 }
 
+/// How often one source may receive unicast answers, and how many sources are tracked.
+const UNICAST_INTERVAL: Duration = Duration::from_secs(1);
+const UNICAST_SOURCES: usize = 256;
+
+/// Unicast answers (a question's QU bit) go to the packet's source address, which any
+/// LAN host can spoof to aim several hundred bytes per small query at a victim. One
+/// packet's answers per source per second, over a bounded set of sources; a source that
+/// does not fit while the set is full gets no unicast answer. Zeroconf (Go) has no limit.
+struct UnicastLimit {
+    last: HashMap<IpAddr, Instant>,
+}
+
+impl UnicastLimit {
+    fn new() -> Self {
+        Self { last: HashMap::new() }
+    }
+
+    fn allow(&mut self, source: IpAddr, now: Instant) -> bool {
+        if let Some(at) = self.last.get(&source)
+            && now.saturating_duration_since(*at) < UNICAST_INTERVAL
+        {
+            return false;
+        }
+        if self.last.len() >= UNICAST_SOURCES && !self.last.contains_key(&source) {
+            self.last
+                .retain(|_, at| now.saturating_duration_since(*at) < UNICAST_INTERVAL);
+            if self.last.len() >= UNICAST_SOURCES {
+                return false;
+            }
+        }
+        self.last.insert(source, now);
+        true
+    }
+}
+
 async fn serve(
     service: Service,
     ifaces: Vec<Iface>,
@@ -579,6 +614,7 @@ async fn serve(
         m.encode()
     };
     let (mut buf4, mut buf6) = (vec![0u8; 65536], vec![0u8; 65536]);
+    let mut unicast = UnicastLimit::new();
     loop {
         let next = schedule.last().map(|s| s.0);
         let (packet, from) = tokio::select! {
@@ -600,11 +636,16 @@ async fn serve(
         if !query.authority.is_empty() {
             continue;
         }
+        // Decided once per packet, at its first unicast answer.
+        let mut unicast_allowed: Option<bool> = None;
         for q in &query.questions {
             let Some(packet) = service.answer(q, &query).and_then(|r| r.encode()) else {
                 continue;
             };
             if q.qclass & CLASS_FLUSH != 0 {
+                if !*unicast_allowed.get_or_insert_with(|| unicast.allow(from.ip(), Instant::now())) {
+                    continue;
+                }
                 let sock = if from.is_ipv4() { v4 } else { v6 };
                 if let Some(sock) = sock {
                     let _ = sock.send_to(&packet, from).await;
@@ -622,6 +663,31 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cliproxy-rs-7ea.40: one unicast answer per source per second, with a bounded
+    /// source table.
+    #[test]
+    fn unicast_answers_are_rate_limited_per_source() {
+        let mut limit = UnicastLimit::new();
+        let start = Instant::now();
+        let a: IpAddr = "192.0.2.1".parse().unwrap();
+        let b: IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(limit.allow(a, start));
+        assert!(!limit.allow(a, start + Duration::from_millis(500)));
+        assert!(limit.allow(b, start + Duration::from_millis(500)));
+        assert!(limit.allow(a, start + UNICAST_INTERVAL));
+        // A flood of distinct (spoofed) sources fills the table; a new source waits
+        // until old entries expire.
+        let mut limit = UnicastLimit::new();
+        for i in 0..UNICAST_SOURCES {
+            let ip = IpAddr::V6(Ipv6Addr::from(i as u128 + 1));
+            assert!(limit.allow(ip, start));
+        }
+        assert_eq!(limit.last.len(), UNICAST_SOURCES);
+        assert!(!limit.allow(a, start + Duration::from_millis(10)));
+        assert!(limit.allow(a, start + UNICAST_INTERVAL));
+        assert!(limit.last.len() <= UNICAST_SOURCES);
+    }
 
     fn spec() -> ServiceSpec {
         ServiceSpec {

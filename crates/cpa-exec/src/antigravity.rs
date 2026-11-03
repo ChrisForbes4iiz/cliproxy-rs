@@ -319,7 +319,7 @@ impl AntigravityExecutor {
                 let body = Bytes::from_static(br#"{"metadata":{"ideType":"ANTIGRAVITY"}}"#);
                 let upstream = proxy::send(&client, &url, headers, body, None).await.ok()?;
                 let ok = (200..300).contains(&upstream.status);
-                let data = proxy::read_all(upstream.body, usize::MAX, false).await.ok()?;
+                let data = proxy::read_success(upstream.body).await.ok()?;
                 ok.then(|| credits::hint_from_load_code_assist(&data)).flatten()
             };
             let hint = tokio::time::timeout(budget, lookup).await.ok().flatten();
@@ -664,7 +664,7 @@ impl AntigravityExecutor {
             .await?;
         let (status, headers) = (upstream.status, upstream.headers.clone());
         let ok = (200..300).contains(&status);
-        let limit = if ok { usize::MAX } else { proxy::MAX_ERROR_BODY };
+        let limit = (!ok).then_some(proxy::MAX_ERROR_BODY);
         let data = gemini::read_captured(req.capture(), upstream, limit).await?;
         if !ok {
             self.observe_rejection(credential, cfg, model, status, &data);
@@ -721,7 +721,7 @@ impl AntigravityExecutor {
             .await?;
         let (status, headers) = (upstream.status, upstream.headers.clone());
         if !(200..300).contains(&status) {
-            let data = gemini::read_captured(req.capture(), upstream, proxy::MAX_ERROR_BODY).await?;
+            let data = gemini::read_captured(req.capture(), upstream, Some(proxy::MAX_ERROR_BODY)).await?;
             self.observe_rejection(credential, cfg, model, status, &data);
             replay::clear_on_invalid_signature(&prepared.replay, status, &data);
             return Err(upstream_error(status, data));
@@ -778,7 +778,7 @@ impl AntigravityExecutor {
             .await?;
         let (status, headers) = (upstream.status, upstream.headers.clone());
         if !(200..300).contains(&status) {
-            let data = gemini::read_captured(req.capture(), upstream, proxy::MAX_ERROR_BODY).await?;
+            let data = gemini::read_captured(req.capture(), upstream, Some(proxy::MAX_ERROR_BODY)).await?;
             self.observe_rejection(credential, cfg, model, status, &data);
             replay::clear_on_invalid_signature(&prepared.replay, status, &data);
             return Err(upstream_error(status, data));
@@ -964,7 +964,7 @@ impl AntigravityExecutor {
         .await?;
         let (status, response_headers) = (upstream.status, upstream.headers.clone());
         let ok = (200..300).contains(&status);
-        let limit = if ok { usize::MAX } else { proxy::MAX_ERROR_BODY };
+        let limit = (!ok).then_some(proxy::MAX_ERROR_BODY);
         let data = gemini::read_captured(req.capture(), upstream, limit).await?;
         if !ok {
             if status == 429 {

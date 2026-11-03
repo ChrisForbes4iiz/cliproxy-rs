@@ -119,11 +119,12 @@ fn is_auth_json(path: &Path) -> bool {
 
 fn observe(state: &Management, cache: &mut HashCache) -> Snapshot {
     let now = SystemTime::now();
-    let mut seen = Vec::new();
+    // A set: the cache is pruned against it once per tick, with thousands of files.
+    let mut seen = HashSet::new();
     let config = std::fs::metadata(&state.path)
         .ok()
         .and_then(|meta| cache.hash(&state.path, &meta, now));
-    seen.push(state.path.clone());
+    seen.insert(state.path.clone());
     let mut auth = BTreeMap::new();
     let dir = state.rt.config().auth_dir.clone();
     // An unreadable auth dir is an empty set, as in reload.
@@ -135,7 +136,7 @@ fn observe(state: &Management, cache: &mut HashCache) -> Snapshot {
         }
         // An unreadable file is present but unknown; reload skips it.
         let hash = cache.hash(&path, &meta, now).unwrap_or_default();
-        seen.push(path.clone());
+        seen.insert(path.clone());
         auth.insert(path, hash);
     }
     cache.0.retain(|path, _| seen.contains(path));

@@ -25,9 +25,14 @@ param([switch]$Service, [switch]$BinaryOnly)
 function Install-CliproxyRs([bool]$Service, [bool]$BinaryOnly) {
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
-  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  # Windows PowerShell 5.1 offers only the protocols named here. Add TLS 1.2, and TLS 1.3
+  # where this .NET knows it (4.8 and later), to whatever is already enabled.
+  $tls = [Net.SecurityProtocolType]::Tls12
+  if ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13') { $tls = $tls -bor [Net.SecurityProtocolType]'Tls13' }
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor $tls
 
   $releases = if ($env:CLIPROXY_RELEASES) { $env:CLIPROXY_RELEASES } else { 'https://github.com/vayungodara/cliproxy-rs/releases' }
+  if (-not (Test-ReleaseUrl $releases)) { throw "install.ps1: CLIPROXY_RELEASES must be an https:// URL (http:// only on loopback): $releases" }
   $dir = if ($env:CLIPROXY_INSTALL_DIR) { $env:CLIPROXY_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\cliproxy-rs' }
   $data = if ($env:CLIPROXY_HOME) { $env:CLIPROXY_HOME } else { Join-Path $env:USERPROFILE '.cliproxy-rs' }
   # Absolute paths: they go into the Run entry and identify this install's server process.
@@ -50,6 +55,7 @@ function Install-CliproxyRs([bool]$Service, [bool]$BinaryOnly) {
     try { $r = Invoke-Retry { Invoke-WebRequest -Uri "$releases/latest" -Method Head -UseBasicParsing } }
     catch { throw "install.ps1: cannot reach $releases ($($_.Exception.Message))" }
     $final = if ($r.BaseResponse.ResponseUri) { $r.BaseResponse.ResponseUri.AbsoluteUri } else { $r.BaseResponse.RequestMessage.RequestUri.AbsoluteUri }
+    if (-not (Test-ReleaseUrl $final)) { throw "install.ps1: $releases/latest redirected to $final, which is not https://" }
     if ($final -notmatch '/tag/([^/]+)$') { throw 'install.ps1: no release is published yet' }
     $tag = $Matches[1]
   }
@@ -214,6 +220,14 @@ function Install-CliproxyRs([bool]$Service, [bool]$BinaryOnly) {
   }
   Write-Host ''
   Write-Host 'If cliproxy-rs helps, a star helps others find it: https://github.com/vayungodara/cliproxy-rs'
+}
+
+# Release downloads use HTTPS only. http:// is accepted for a mirror on this machine's
+# loopback address (the installer tests serve releases that way), as in install.sh.
+function Test-ReleaseUrl([string]$url) {
+  $uri = $null
+  if (-not [Uri]::TryCreate($url, [UriKind]::Absolute, [ref]$uri)) { return $false }
+  ($uri.Scheme -eq 'https') -or ($uri.Scheme -eq 'http' -and $uri.Host -in '127.0.0.1', 'localhost', '[::1]')
 }
 
 # Runs a download up to three times, for a brief network or server error.

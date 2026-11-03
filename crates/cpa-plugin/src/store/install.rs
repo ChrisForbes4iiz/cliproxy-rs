@@ -382,7 +382,7 @@ fn install_target_path(options: &InstallOptions, id: &str, version: &str) -> Res
 }
 
 /// Go `readTargetLibrary`: exactly one library at the archive root, named for the
-/// plugin (optionally versioned); its permission bits, 0755 when none.
+/// plugin (optionally versioned); its permission bits masked to 0755, 0755 when none.
 fn read_target_library(archive: &Archive<'_>, id: &str, version: &str, goos: &str) -> Result<(Vec<u8>, u32), String> {
     let target_name = format!("{}{}", id.trim(), extension(goos));
     let versioned = versioned_file_name(id, version, goos);
@@ -422,7 +422,9 @@ fn read_target_library(archive: &Archive<'_>, id: &str, version: &str, goos: &st
         ReadError::Open(e) => format!("open {target_name}: {e}"),
         ReadError::Read(e) => format!("read {target_name}: {e}"),
     })?;
-    let mode = match entry.perm() {
+    // Go keeps the entry's bits; group and other write (and setuid, setgid, sticky) are
+    // dropped here, so no other local user can replace the library before it loads.
+    let mode = match entry.perm() & 0o755 {
         0 => 0o755,
         m => m,
     };
@@ -611,6 +613,22 @@ mod tests {
         assert!(clean_zip_name("/b.so").is_err());
         assert!(clean_zip_name("a\\b.so").is_err());
         assert_eq!(versioned_file_name("p", "v1.2", "darwin"), "p-v1.2.dylib");
+    }
+
+    /// cliproxy-rs-7ea.41: the installed library never keeps group or other write.
+    #[test]
+    fn library_mode_drops_group_and_other_write() {
+        for (perm, want) in [
+            (0o777, 0o755),
+            (0o666, 0o644),
+            (0o750, 0o750),
+            (0o640, 0o640),
+            (0o022, 0o755),
+        ] {
+            let data = crate::testing::stored_zip(&[("p.so", b"lib", perm)]);
+            let (_, mode) = read_target_library(&Archive::new(&data).unwrap(), "p", "1.0.0", "linux").unwrap();
+            assert_eq!(mode, want, "{perm:o}");
+        }
     }
 
     /// A library declaring more than the ceiling is refused before it is inflated; at

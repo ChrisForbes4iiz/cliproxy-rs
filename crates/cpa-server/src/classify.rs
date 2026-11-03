@@ -18,6 +18,21 @@ pub fn error_text(e: &ExecError) -> String {
     }
 }
 
+/// The most of a failure's text a cooldown keeps (its `.cds` record, error events, the
+/// cause selection reports). Go keeps the whole body; a Cloudflare challenge page is
+/// tens of KB, kept per credential and model (docs/DIFFERENCES-FROM-GO.md).
+pub const KEPT_ERROR_BYTES: usize = 4096;
+
+/// `text` cut to [`KEPT_ERROR_BYTES`] at a character boundary. Classification reads the
+/// whole text first.
+pub fn kept_error_text(text: &str) -> String {
+    let mut end = text.len().min(KEPT_ERROR_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+
 /// Go `extractErrorBody`, what request-scoped error rules match: the error's text,
 /// except for the Claude executor's own missing-thread error, whose structured body
 /// (`claudeThreadNotFoundError.ResponseBody`, v8.0.27 e7b2226) is Anthropic's JSON
@@ -660,5 +675,20 @@ mod tests {
         let mut empty = upstream(500, "");
         empty.body = Bytes::new();
         assert_eq!(error_text(&empty), "status 500");
+    }
+
+    /// A cooldown keeps at most [`KEPT_ERROR_BYTES`] of a failure's text, cut on a
+    /// character boundary; shorter text is kept whole.
+    #[test]
+    fn kept_error_text_is_bounded_on_a_char_boundary() {
+        assert_eq!(kept_error_text("status 429"), "status 429");
+        let page = format!("a{}", "\u{e9}".repeat(KEPT_ERROR_BYTES));
+        let kept = kept_error_text(&page);
+        assert_eq!(kept.len(), KEPT_ERROR_BYTES - 1, "the split two-byte char is dropped");
+        assert!(page.starts_with(&kept));
+        assert_eq!(
+            kept_error_text(&"x".repeat(KEPT_ERROR_BYTES + 10)).len(),
+            KEPT_ERROR_BYTES
+        );
     }
 }

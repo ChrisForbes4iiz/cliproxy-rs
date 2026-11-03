@@ -540,7 +540,9 @@ impl ObjectStore {
                 let rel_path = Path::new(rel);
                 // ponytail: Go cleans `sub/../x.json` to `x.json` and fetches it; URL
                 // parsing here would rewrite such a key, so any dot segment is skipped.
-                if rel_path.is_absolute() || rel.split('/').any(|s| s == "." || s == "..") {
+                // Backslashes and drive prefixes are refused on every platform, so a
+                // bucket shared with a Windows node cannot write outside its mirror.
+                if rel_path.is_absolute() || crate::escapes_root(rel) {
                     tracing::warn!(key, "object store: skip auth outside mirror");
                     continue;
                 }
@@ -820,6 +822,8 @@ mod tests {
         s3.put("tokens", "auths/a b+c.json", b"{\"s\":1}");
         s3.put("tokens", "auths/sub/../z.json", b"{\"z\":1}");
         s3.put("tokens", "auths/../evil.json", b"{}");
+        s3.put("tokens", "auths/..\\win.json", b"{}");
+        s3.put("tokens", "auths/C:drive.json", b"{}");
         s3.put("tokens", "auths/folder/", b"");
         let dir = scratch("obj-mirror");
         let store = store(&s3, &dir);
@@ -833,6 +837,8 @@ mod tests {
         // Dot segments never reach the disk; folder markers are not files.
         assert!(!auth.join("z.json").exists());
         assert!(!dir.join("evil.json").exists() && !auth.join("folder").exists());
+        // Backslashes and drive prefixes are Windows paths: refused on every platform.
+        assert!(!auth.join("..\\win.json").exists() && !auth.join("C:drive.json").exists());
         assert!(auth.join("local.json").exists(), "the mirror is never wiped");
         assert_eq!(mode(&auth.join("x.json")), 0o600);
         let log = s3.state.log.lock().unwrap();

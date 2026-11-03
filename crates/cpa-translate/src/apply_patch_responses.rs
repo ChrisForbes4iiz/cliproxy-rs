@@ -156,35 +156,54 @@ pub fn normalize_request(raw: &[u8]) -> Result<Vec<u8>, String> {
         })
         .map(|item| str_of(&item.get("call_id")))
         .collect();
-    for (i, item) in input.iter().enumerate() {
-        let path = format!("input.{i}");
+    // Go edits `out` by path per item (`input.N.type`, ...). For an array, each item is
+    // edited on its own with the same relative paths and spliced back into `out` in one
+    // pass: the same bytes without a copy of the request per edit. A non-array `input`
+    // (an object reads as one item, where `input.0.type` adds a member named "0") keeps
+    // the edits by path. The logic reads `input` from `raw`, whose offsets the
+    // descriptors were built from.
+    let edit_item = |item: &Res<'_>, target: &mut Vec<u8>, prefix: &str| -> Result<bool, String> {
         match &*item.get("type").bytes() {
             b"additional_tools" => {
                 let tools = item.get("tools");
-                if tools.is_array() {
-                    gj::set_raw(&mut out, &format!("{path}.tools"), normalize_tools(&tools, b""));
+                if !tools.is_array() {
+                    return Ok(false);
                 }
+                gj::set_raw(target, &format!("{prefix}tools"), normalize_tools(&tools, b""));
             }
             b"custom_tool_call" => {
                 if trim_space(&item.get("name").bytes()) != b"apply_patch" {
-                    continue;
+                    return Ok(false);
                 }
                 let patch = item.get("input");
                 if patch.kind != Kind::String {
                     return Err("apply_patch history input must be a string".into());
                 }
-                gj::set_str(&mut out, &format!("{path}.type"), "function_call");
-                gj::set_str(
-                    &mut out,
-                    &format!("{path}.arguments"),
-                    apply_patch::wrap_input(&patch.s),
-                );
-                gj::delete(&mut out, &format!("{path}.input"));
+                gj::set_str(target, &format!("{prefix}type"), "function_call");
+                gj::set_str(target, &format!("{prefix}arguments"), apply_patch::wrap_input(&patch.s));
+                gj::delete(target, &format!("{prefix}input"));
             }
             b"custom_tool_call_output" if patch_history.contains(&*item.get("call_id").bytes()) => {
-                gj::set_str(&mut out, &format!("{path}.type"), "function_call_output");
+                gj::set_str(target, &format!("{prefix}type"), "function_call_output");
             }
-            _ => {}
+            _ => return Ok(false),
+        }
+        Ok(true)
+    };
+    if root.get("input").is_array() {
+        let mut edits = vec![];
+        for (i, item) in input.iter().enumerate() {
+            let mut edited = item.raw.to_vec();
+            if edit_item(item, &mut edited, "")? {
+                edits.push((i, edited));
+            }
+        }
+        if !edits.is_empty() {
+            out = crate::common::replace_array_items(&out, "input", &edits);
+        }
+    } else {
+        for (i, item) in input.iter().enumerate() {
+            edit_item(item, &mut out, &format!("input.{i}."))?;
         }
     }
     fn normalize_choice(

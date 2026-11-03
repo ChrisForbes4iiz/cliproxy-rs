@@ -229,16 +229,20 @@ fn go_error(case: &Value) -> Option<String> {
         }
     };
     const EXCHANGE: &str = "antigravity: token exchange failed: antigravity token exchange: request failed: status ";
-    if let Some(rest) = go.strip_prefix(EXCHANGE)
-        && let Some((status, body)) = rest.split_once(": ")
-    {
-        let code = code(body);
-        let suffix = if code.is_empty() {
-            String::new()
-        } else {
-            format!(": {code}")
-        };
-        return Some(format!("{EXCHANGE}{status}{suffix}"));
+    // The user info call is sent the access token; its error body is withheld the same way.
+    const USERINFO: &str = "antigravity: fetch user info failed: antigravity userinfo: request failed: status ";
+    for prefix in [EXCHANGE, USERINFO] {
+        if let Some(rest) = go.strip_prefix(prefix)
+            && let Some((status, body)) = rest.split_once(": ")
+        {
+            let code = code(body);
+            let suffix = if code.is_empty() {
+                String::new()
+            } else {
+                format!(": {code}")
+            };
+            return Some(format!("{prefix}{status}{suffix}"));
+        }
     }
     // A failed refresh grant: Go's error is the body itself.
     if let Some(status) = case["status"].as_u64().map(|s| s as u16)

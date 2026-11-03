@@ -360,7 +360,10 @@ impl OAuth {
             let body = proxy::read_all(upstream.body, 8 << 10, false)
                 .await
                 .map_err(|e| AuthError::plain(format!("{STEP}: read response: {}", transport_text(&e))))?;
-            return Err(AuthError::http(status, status_message(STEP, status, &body)));
+            return Err(AuthError::http(
+                status,
+                status_message(STEP, status, &token_error_code(&body)),
+            ));
         }
         let body = proxy::read_all(upstream.body, usize::MAX, false)
             .await

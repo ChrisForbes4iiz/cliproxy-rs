@@ -916,3 +916,18 @@ fn sensitive_words_drop_matching_lines_then_obfuscate() {
     // A line containing a word is dropped; nothing is left to obfuscate.
     assert_eq!(sanitize_system_prompt(b"keep\nhas secret\nend", Some(&m)), b"keep\nend");
 }
+
+/// A `Retry-After` beyond Go's largest Duration saturates there.
+#[test]
+fn huge_retry_after_saturates_at_go_max_duration() {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, "99999999999999".parse().unwrap());
+    let error = upstream_error(429, headers, Bytes::new());
+    assert_eq!(error.retry_after, Some(crate::quota::GO_MAX_DURATION));
+    let mut headers = http::HeaderMap::new();
+    headers.insert(http::header::RETRY_AFTER, "30".parse().unwrap());
+    assert_eq!(
+        upstream_error(429, headers, Bytes::new()).retry_after,
+        Some(Duration::from_secs(30))
+    );
+}

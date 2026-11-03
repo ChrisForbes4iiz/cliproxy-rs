@@ -638,3 +638,111 @@ fn keeps_the_current_branch_when_the_remote_default_cannot_be_resolved() {
     store(&remote, "", &ws).ensure_repository().unwrap();
     assert_eq!(head_branch(&ws), "develop");
 }
+
+/// `git mktree` of `entries` (`<mode> <type> <hash>\t<name>` lines) in `dir`: git's
+/// plumbing builds trees that its checkout would refuse, as a hostile remote can.
+fn mktree(dir: &Path, entries: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .current_dir(dir)
+        .arg("mktree")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(entries.as_bytes()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A commit in `ws` whose tree holds `safe.txt` plus `.git/evil` and `.GIT/evil`.
+fn hostile_commit(ws: &Path) -> String {
+    std::fs::write(ws.join("payload"), "[core]\n\tfsmonitor = touch pwned\n").unwrap();
+    let blob = git(ws, &["hash-object", "-w", "payload"]);
+    std::fs::remove_file(ws.join("payload")).unwrap();
+    let sub = mktree(ws, &format!("100644 blob {blob}\tevil\n"));
+    let tree = mktree(
+        ws,
+        &format!("040000 tree {sub}\t.git\n040000 tree {sub}\t.GIT\n100644 blob {blob}\tsafe.txt\n"),
+    );
+    git(ws, &["commit-tree", &tree, "-m", "hostile tree"])
+}
+
+/// cliproxy-rs-7ea.3: a tracked path that git's checkout refused is never restored by
+/// hand into `.git` (in any case).
+#[test]
+fn restore_missing_skips_paths_inside_the_git_directory() {
+    let root = scratch("hostile-restore");
+    let remote = setup_remote(&root, "master", &[("master", "remote master branch\n")]);
+    let ws = root.join("workspace");
+    let s = store(&remote, "", &ws);
+    s.ensure_repository().unwrap();
+    let commit = hostile_commit(&ws);
+    git(&ws, &["update-ref", "refs/heads/master", &commit]);
+    s.restore_missing().unwrap();
+    assert!(ws.join("safe.txt").exists(), "a plain tracked file is restored");
+    assert!(!ws.join(".git/evil").exists());
+    assert!(!ws.join(".GIT").exists());
+}
+
+/// cliproxy-rs-7ea.3: the pull's reconcile writes the remote's plain files but no path
+/// inside `.git`.
+#[test]
+fn reconcile_skips_paths_inside_the_git_directory() {
+    let root = scratch("hostile-reconcile");
+    let remote = setup_remote(&root, "master", &[("master", "remote master branch\n")]);
+    let ws = root.join("workspace");
+    let s = store(&remote, "", &ws);
+    s.ensure_repository().unwrap();
+    let base = git(&ws, &["rev-parse", "HEAD"]);
+    let commit = hostile_commit(&ws);
+    // The files are written before the index reset, which git may refuse for this tree
+    // (`invalid path '.git/evil'`); only what reached the disk matters here.
+    let _ = s.reconcile(Some(&base), &commit, "refs/heads/master");
+    assert!(ws.join("safe.txt").exists());
+    assert!(!ws.join(".git/evil").exists());
+    assert!(!ws.join(".GIT").exists());
+}
+
+/// cliproxy-rs-7ea.23: a remote default branch that git would parse as an option is
+/// refused, and the store keeps its current branch as it does for an unresolvable one.
+#[test]
+fn an_option_like_remote_default_branch_is_refused() {
+    let root = scratch("dash-branch");
+    let remote = setup_remote(&root, "master", &[("master", "remote master branch\n")]);
+    let ws = root.join("workspace");
+    store(&remote, "", &ws).ensure_repository().unwrap();
+    let tip = git(Path::new(&remote), &["rev-parse", "refs/heads/master"]);
+    git(Path::new(&remote), &["update-ref", "refs/heads/--orphan", &tip]);
+    git(Path::new(&remote), &["symbolic-ref", "HEAD", "refs/heads/--orphan"]);
+    let s = store(&remote, "", &ws);
+    assert!(s.remote_default_branch().is_err());
+    s.ensure_repository().unwrap();
+    assert_eq!(head_branch(&ws), "master");
+}
+
+/// cliproxy-rs-7ea.23: a stalled git is killed at the deadline; a finished one returns
+/// both streams.
+#[test]
+fn git_subprocesses_are_killed_at_the_deadline() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let started = Instant::now();
+    let mut slow = Command::new("sh");
+    slow.args(["-c", "sleep 30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let error = super::output_with_timeout(&mut slow, Duration::from_millis(200)).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let mut quick = Command::new("sh");
+    quick
+        .args(["-c", "printf out; printf err >&2; exit 3"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = super::output_with_timeout(&mut quick, Duration::from_secs(30)).unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(output.stdout, b"out");
+    assert_eq!(output.stderr, b"err");
+}

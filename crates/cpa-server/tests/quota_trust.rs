@@ -183,6 +183,8 @@ async fn early_reset_is_noticed_after_the_bound(save: bool) {
         "a cooling credential is not sent upstream"
     );
 
+    // The 429's cooldown is written by the persistence worker.
+    rt.flush_persistence().await;
     let cds = dir.join("claude-q.cds");
     let url = if save {
         assert!(cds.exists(), "save-cooldown-status writes the cooldown");

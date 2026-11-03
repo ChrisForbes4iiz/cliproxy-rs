@@ -595,8 +595,9 @@ impl Depth {
     }
 }
 
-/// The largest [`Depth::levels`] of separately scanned bodies.
-pub(crate) fn levels(bodies: &[&[u8]]) -> usize {
+/// The largest bracket nesting (as `Depth` counts it) of separately scanned bodies: the
+/// `levels` argument of [`deep_stack`].
+pub fn levels(bodies: &[&[u8]]) -> usize {
     bodies
         .iter()
         .map(|body| {
@@ -612,13 +613,20 @@ pub(crate) fn levels(bodies: &[&[u8]]) -> usize {
 /// a caller's stack (a 2 MiB async worker) safely holds. Go's JSON walkers recurse per
 /// nesting level on growable stacks (up to 1 GiB); the ported walkers recurse too, so
 /// deep data would otherwise overflow a native stack and abort the process. A stack that
-/// cannot be reserved (memory limits on a small host) is an error, not a panic.
+/// cannot be reserved (memory limits on a small host) is an error, not a panic. Public so
+/// that callers outside the crate (cpa-exec's translators) share this guard and its
+/// per-thread flag instead of nesting a second one.
+// Decision (review 2026-11-02): `Depth` keeps counting every bracket opened inside a
+// string. Counting only structural brackets under-counts JSON text that a translator
+// parses out of strings, and a stream's tool arguments arrive split across many delta
+// strings that are joined before parsing, so no per-string bound is sound; the cost is a
+// larger stack reservation for bracket-heavy text, not a refusal.
 // ponytail: the stack is sized from a measured per-level cost of the deepest walkers
 // (under 2 KiB in debug builds, which use more stack than release; 4x margin), clamped
 // to Go's 1 GiB maximum. Once a stream's strings have held more than 256 brackets (code
 // in text deltas), each later event runs on a new thread (about 32 us measured); a
 // per-stream worker thread would remove that cost if it ever matters.
-pub(crate) fn deep_stack<T: Send>(levels: usize, f: impl FnOnce() -> Result<T, Error> + Send) -> Result<T, Error> {
+pub fn deep_stack<T: Send>(levels: usize, f: impl FnOnce() -> Result<T, Error> + Send) -> Result<T, Error> {
     const DEEP: usize = 256;
     const PER_LEVEL: usize = 8 << 10;
     const MIN_STACK: usize = 8 << 20;

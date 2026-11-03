@@ -1366,8 +1366,16 @@ async fn panel(State(state): State<Arc<Management>>, OriginalUri(uri): OriginalU
     let Some((bytes, mime)) = dashboard_asset(uri.path()) else {
         return error(404, "not_found");
     };
+    // Defence in depth for the page that holds the management key (Go sets none of
+    // these): no MIME sniffing, and no framing by another site (clickjacking).
     (
-        [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, "no-cache")],
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+        ],
         bytes,
     )
         .into_response()

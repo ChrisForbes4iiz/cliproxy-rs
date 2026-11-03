@@ -393,6 +393,26 @@ async fn replay(op: &str, args: &Value, installs: &mut Installs) -> Value {
     }
 }
 
+/// docs/DIFFERENCES-FROM-GO.md: an installed library's mode is masked to 0755 (Go keeps
+/// the zip entry's bits, 0666 for an entry without them), so Go's recorded library modes
+/// are compared masked.
+fn mask_go_library_modes(want: &mut Value) {
+    let Some(files) = want.get_mut("files").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for file in files {
+        let library = file["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with(".so") || p.ends_with(".dylib") || p.ends_with(".dll"));
+        if !library {
+            continue;
+        }
+        if let Some(mode) = file["mode"].as_str().and_then(|m| u32::from_str_radix(m, 8).ok()) {
+            file["mode"] = json!(format!("{:o}", mode & 0o755));
+        }
+    }
+}
+
 #[test]
 fn store_matches_go() {
     let fixture: Value =
@@ -406,8 +426,12 @@ fn store_matches_go() {
     for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
         let op = case["op"].as_str().unwrap();
         let got = runtime.block_on(replay(op, &case["args"], &mut installs));
+        let mut want = case["result"].clone();
+        if op == "install" {
+            mask_go_library_modes(&mut want);
+        }
         // Compared as serialized text so field order counts too.
-        let (want, got) = (case["result"].to_string(), got.to_string());
+        let (want, got) = (want.to_string(), got.to_string());
         if want != got {
             let args = case["args"].to_string();
             let args = &args[..args.len().min(600)];

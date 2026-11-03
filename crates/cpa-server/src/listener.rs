@@ -72,6 +72,12 @@ const ALPN: &[u8] = b"\x02h2\x08http/1.1";
 /// byte within this.
 const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// An HTTP/1 connection must deliver each request's complete header block within this
+/// (hyper's default). It also ends a keep-alive connection that sends nothing for this
+/// long. Go's `http.Server` here sets no timeouts at all; a connection that trickles bytes
+/// would otherwise hold its task and socket for as long as the client likes.
+const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The configured TLS settings (`server.tls`, legacy `tls`).
 fn tls_settings(cfg: &Config) -> (bool, String, String) {
     let tls = cfg.document.get("server").and_then(|s| s.get("tls"));
@@ -303,7 +309,10 @@ where
             .serve_connection(io, service)
             .await
     } else {
+        // hyper drops its header-read timeout, with only a log line, when no timer is set.
         hyper::server::conn::http1::Builder::new()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(HEADER_READ_TIMEOUT)
             .serve_connection(io, service)
             .with_upgrades()
             .await
@@ -329,6 +338,46 @@ mod tests {
 
     fn cfg(yaml: &str) -> Config {
         Config::parse(yaml).unwrap()
+    }
+
+    /// A client that sends part of a request line and then stalls is disconnected once
+    /// the header-read timeout passes (hyper ignores the timeout without a timer).
+    #[tokio::test(start_paused = true)]
+    async fn stalled_partial_request_line_is_disconnected() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let served = tokio::spawn(serve_connection(server, peer, app, false));
+        client.write_all(b"GET / HT").await.unwrap();
+        let mut rest = Vec::new();
+        let closed = tokio::time::timeout(
+            HEADER_READ_TIMEOUT + std::time::Duration::from_secs(30),
+            client.read_to_end(&mut rest),
+        )
+        .await;
+        assert!(closed.is_ok(), "a stalled request header must end the connection");
+        tokio::time::timeout(std::time::Duration::from_secs(1), served)
+            .await
+            .expect("the connection task ends")
+            .unwrap();
+    }
+
+    /// A complete request on the same kind of connection is still answered.
+    #[tokio::test(start_paused = true)]
+    async fn complete_request_is_answered_with_the_timer_set() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let app = Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        tokio::spawn(serve_connection(server, peer, app, false));
+        client
+            .write_all(b"GET / HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("ok"), "{response}");
     }
 
     fn error(yaml: &str) -> String {

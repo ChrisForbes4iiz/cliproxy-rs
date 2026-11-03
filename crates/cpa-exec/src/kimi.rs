@@ -40,7 +40,7 @@ use crate::kimi_http::{DeferredUsage, UsageRule, apply_patch_requested, defer_us
 use crate::kimi_replay::{self, ReplayCache};
 use crate::meta_codex::go_trim_space;
 use crate::openai_compat_payload::ensure_responses_usage_details;
-use crate::proxy::{GoClients, GoHeaders, Proxy, Upstream, default_client, lines, read_all, send_scanned};
+use crate::proxy::{GoClients, GoHeaders, Proxy, Upstream, default_client, lines, read_success, send_scanned};
 
 const REASONING_UNAVAILABLE: &str = "[reasoning unavailable]";
 
@@ -393,7 +393,7 @@ async fn read_body(
     body: futures_util::stream::BoxStream<'static, Result<Bytes, ExecError>>,
     capture: &cpa_core::exec::CaptureSink,
 ) -> Result<Bytes, ExecError> {
-    let data = read_all(body, usize::MAX, false)
+    let data = read_success(body)
         .await
         .inspect_err(|e| crate::kimi_http::capture_error(capture, e))?;
     crate::kimi_http::capture_chunk(capture, &data);

@@ -39,7 +39,7 @@ use crate::kimi_http::{
 use crate::meta_auth::{DEFAULT_API_BASE_URL, MetaAuth, MintedKey};
 use crate::meta_codex::go_trim_space;
 use crate::openai_compat_payload::{ensure_responses_usage_details, sanitize_reasoning_encrypted_content};
-use crate::proxy::{GoClients, GoHeaders, MAX_ERROR_BODY, Proxy, default_client, lines, read_all, send};
+use crate::proxy::{GoClients, GoHeaders, MAX_ERROR_BODY, Proxy, default_client, lines, read_success, send};
 use crate::tokenizer::Encoding;
 use cpa_common::codex_client::normalize_codex_instructions;
 
@@ -273,7 +273,7 @@ impl MetaExecutor {
                 capture.clone(),
             ))
         } else {
-            let data = read_all(upstream.body, usize::MAX, false)
+            let data = read_success(upstream.body)
                 .await
                 .inspect_err(|e| capture_error(capture, e))?;
             capture_chunk(capture, &data);
@@ -545,10 +545,7 @@ fn resets_in(body: &[u8]) -> Option<Duration> {
     if resets_at <= 0 {
         return None;
     }
-    let at = std::time::UNIX_EPOCH + Duration::from_secs(resets_at as u64);
-    at.duration_since(std::time::SystemTime::now())
-        .ok()
-        .filter(|d| !d.is_zero())
+    crate::quota::until_unix(resets_at as u64, std::time::SystemTime::now())
 }
 
 /// `isMetaSubscriptionQuota` (status already 429).

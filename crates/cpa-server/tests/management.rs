@@ -271,23 +271,27 @@ async fn real_http_config_rejections_comments_publication_and_panel_assets() {
             .status(),
         404
     );
+    // The page and every asset refuse sniffing and framing by another site.
+    let hardened = |headers: &wreq::header::HeaderMap, what: &str| {
+        assert_eq!(headers["x-content-type-options"], "nosniff", "{what}");
+        assert_eq!(headers["x-frame-options"], "DENY", "{what}");
+        assert_eq!(headers["content-security-policy"], "frame-ancestors 'none'", "{what}");
+    };
     let html = client.get(format!("{base}/management.html")).send().await.unwrap();
     assert_eq!(html.status(), 200);
+    hardened(html.headers(), "management.html");
     let html = html.text().await.unwrap();
     for piece in html
         .split('"')
         .filter(|p| p.starts_with("./assets/") || p.starts_with("./fonts/"))
     {
-        assert_eq!(
-            client
-                .get(format!("{base}/{}", piece.trim_start_matches("./")))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200,
-            "asset {piece}"
-        );
+        let asset = client
+            .get(format!("{base}/{}", piece.trim_start_matches("./")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(asset.status(), 200, "asset {piece}");
+        hardened(asset.headers(), piece);
     }
     server.abort();
 }
@@ -361,6 +365,52 @@ async fn watcher_keeps_last_good_config_and_reconciles_disabled_deleted_and_self
     server.abort();
 }
 
+/// Key-less requests never count toward the ban; every presented key does, whatever
+/// other headers say: `Sec-Fetch-Site` is attacker-settable, so it exempts nothing.
+#[tokio::test]
+async fn missing_keys_do_not_ban_but_cross_site_wrong_keys_do() {
+    let f = Fixture::new("ban-counting");
+    let (base, server) = f.server().await;
+    let client = wreq::Client::new();
+    let url = format!("{base}/v8/management/config");
+    for _ in 0..10 {
+        let r = client
+            .get(&url)
+            .header("Sec-Fetch-Site", "cross-site")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+        assert_eq!(r.text().await.unwrap(), r#"{"error":"missing management key"}"#);
+    }
+    let ok = client
+        .get(&url)
+        .header("X-Management-Key", "fake-management-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200, "key-less requests must not ban");
+    for _ in 0..5 {
+        let r = client
+            .get(&url)
+            .header("Sec-Fetch-Site", "cross-site")
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 401);
+    }
+    let banned = client
+        .get(&url)
+        .header("X-Management-Key", "fake-management-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(banned.status(), 403, "cross-site wrong keys count toward the ban");
+    server.abort();
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
 #[tokio::test]
 async fn remote_policy_does_not_trust_forwarded_headers_and_key_hashing_preserves_source() {
     let f = Fixture::new("auth");
@@ -373,11 +423,21 @@ async fn remote_policy_does_not_trust_forwarded_headers_and_key_hashing_preserve
         .send()
         .await
         .unwrap();
+    // An untrusted loopback peer relaying a client (forwarding headers) is remote, so
+    // `allow-remote: false` refuses it (Go treats it as local; DIFFERENCES-FROM-GO.md).
     assert_eq!(
         r.status(),
-        200,
-        "untrusted forwarded header must not change local identity"
+        403,
+        "a loopback proxy's client must not be treated as local"
     );
+    assert_eq!(r.text().await.unwrap(), r#"{"error":"remote management disabled"}"#);
+    let r = client
+        .get(format!("{base}/v8/management/config"))
+        .header("X-Management-Key", "fake-management-only")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "a direct loopback caller stays local");
     for _ in 0..5 {
         assert_eq!(
             client
@@ -2719,7 +2779,13 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     let (base, _state, server) = login_server(&f, &fake).await;
     let started = oauth_get(&base, "/oauth/auth-url?provider=xai").await;
     let state = started["state"].as_str().unwrap().to_owned();
-    assert!(state.starts_with("xai-"), "{state}");
+    // A random 16-byte hex suffix, not a timestamp (docs/DIFFERENCES-FROM-GO.md).
+    assert!(
+        state
+            .strip_prefix("xai-")
+            .is_some_and(|r| r.len() == 32 && r.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{state}"
+    );
     assert_eq!(started["status"], "ok");
     assert_eq!(started["flow"], "device");
     assert_eq!(started["url"], "https://accounts.x.ai/device?user_code=XU-1");
@@ -3484,7 +3550,13 @@ async fn kimi_device_login_saves_and_a_cancelled_one_does_not() {
     assert_eq!(started["expires_in"], 600);
     assert_eq!(started["url"], "https://kimi.example.invalid/device?code=UC-1");
     let state = started["state"].as_str().unwrap().to_owned();
-    assert!(state.starts_with("kmi-"));
+    // A random 16-byte hex suffix, not a timestamp (docs/DIFFERENCES-FROM-GO.md).
+    assert!(
+        state
+            .strip_prefix("kmi-")
+            .is_some_and(|r| r.len() == 32 && r.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{state}"
+    );
     let cancelled = oauth_get(&base, "/oauth/auth-url?provider=kimi-ai").await;
     let other = cancelled["state"].as_str().unwrap().to_owned();
     let r: Value = wreq::Client::new()
@@ -3525,7 +3597,13 @@ async fn kimi_channel_selects_kimi_ai_and_codex_exchange_errors_read_like_go() {
     let (base, _state, server) = login_server(&f, &fake).await;
     let started = oauth_get(&base, "/oauth/auth-url?provider=kimi&channel=ai").await;
     let state = started["state"].as_str().unwrap().to_owned();
-    assert!(state.starts_with("kmi-ai-"), "{state}");
+    // A random 16-byte hex suffix, not a timestamp (docs/DIFFERENCES-FROM-GO.md).
+    assert!(
+        state
+            .strip_prefix("kmi-ai-")
+            .is_some_and(|r| r.len() == 32 && r.bytes().all(|b| b.is_ascii_hexdigit())),
+        "{state}"
+    );
     let _ = wreq::Client::new()
         .delete(format!("{base}/v8/management/oauth/session?state={state}"))
         .bearer_auth("fake-management-only")

@@ -210,6 +210,31 @@ fn fuzz() -> Duration {
     }
 }
 
+/// Go's largest `time.Duration` (about 292 years). `Time.Sub` saturates there, so a far
+/// future reset waits this long in Go.
+pub(crate) const GO_MAX_DURATION: Duration = Duration::from_nanos(i64::MAX as u64);
+
+/// `time.Unix(at, 0).Sub(now)` for an `at` after `now`; `None` otherwise. Saturates at
+/// [`GO_MAX_DURATION`] as Go does. A deadline past this platform's `SystemTime` range
+/// (on Windows about 9.2e11 seconds, which a millisecond timestamp sent as seconds
+/// exceeds) is later than any `now`, so it saturates too instead of panicking.
+pub(crate) fn until_unix(at: u64, now: SystemTime) -> Option<Duration> {
+    let Some(deadline) = UNIX_EPOCH.checked_add(Duration::from_secs(at)) else {
+        return Some(GO_MAX_DURATION);
+    };
+    deadline
+        .duration_since(now)
+        .ok()
+        .filter(|d| !d.is_zero())
+        .map(|d| d.min(GO_MAX_DURATION))
+}
+
+/// `time.Duration(seconds) * time.Second`, saturating at [`GO_MAX_DURATION`] where Go's
+/// multiplication wraps.
+pub(crate) fn go_seconds(seconds: u64) -> Duration {
+    Duration::from_secs(seconds).min(GO_MAX_DURATION)
+}
+
 /// `maxClaudeRateLimitWindow` (v8.0.27, 8080967): the longest Anthropic window, 7 days,
 /// plus an hour of clock skew. A later reset is a billing boundary, not a rate limit.
 const MAX_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600 + 3600);
@@ -682,6 +707,21 @@ mod tests {
         bad.insert("anthropic-ratelimit-unified-claim", "x".repeat(513).parse().unwrap());
         assert!(claude_signals(&bad).is_empty());
         assert!(obs.snapshot("other").is_none());
+    }
+
+    /// A millisecond timestamp read as seconds lies past Windows' `SystemTime` range; it
+    /// saturates like Go's `Time.Sub` on every platform instead of panicking.
+    #[test]
+    fn unix_deadlines_saturate_at_go_max_duration() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_762_000_000);
+        assert_eq!(until_unix(1_762_000_000_000, now), Some(GO_MAX_DURATION));
+        assert_eq!(until_unix(u64::MAX, now), Some(GO_MAX_DURATION));
+        assert_eq!(until_unix(1_762_000_060, now), Some(Duration::from_secs(60)));
+        assert_eq!(until_unix(1_762_000_000, now), None);
+        assert_eq!(until_unix(1, now), None);
+        assert_eq!(go_seconds(30), Duration::from_secs(30));
+        assert_eq!(go_seconds(u64::MAX), GO_MAX_DURATION);
+        assert_eq!(GO_MAX_DURATION.as_secs(), 9_223_372_036);
     }
 
     /// TestObserveResponseHeadersTruncatesDeterministically, for Claude: the first 64 names.

@@ -77,6 +77,19 @@ pub(crate) fn clean(path: &Path) -> PathBuf {
     out.iter().collect()
 }
 
+/// Whether a slash-separated relative path taken from a remote (an object key, a git
+/// tree entry) could land outside the directory it is joined to, on any platform:
+/// absolute, a backslash (a separator on Windows), a drive prefix (`C:x` is relative to
+/// drive C's current directory on Windows), or a `.` or `..` segment.
+pub(crate) fn escapes_root(rel: &str) -> bool {
+    let bytes = rel.as_bytes();
+    rel.is_empty()
+        || rel.starts_with('/')
+        || rel.contains('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || rel.split('/').any(|segment| segment == "." || segment == "..")
+}
+
 /// Go `filepath.Abs`: joined with the working directory, then cleaned.
 pub(crate) fn go_abs(path: &Path) -> std::io::Result<PathBuf> {
     std::path::absolute(path).map(|p| clean(&p))
@@ -261,6 +274,27 @@ pub async fn bootstrap(selection: Selection, wd: &Path) -> Result<Store, String>
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn hostile_relative_paths_escape_the_root() {
+        for rel in [
+            "",
+            "/etc/passwd",
+            "../x.json",
+            "a/../../x.json",
+            "a/./b.json",
+            "..\\config\\config.yaml",
+            "a\\b.json",
+            "C:foo",
+            "c:/foo",
+            "\\\\server\\share\\x",
+        ] {
+            assert!(escapes_root(rel), "{rel:?}");
+        }
+        for rel in ["a.json", "sub/a.json", "a..b.json", ".hidden/x.json", "ab:c.json"] {
+            assert!(!escapes_root(rel), "{rel:?}");
+        }
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();

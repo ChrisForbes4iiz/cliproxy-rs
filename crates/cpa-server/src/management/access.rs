@@ -5,9 +5,14 @@
 //!
 //! Order matters and is Go's: availability (404, empty body) -> version headers ->
 //! active ban (403) -> remote policy (403) -> missing secret (403) -> missing key
-//! (401, counted) -> local password -> MANAGEMENT_PASSWORD -> bcrypt (401, counted).
+//! (401, not counted; Go counts it) -> local password -> MANAGEMENT_PASSWORD -> bcrypt (401, counted).
 //! The fifth counted failure bans the client IP for 30 minutes. "Local" means the
 //! client IP text is exactly `127.0.0.1` or `::1`, after trusted-proxy resolution.
+//!
+//! Two differences from Go (docs/DIFFERENCES-FROM-GO.md): a loopback peer that is not a
+//! trusted proxy but sends forwarding headers is a proxy relaying someone else, so its
+//! requests are remote; and a request without a key is refused without counting
+//! toward the ban, so a web page cannot lock the operator's own address out.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,6 +29,8 @@ use subtle::ConstantTimeEq;
 use super::{Management, json_error};
 
 const MAX_FAILURES: u32 = 5;
+/// Headers a reverse proxy or tunnel adds for the client it relays.
+const FORWARDING_HEADERS: [&str; 4] = ["X-Forwarded-For", "Forwarded", "X-Real-IP", "CF-Connecting-IP"];
 const BAN: Duration = Duration::from_secs(30 * 60);
 /// Go `attemptCleanupInterval`.
 pub(super) const PURGE_EVERY: Duration = Duration::from_secs(3600);
@@ -138,20 +145,33 @@ impl Access {
             .trusted
             .client_ip(peer, |name| headers.get(name).map(HeaderValue::as_bytes));
         // Go trusts no proxy by default, so a local reverse proxy or tunnel (for example
-        // cloudflared on loopback) makes every client local. Keep Go's decision but say
-        // so once; the fix is `server.trusted-proxies: [127.0.0.1, "::1"]` and a restart.
+        // cloudflared on loopback) makes every client local; `is_local` treats such
+        // requests as remote instead. Say so once; the fix is
+        // `server.trusted-proxies: [127.0.0.1, "::1"]` and a restart.
         if (ip == "127.0.0.1" || ip == "::1")
-            && ["X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"]
-                .iter()
-                .any(|h| headers.contains_key(*h))
+            && self.untrusted_forwarding(peer, headers)
             && !self.warned_untrusted_forwarding.swap(true, Ordering::Relaxed)
         {
             tracing::warn!(
                 "management request from a loopback proxy carries forwarding headers; it is treated as \
-                 local. Set server.trusted-proxies to the proxy address and restart to use the client address"
+                 remote. Set server.trusted-proxies to the proxy address and restart to use the client address"
             );
         }
         ip
+    }
+
+    /// The peer is not a trusted proxy but sends headers a proxy adds for its client.
+    fn untrusted_forwarding(&self, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+        peer.is_some_and(|p| !self.trusted.contains(p.ip().to_canonical()))
+            && FORWARDING_HEADERS.iter().any(|h| headers.contains_key(*h))
+    }
+
+    /// Whether `ip` (from [`Access::client_ip`]) is a local caller: Go's text test, except
+    /// that a loopback peer relaying forwarding headers without being a trusted proxy is
+    /// remote. Go treats it as local, so a proxy on loopback lifts `allow-remote: false`
+    /// and accepts the `--password` local password from anyone who reaches the proxy.
+    pub(crate) fn is_local(&self, ip: &str, peer: Option<SocketAddr>, headers: &HeaderMap) -> bool {
+        (ip == "127.0.0.1" || ip == "::1") && !self.untrusted_forwarding(peer, headers)
     }
 
     fn attempts(&self) -> std::sync::MutexGuard<'_, Attempts> {
@@ -222,8 +242,10 @@ impl Access {
         if secret.is_empty() && self.env_secret.is_empty() && !(local && self.local_secret) {
             return Err((StatusCode::FORBIDDEN, "remote management key not set".into()));
         }
+        // A missing key does not count toward the ban. Go counts it, which lets any page
+        // the operator visits ban loopback with five image tags. Every presented key
+        // counts, whatever other headers say.
         if provided.is_empty() {
-            self.fail(ip);
             return Err((StatusCode::UNAUTHORIZED, "missing management key".into()));
         }
         let matches = |want: &[u8]| !want.is_empty() && bool::from(want.ct_eq(provided));
@@ -309,7 +331,7 @@ pub(crate) async fn guard(State(state): State<Arc<Management>>, req: Request, ne
     }
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0);
     let ip = state.access.client_ip(peer, req.headers());
-    let local = ip == "127.0.0.1" || ip == "::1";
+    let local = state.access.is_local(&ip, peer, req.headers());
     let provided = provided_key(req.headers()).to_vec();
     let cfg = state.rt.config();
     let mut response = match state.access.authenticate(&cfg, &ip, local, &provided).await {
@@ -356,6 +378,71 @@ pub(crate) fn cors_headers(response: &mut Response) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bcrypt_cfg() -> Config {
+        Config::parse("management:\n  secret-key: '$2a$04$aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'\n")
+            .unwrap()
+    }
+
+    #[test]
+    fn loopback_peer_with_forwarding_headers_is_remote_unless_trusted() {
+        let peer: Option<SocketAddr> = Some("127.0.0.1:50000".parse().unwrap());
+        let v6: Option<SocketAddr> = Some("[::1]:50000".parse().unwrap());
+        let access = Access::new(&bcrypt_cfg(), super::super::Options::default());
+        let plain = HeaderMap::new();
+        let ip = access.client_ip(peer, &plain);
+        assert_eq!(ip, "127.0.0.1");
+        assert!(access.is_local(&ip, peer, &plain), "a direct loopback caller is local");
+        assert!(access.is_local("::1", v6, &plain));
+        for name in ["X-Forwarded-For", "Forwarded", "X-Real-IP", "CF-Connecting-IP"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(name, HeaderValue::from_static("203.0.113.9"));
+            let ip = access.client_ip(peer, &headers);
+            assert_eq!(ip, "127.0.0.1", "untrusted forwarding headers are not used");
+            assert!(!access.is_local(&ip, peer, &headers), "{name} from loopback is remote");
+            assert!(!access.is_local("::1", v6, &headers), "{name} from ::1 is remote");
+        }
+        // A trusted loopback proxy that forwards a loopback client keeps it local.
+        let mut trusted_cfg = bcrypt_cfg();
+        trusted_cfg.trusted_proxies = vec!["127.0.0.1".into()];
+        let trusted = Access::new(&trusted_cfg, super::super::Options::default());
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+        let ip = trusted.client_ip(peer, &headers);
+        assert!(trusted.is_local(&ip, peer, &headers));
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("203.0.113.9"));
+        let ip = trusted.client_ip(peer, &headers);
+        assert_eq!(ip, "203.0.113.9");
+        assert!(!trusted.is_local(&ip, peer, &headers));
+    }
+
+    #[tokio::test]
+    async fn missing_keys_do_not_ban() {
+        let cfg = bcrypt_cfg();
+        let access = Access::new(&cfg, super::super::Options::default());
+        let count = |ip: &str| access.attempts().by_ip.get(ip).map_or(0, |a| a.count);
+        for _ in 0..10 {
+            let missing = access.authenticate(&cfg, "127.0.0.1", true, b"").await;
+            assert_eq!(
+                missing.unwrap_err(),
+                (StatusCode::UNAUTHORIZED, "missing management key".into())
+            );
+        }
+        assert_eq!(count("127.0.0.1"), 0);
+        assert!(
+            access
+                .attempts()
+                .by_ip
+                .get("127.0.0.1")
+                .is_none_or(|a| a.blocked_until.is_none())
+        );
+        // A wrong key still counts, and the fifth bans.
+        for _ in 0..5 {
+            let _ = access.authenticate(&cfg, "127.0.0.1", true, b"wrong").await;
+        }
+        let banned = access.authenticate(&cfg, "127.0.0.1", true, b"wrong").await;
+        assert_eq!(banned.unwrap_err().0, StatusCode::FORBIDDEN);
+    }
 
     #[test]
     fn failures_only_expire_through_the_hourly_purge() {

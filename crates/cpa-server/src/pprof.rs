@@ -123,6 +123,12 @@ impl Server {
                             match bound {
                                 Ok(bound) => {
                                     tracing::info!("pprof server starting on {}", current.1);
+                                    if bound.local_addr().is_ok_and(|a| !a.ip().to_canonical().is_loopback()) {
+                                        tracing::warn!(
+                                            "pprof server on {} is reachable beyond loopback and has no authentication",
+                                            current.1
+                                        );
+                                    }
                                     listener = Some(bound);
                                     accept_delay = Duration::ZERO;
                                     retry_at = None;
@@ -301,11 +307,42 @@ async fn cmdline() -> Response {
     // net/http/pprof.Cmdline joins os.Args with NUL, with no trailing separator.
     text(
         StatusCode::OK,
-        std::env::args_os()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("\0"),
+        redact_args(std::env::args_os().map(|s| s.to_string_lossy().into_owned())).join("\0"),
     )
+}
+
+/// Command-line flags whose values are secrets (crates/cliproxy/src/main.rs).
+const SECRET_FLAGS: &[&str] = &["password", "home-jwt"];
+
+/// argv with the values of [`SECRET_FLAGS`] replaced, in every form Go's flag package
+/// accepts: `-flag value`, `--flag value`, `-flag=value` and `--flag=value`. Go's
+/// `pprof.Cmdline` returns them as given, and this listener has no authentication.
+fn redact_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    const REDACTED: &str = "[REDACTED]";
+    let mut out = Vec::new();
+    let mut hide_next = false;
+    for arg in args {
+        if std::mem::take(&mut hide_next) {
+            out.push(REDACTED.to_owned());
+            continue;
+        }
+        let Some(bare) = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')) else {
+            out.push(arg);
+            continue;
+        };
+        match bare.split_once('=') {
+            Some((name, _)) if SECRET_FLAGS.contains(&name) => {
+                let flag = &arg[..arg.len() - bare.len() + name.len()];
+                out.push(format!("{flag}={REDACTED}"));
+            }
+            None if SECRET_FLAGS.contains(&bare) => {
+                hide_next = true;
+                out.push(arg);
+            }
+            _ => out.push(arg),
+        }
+    }
+    out
 }
 
 async fn symbol(OriginalUri(uri): OriginalUri, req: Request) -> Response {
@@ -477,6 +514,50 @@ mod tests {
         let mut body = [0; 15];
         stream.read_exact(&mut body).await.unwrap();
         assert_eq!(&body, b"num_symbols: 1\n");
+    }
+
+    #[test]
+    fn cmdline_redacts_secret_flag_values() {
+        let args = [
+            "cliproxy",
+            "-password",
+            "pw-1",
+            "--password",
+            "pw-2",
+            "-password=pw-3",
+            "--password=pw-4",
+            "-home-jwt",
+            "jwt-1",
+            "--home-jwt=jwt-2",
+            "-config",
+            "c.yaml",
+            "-passwords=kept",
+            "-tui",
+        ];
+        let redacted = redact_args(args.map(String::from));
+        assert_eq!(
+            redacted,
+            [
+                "cliproxy",
+                "-password",
+                "[REDACTED]",
+                "--password",
+                "[REDACTED]",
+                "-password=[REDACTED]",
+                "--password=[REDACTED]",
+                "-home-jwt",
+                "[REDACTED]",
+                "--home-jwt=[REDACTED]",
+                "-config",
+                "c.yaml",
+                "-passwords=kept",
+                "-tui",
+            ]
+        );
+        let joined = redacted.join("\0");
+        for secret in ["pw-1", "pw-2", "pw-3", "pw-4", "jwt-1", "jwt-2"] {
+            assert!(!joined.contains(secret), "{secret} leaked");
+        }
     }
 
     #[tokio::test]

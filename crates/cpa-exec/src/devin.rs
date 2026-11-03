@@ -163,7 +163,7 @@ fn apply_patch_error() -> ExecError {
 /// `newDevinStatusError`: the upstream body, with a 429's `Retry-After` (seconds or an
 /// HTTP date) as the cooldown hint.
 fn upstream_error(status: u16, headers: http::HeaderMap, body: Bytes) -> ExecError {
-    let mut retry_after = None;
+    let mut retry_after: Option<Duration> = None;
     if status == 429
         && let Some(raw) = headers
             .get(http::header::RETRY_AFTER)
@@ -173,13 +173,14 @@ fn upstream_error(status: u16, headers: http::HeaderMap, body: Bytes) -> ExecErr
     {
         if let Ok(seconds) = raw.parse::<i64>() {
             if seconds >= 0 {
-                retry_after = Some(Duration::from_secs(seconds as u64));
+                retry_after = Some(crate::quota::go_seconds(seconds as u64));
             }
         } else if let Ok(at) = httpdate::parse_http_date(raw) {
             retry_after = at
                 .duration_since(std::time::SystemTime::now())
                 .ok()
-                .filter(|d| !d.is_zero());
+                .filter(|d| !d.is_zero())
+                .map(|d| d.min(crate::quota::GO_MAX_DURATION));
         }
     }
     ExecError {

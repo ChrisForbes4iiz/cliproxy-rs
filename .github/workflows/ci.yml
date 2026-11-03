@@ -55,7 +55,7 @@ jobs:
       # CARGO_* variables, and the perf and Windows jobs keep theirs.
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build tools
         # BoringSSL (through btls-sys) needs cmake, clang and perl; bindgen needs libclang.
         # The script bounds a stalled mirror download (it says how).
@@ -78,7 +78,7 @@ jobs:
           tool: cargo-nextest@0.9.148
       # The plugin tests build Go plugins (cgo, c-shared) from this module. Without Go 1.26
       # they would skip; CPA_TEST_NO_SKIP below turns that skip into a failure.
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: crates/cpa-plugin/tests/goplugins/go.mod
           cache-dependency-path: crates/cpa-plugin/tests/goplugins/go.sum
@@ -157,7 +157,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: .github/scripts
       - name: Test counts
@@ -169,6 +169,30 @@ jobs:
           printf '%s\n' "$COUNTS_2" > counts-2.json
           python3 .github/scripts/test-counts.py total counts-1.json counts-2.json
 
+  # The binary embeds the committed ui/dist, and the Go panel ships ui/dist-panel, so a pull
+  # request that changes either without the source (or the source without them) fails here
+  # rather than at release time. The same commands and Node as release.yml's dashboard job.
+  dashboard:
+    name: dashboard build matches the source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Check, test and build
+        working-directory: ui
+        run: |
+          npm ci
+          npm run check
+          npm test
+          npm run build
+      - name: Committed build matches the source
+        run: git diff --exit-code -- ui/dist ui/dist-panel ui/PANEL.md
+
   # Everything that does not need the test build: formatting, clippy over every target,
   # the harness, and the Codex Live media relay tests, which build cpa-server with its
   # optional media-relay feature. In parallel with the tests above.
@@ -179,7 +203,7 @@ jobs:
     env:
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build tools
         run: .github/scripts/apt-install.sh cmake clang libclang-dev perl
       - name: Rust
@@ -244,7 +268,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build tools
         run: .github/scripts/apt-install.sh cmake clang libclang-dev perl
       - name: Rust
@@ -285,7 +309,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # btls-sys keeps BoringSSL's assembly on a native MSVC build, and BoringSSL assembles
       # x86_64 Windows code with NASM, which the image lacks. bindgen needs libclang.
       - name: NASM and libclang

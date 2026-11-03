@@ -1327,9 +1327,7 @@ fn resolve_auto(rt: &Runtime, registry: &crate::registry::Registry, model: &str)
     if base != "auto" {
         return model.to_owned();
     }
-    let first = registry
-        .resolve_auto(|client, m| rt.suspension(client, m))
-        .unwrap_or_else(|| "auto".into());
+    let first = registry.resolve_auto(rt.suspensions()).unwrap_or_else(|| "auto".into());
     format!("{first}{}", &model[base.len()..])
 }
 

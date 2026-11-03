@@ -530,14 +530,14 @@ fn normalize_malformed_schema_objects(json: Vec<u8>, add_missing_array_items: bo
     if root == GoValue::Bool(true) {
         return b"{}".to_vec();
     }
-    let root = match root.into_object().ok() {
+    let mut root = match root.into_object().ok() {
         Some(map) if !is_api_request_document(&map) => map,
         _ => return json,
     };
     if root.len() == 1 {
-        match root.get("schema") {
+        match root.get_mut("schema") {
             Some(GoValue::Object(inner)) => {
-                let (repaired, modified) = repair_node(inner, add_missing_array_items);
+                let (repaired, modified) = repair_node(std::mem::take(inner), add_missing_array_items);
                 if !modified {
                     return json;
                 }
@@ -549,7 +549,7 @@ fn normalize_malformed_schema_objects(json: Vec<u8>, add_missing_array_items: bo
             _ => {}
         }
     }
-    let (repaired, modified) = repair_node(&root, add_missing_array_items);
+    let (repaired, modified) = repair_node(root, add_missing_array_items);
     if !modified {
         return json;
     }
@@ -593,25 +593,39 @@ fn empty_object() -> GoValue {
     GoValue::Object(Map::new())
 }
 
-fn repair_node(node: &Map, add_items: bool) -> (Map, bool) {
+/// The object map under `key`, taken out of `node` (an empty map is left in its place
+/// until the caller writes the repaired one back).
+fn take_map(node: &mut Map, key: &str) -> Map {
+    match node.get_mut(key) {
+        Some(GoValue::Object(map)) => std::mem::take(map),
+        _ => Map::new(),
+    }
+}
+
+/// repairSchemaNode. Go copies each map one level deep and rebuilds only what it repairs;
+/// this takes the node by value and repairs it in place, so every node is visited once
+/// (cloning the subtree at every level was quadratic in the nesting depth). The output is
+/// the same: a node reported unmodified is returned exactly as it came in, which is what
+/// Go's discarded copy amounts to.
+fn repair_node(mut clone: Map, add_items: bool) -> (Map, bool) {
     let mut modified = false;
-    let mut clone = node.clone();
 
     if !is_non_object_type(clone.get("type")) {
-        let bare: Map = clone
+        let bare_keys: Vec<String> = clone
             .iter()
             .filter(|(k, v)| matches!(v, GoValue::Object(_)) && !is_known_keyword_or_extension(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, _)| k.clone())
             .collect();
-        if !bare.is_empty() {
-            let (repaired, promoted, _) = repair_property_map(&bare, add_items);
-            for k in bare.keys() {
-                clone.remove(k);
-            }
+        if !bare_keys.is_empty() {
+            let mut bare: Map = bare_keys
+                .into_iter()
+                .filter_map(|k| clone.remove(&k).map(|v| (k, v)))
+                .collect();
+            let (promoted, _) = repair_property_map(&mut bare, add_items);
             match clone.get_mut("properties") {
-                Some(GoValue::Object(existing)) => existing.extend(repaired),
+                Some(GoValue::Object(existing)) => existing.extend(bare),
                 _ => {
-                    clone.insert("properties".into(), GoValue::Object(repaired));
+                    clone.insert("properties".into(), GoValue::Object(bare));
                     clone
                         .entry("type".into())
                         .or_insert_with(|| GoValue::String("object".into()));
@@ -624,17 +638,15 @@ fn repair_node(node: &Map, add_items: bool) -> (Map, bool) {
         }
     }
 
-    if let Some(GoValue::Object(props)) = clone.get("properties") {
-        let props = props.clone();
+    if matches!(clone.get("properties"), Some(GoValue::Object(_))) {
         if !clone.contains_key("type") {
             clone.insert("type".into(), GoValue::String("object".into()));
             modified = true;
         }
-        let (repaired, promoted, props_modified) = repair_property_map(&props, add_items);
-        if props_modified {
-            clone.insert("properties".into(), GoValue::Object(repaired));
-            modified = true;
-        }
+        let mut props = take_map(&mut clone, "properties");
+        let (promoted, props_modified) = repair_property_map(&mut props, add_items);
+        clone.insert("properties".into(), GoValue::Object(props));
+        modified |= props_modified;
         if !promoted.is_empty() {
             promote_required(&mut clone, &promoted);
             modified = true;
@@ -656,40 +668,15 @@ fn repair_node(node: &Map, add_items: bool) -> (Map, bool) {
         }
     }
 
-    match clone.get("items") {
-        Some(GoValue::Object(items)) => {
-            let (repaired, m) = repair_node(items, add_items);
-            if m {
-                clone.insert("items".into(), GoValue::Object(repaired));
-                modified = true;
-            }
-        }
-        Some(GoValue::Array(list)) => {
-            if let Some(repaired) = repair_list(list, add_items) {
-                clone.insert("items".into(), GoValue::Array(repaired));
-                modified = true;
-            }
-        }
-        Some(GoValue::Bool(true)) => {
-            clone.insert("items".into(), empty_object());
-            modified = true;
-        }
-        _ => {}
+    if let Some(items) = clone.get_mut("items") {
+        modified |= repair_child(items, add_items, true);
     }
-
-    if let Some(GoValue::Object(add)) = clone.get("additionalProperties") {
-        let (repaired, m) = repair_node(add, add_items);
-        if m {
-            clone.insert("additionalProperties".into(), GoValue::Object(repaired));
-            modified = true;
-        }
+    if let Some(add @ GoValue::Object(_)) = clone.get_mut("additionalProperties") {
+        modified |= repair_child(add, add_items, false);
     }
-    if let Some(GoValue::Object(pattern)) = clone.get("patternProperties") {
-        let (repaired, _, m) = repair_property_map(pattern, add_items);
-        if m {
-            clone.insert("patternProperties".into(), GoValue::Object(repaired));
-            modified = true;
-        }
+    if let Some(GoValue::Object(pattern)) = clone.get_mut("patternProperties") {
+        let (_, m) = repair_property_map(pattern, add_items);
+        modified |= m;
     }
     for key in [
         "if",
@@ -703,108 +690,83 @@ fn repair_node(node: &Map, add_items: bool) -> (Map, bool) {
         "contentSchema",
         "additionalItems",
     ] {
-        match clone.get(key) {
-            Some(GoValue::Object(sub)) => {
-                let (repaired, m) = repair_node(sub, add_items);
-                if m {
-                    clone.insert(key.into(), GoValue::Object(repaired));
-                    modified = true;
-                }
-            }
-            Some(GoValue::Bool(true)) => {
-                clone.insert(key.into(), empty_object());
-                modified = true;
-            }
-            _ => {}
+        if let Some(sub) = clone.get_mut(key) {
+            modified |= repair_child(sub, add_items, false);
         }
     }
     for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
-        if let Some(GoValue::Array(list)) = clone.get(key)
-            && let Some(repaired) = repair_list(list, add_items)
-        {
-            clone.insert(key.into(), GoValue::Array(repaired));
-            modified = true;
+        if let Some(GoValue::Array(list)) = clone.get_mut(key) {
+            modified |= repair_list(list, add_items);
         }
     }
     for key in ["$defs", "definitions", "dependentSchemas", "dependencies"] {
-        if let Some(GoValue::Object(defs)) = clone.get(key) {
-            let mut repaired = Map::new();
-            let mut defs_modified = false;
-            for (k, v) in defs {
-                let value = match v {
-                    GoValue::Object(def) => {
-                        let (r, m) = repair_node(def, add_items);
-                        defs_modified |= m;
-                        GoValue::Object(r)
-                    }
-                    GoValue::Bool(true) => {
-                        defs_modified = true;
-                        empty_object()
-                    }
-                    other => other.clone(),
-                };
-                repaired.insert(k.clone(), value);
-            }
-            if defs_modified {
-                clone.insert(key.into(), GoValue::Object(repaired));
-                modified = true;
+        if let Some(GoValue::Object(defs)) = clone.get_mut(key) {
+            for def in defs.values_mut() {
+                modified |= repair_child(def, add_items, false);
             }
         }
     }
     (clone, modified)
 }
 
-/// repairSchemaList: `Some` only when an entry changed.
-fn repair_list(list: &[GoValue], add_items: bool) -> Option<Vec<GoValue>> {
-    let mut modified = false;
-    let repaired = list
-        .iter()
-        .map(|item| match item {
-            GoValue::Object(m) => {
-                let (r, changed) = repair_node(m, add_items);
-                modified |= changed;
-                GoValue::Object(r)
-            }
-            GoValue::Bool(true) => {
-                modified = true;
-                empty_object()
-            }
-            other => other.clone(),
-        })
-        .collect();
-    modified.then_some(repaired)
+/// One schema-valued child, repaired in place: an object is repaired, `true` becomes `{}`,
+/// and with `list` an array is repaired entry by entry (`items`). Anything else is left
+/// alone. True when the child changed.
+fn repair_child(child: &mut GoValue, add_items: bool, list: bool) -> bool {
+    if matches!(child, GoValue::Bool(true)) {
+        *child = empty_object();
+        return true;
+    }
+    match child {
+        GoValue::Object(map) => {
+            let (repaired, m) = repair_node(std::mem::take(map), add_items);
+            *map = repaired;
+            m
+        }
+        GoValue::Array(entries) if list => repair_list(entries, add_items),
+        _ => false,
+    }
 }
 
-fn repair_property_map(props: &Map, add_items: bool) -> (Map, Vec<String>, bool) {
-    let mut out = Map::new();
+/// repairSchemaList, in place: true when an entry changed.
+fn repair_list(list: &mut [GoValue], add_items: bool) -> bool {
+    let mut modified = false;
+    for item in list.iter_mut() {
+        if matches!(item, GoValue::Object(_) | GoValue::Bool(true)) {
+            modified |= repair_child(item, add_items, false);
+        }
+    }
+    modified
+}
+
+/// repairPropertyMap, in place: the property names whose `required: true` was promoted
+/// (sorted), and whether anything changed.
+fn repair_property_map(props: &mut Map, add_items: bool) -> (Vec<String>, bool) {
     let mut promoted = vec![];
     let mut modified = false;
-    for (k, v) in props {
-        match v {
-            GoValue::Bool(true) => {
-                out.insert(k.clone(), empty_object());
+    for (k, v) in props.iter_mut() {
+        if matches!(v, GoValue::Bool(true)) {
+            *v = empty_object();
+            modified = true;
+        } else if let GoValue::Object(child) = v {
+            let required = match child.get("required") {
+                Some(GoValue::Bool(required)) => Some(*required),
+                _ => None,
+            };
+            if let Some(required) = required {
+                child.remove("required");
                 modified = true;
-            }
-            GoValue::Object(child) => {
-                let mut child = child.clone();
-                if let Some(GoValue::Bool(required)) = child.get("required").cloned() {
-                    child.remove("required");
-                    modified = true;
-                    if required {
-                        promoted.push(k.clone());
-                    }
+                if required {
+                    promoted.push(k.clone());
                 }
-                let (repaired, m) = repair_node(&child, add_items);
-                modified |= m;
-                out.insert(k.clone(), GoValue::Object(repaired));
             }
-            other => {
-                out.insert(k.clone(), other.clone());
-            }
+            let (repaired, m) = repair_node(std::mem::take(child), add_items);
+            *child = repaired;
+            modified |= m;
         }
     }
     promoted.sort();
-    (out, promoted, modified)
+    (promoted, modified)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2125,5 +2087,45 @@ mod tests {
             gj::get(&got, "properties.p1.properties.name.type").bytes().as_ref(),
             b"string"
         );
+    }
+
+    /// A tool-schema property named like a huge array index: materializing the
+    /// `{"required": [...]}` branch sets `properties.9999999999` on a branch with no
+    /// `properties`, which sjson pads with ten billion nulls. The padding ceiling fails
+    /// that edit instead, so cleaning finishes and returns JSON.
+    #[test]
+    fn numeric_property_name_does_not_pad_an_array() {
+        let schema =
+            br#"{"type":"object","properties":{"9999999999":{"type":"string"}},"anyOf":[{"required":["9999999999"]}]}"#;
+        let got = for_gemini(schema);
+        assert!(gj::valid(&got), "{}", String::from_utf8_lossy(&got));
+        assert!(got.len() < 4096, "output is {} bytes", got.len());
+        assert!(!contains_seq(&got, b"null,null"));
+    }
+
+    /// repair_node visits each node once: a `properties` chain 4,000 levels deep (8,001
+    /// nesting levels, under encoding/json's 10,000) is repaired, every level gaining
+    /// `"type":"object"`. Cloning the subtree at each level made this quadratic.
+    #[test]
+    fn deep_properties_chain_repairs_linearly() {
+        const LEVELS: usize = 4_000;
+        let mut schema = Vec::with_capacity(LEVELS * 20);
+        for _ in 0..LEVELS {
+            schema.extend_from_slice(br#"{"properties":{"a":"#);
+        }
+        schema.extend_from_slice(b"{}");
+        for _ in 0..LEVELS {
+            schema.extend_from_slice(b"}}");
+        }
+        // Repair recurses once per level; give it room the way production's deep stack does.
+        let got = std::thread::Builder::new()
+            .stack_size(512 << 20)
+            .spawn(move || normalize_malformed_schema_objects(schema, false))
+            .unwrap()
+            .join()
+            .unwrap();
+        let typed = got.windows(15).filter(|w| w == br#""type":"object""#).count();
+        assert_eq!(typed, LEVELS);
+        assert!(got.starts_with(br#"{"properties":{"a":"#));
     }
 }

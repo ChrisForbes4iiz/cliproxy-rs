@@ -88,6 +88,15 @@ async fn limit(State(rt): State<Arc<Runtime>>, mut request: Request, next: Next)
     .await
 }
 
+/// `body`, failing with [`TooLarge`] once more than `max` bytes have arrived.
+pub(crate) fn capped(body: Body, max: u64) -> Body {
+    Body::new(Capped {
+        body,
+        left: max,
+        over: false,
+    })
+}
+
 /// Go `http.MaxBytesReader`: passes frames through until more than `left` bytes have
 /// arrived. The frame that crosses the limit yields its permitted prefix (a slice, not a
 /// copy), and every later poll fails. Nothing is buffered.

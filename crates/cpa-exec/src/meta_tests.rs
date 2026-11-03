@@ -1094,3 +1094,15 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
         }
     }
 }
+
+/// A 13-digit `resets_at` lies past Windows' `SystemTime` range: it saturates like Go's
+/// `Time.Sub` instead of panicking the request.
+#[test]
+fn millisecond_resets_at_saturates_instead_of_panicking() {
+    assert_eq!(
+        resets_in(br#"{"error":{"resets_at":1762000000000}}"#),
+        Some(crate::quota::GO_MAX_DURATION)
+    );
+    assert_eq!(resets_in(br#"{"error":{"resets_at":1}}"#), None);
+    assert_eq!(resets_in(br#"{"error":{}}"#), None);
+}

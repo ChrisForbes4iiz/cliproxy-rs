@@ -184,7 +184,7 @@ impl CodexExecutor {
             ));
         }
         if !req.stream {
-            let data = match crate::proxy::read_all(upstream.body, usize::MAX, false).await {
+            let data = match crate::proxy::read_success(upstream.body).await {
                 Ok(data) => data,
                 Err(error) => {
                     wire.exec_error(&error);
@@ -839,7 +839,7 @@ fn tool_json(raw: &str, route_model: &str, action: &str, string_fields: &[&str])
 fn responses_request(prompt: &str, images: &[String], tool: &str) -> String {
     let mut req = r#"{"instructions":"","stream":true,"reasoning":{"effort":"medium","summary":"auto"},"parallel_tool_calls":true,"include":["reasoning.encrypted_content"],"model":"","store":false,"tool_choice":{"type":"image_generation"},"tools":[]}"#.to_owned();
     req = set_str(&req, "model", MAIN_MODEL);
-    if !tool.is_empty() && gjson::valid(tool) {
+    if !tool.is_empty() && cpa_common::json::valid(tool.as_bytes()) {
         req = set_raw(&req, "tools", &format!("[{tool}]"));
     }
     let mut content = vec![set_str(r#"{"type":"input_text","text":""}"#, "text", prompt)];
@@ -932,7 +932,7 @@ fn images_response(calls: &[ImageCall], created: i64, usage: Option<&str>, url: 
             out = set_str(&out, key, value);
         }
     }
-    if let Some(usage) = usage.filter(|u| gjson::valid(u)) {
+    if let Some(usage) = usage.filter(|u| cpa_common::json::valid(u.as_bytes())) {
         out = set_raw(&out, "usage", usage);
     }
     let items: Vec<String> = calls
@@ -986,7 +986,7 @@ fn partial_frame(payload: &str, prepared: &Prepared) -> Option<String> {
 fn completed_frame(call: &ImageCall, usage: Option<&str>, prepared: &Prepared) -> String {
     let event = format!("{}.completed", prepared.prefix);
     let mut data = set_str(r#"{"type":""}"#, "type", &event);
-    if let Some(usage) = usage.filter(|u| gjson::valid(u)) {
+    if let Some(usage) = usage.filter(|u| cpa_common::json::valid(u.as_bytes())) {
         data = set_raw(&data, "usage", usage);
     }
     sse_frame(&event, &image_field(data, call, prepared.url_format))

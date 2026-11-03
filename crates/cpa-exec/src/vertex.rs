@@ -724,7 +724,7 @@ impl VertexExecutor {
         let response_headers = upstream.headers.clone();
         if !req.stream {
             // Go logs the raw body, before any Imagen conversion.
-            let mut data = g::read_captured(capture, upstream, usize::MAX).await?.to_vec();
+            let mut data = g::read_captured(capture, upstream, None).await?.to_vec();
             // ponytail: Go observes the response model on the raw body but parses usage
             // after the Imagen conversion, whose usageMetadata is all zeros; Imagen
             // predict responses carry no usageMetadata, so the raw body gives the same.
@@ -805,7 +805,7 @@ impl VertexExecutor {
             return Err(g::error_from(capture, upstream).await);
         }
         let response_headers = upstream.headers.clone();
-        let data = g::read_captured(capture, upstream, usize::MAX).await?;
+        let data = g::read_captured(capture, upstream, None).await?;
         let count = gj::get(&data, "totalTokens").int();
         let out = cpa_translate::translate_token_count(req.response_format, to, count, &data);
         Ok(ExecResponse {

@@ -21,7 +21,9 @@ pub enum Source {
     Runtime,
 }
 
-#[derive(Debug, Clone)]
+/// `Debug` is written by hand: metadata and attributes hold tokens and API keys, so
+/// only their keys are shown.
+#[derive(Clone)]
 pub struct Credential {
     /// Path relative to `auth-dir` for files, as CLIProxyAPI uses.
     pub id: String,
@@ -41,6 +43,37 @@ pub struct Credential {
     /// Go `NextRefreshAfter` as the plugin auth parser returned it for this credential.
     /// Registering the credential takes it per Go's registration rule; never persisted.
     pub next_refresh_after: Option<std::time::SystemTime>,
+}
+
+/// Map keys without their values, for `Debug`.
+struct KeysOnly<'a>(Vec<&'a str>);
+
+impl<'a> KeysOnly<'a> {
+    fn of(keys: impl Iterator<Item = &'a String>) -> Self {
+        Self(keys.map(String::as_str).collect())
+    }
+}
+
+impl std::fmt::Debug for KeysOnly<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(&self.0).finish()
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credential")
+            .field("id", &self.id)
+            .field("provider", &self.provider)
+            .field("source", &self.source)
+            .field("disabled", &self.disabled)
+            .field("label", &self.label)
+            .field("attributes", &KeysOnly::of(self.attributes.keys()))
+            .field("metadata", &KeysOnly::of(self.metadata.keys()))
+            .field("revision", &self.revision)
+            .field("next_refresh_after", &self.next_refresh_after)
+            .finish()
+    }
 }
 
 impl Credential {
@@ -108,10 +141,20 @@ impl Credential {
 }
 
 /// A change to credential metadata, produced by token refresh or the management API.
-#[derive(Debug, Clone, Default)]
+/// `Debug` shows the keys it sets, not their values (refreshed tokens).
+#[derive(Clone, Default)]
 pub struct MetadataPatch {
     pub set: Map<String, Value>,
     pub remove: Vec<String>,
+}
+
+impl std::fmt::Debug for MetadataPatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataPatch")
+            .field("set", &KeysOnly::of(self.set.keys()))
+            .field("remove", &self.remove)
+            .finish()
+    }
 }
 
 impl MetadataPatch {
@@ -122,5 +165,34 @@ impl MetadataPatch {
         for (key, value) in &self.set {
             metadata.insert(key.clone(), value.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    /// cliproxy-rs-7ea.35: `{:?}` of a credential or a patch never shows a token.
+    #[test]
+    fn debug_output_redacts_secret_values() {
+        const SECRET: &str = "sk-fake-debug-secret-0123";
+        let mut metadata = Map::new();
+        metadata.insert("type".into(), Value::from("claude"));
+        metadata.insert("access_token".into(), Value::from(SECRET));
+        metadata.insert("refresh_token".into(), Value::from(SECRET));
+        let mut cred = Credential::from_file(Path::new("/auth"), Path::new("/auth/a.json"), metadata.clone()).unwrap();
+        cred.attributes.insert("api_key".into(), SECRET.into());
+        let shown = format!("{cred:?} {cred:#?}");
+        assert!(!shown.contains(SECRET), "{shown}");
+        for visible in ["a.json", "claude", "access_token", "api_key"] {
+            assert!(shown.contains(visible), "{visible}: {shown}");
+        }
+        let patch = MetadataPatch {
+            set: metadata,
+            remove: vec!["expired".into()],
+        };
+        let shown = format!("{patch:?}");
+        assert!(!shown.contains(SECRET), "{shown}");
+        assert!(shown.contains("refresh_token") && shown.contains("expired"), "{shown}");
     }
 }

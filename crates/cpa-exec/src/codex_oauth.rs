@@ -328,10 +328,13 @@ impl CodexOAuth {
             .post(&self.token_url, "application/x-www-form-urlencoded", body.into_bytes())
             .await?;
         if status != 200 && exchange {
-            let message = format!(
-                "token exchange failed with status {status}: {}",
-                String::from_utf8_lossy(&body)
-            );
+            // Go appends the whole body; only its OAuth error code is kept, as for refreshes.
+            let code = oauth_code(&body);
+            let message = if code.is_empty() {
+                format!("token exchange failed with status {status}")
+            } else {
+                format!("token exchange failed with status {status}: {code}")
+            };
             return Err(oauth_error(status, &message));
         }
         if status != 200 {

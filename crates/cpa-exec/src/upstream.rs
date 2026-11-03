@@ -86,7 +86,7 @@ pub(crate) async fn into_response(res: wreq::Response) -> Result<ExecResponse, E
     let body = if is_sse {
         ResponseBody::Stream(framed(body))
     } else {
-        let bytes = read_bounded(body, usize::MAX).await?;
+        let bytes = crate::proxy::read_success(body).await?;
         ResponseBody::Buffered(bytes)
     };
     Ok(ExecResponse { status, headers, body })
@@ -383,6 +383,39 @@ mod tests {
         );
         let error = decoded(chunks(vec![]), &h).await.err();
         assert_eq!(error.as_deref(), Some("failed to create gzip reader: EOF"));
+    }
+
+    /// A small gzip body that inflates past the success-body cap fails as a read error
+    /// instead of being buffered whole; under the cap it reads as before.
+    #[tokio::test]
+    async fn decompressed_success_bodies_are_capped() {
+        use tokio::io::AsyncReadExt as _;
+        let plain = vec![0u8; 1 << 20];
+        let mut encoded = Vec::new();
+        async_compression::tokio::bufread::GzipEncoder::new(tokio::io::BufReader::new(std::io::Cursor::new(
+            plain.clone(),
+        )))
+        .read_to_end(&mut encoded)
+        .await
+        .unwrap();
+        assert!(encoded.len() < 64 << 10, "the body compresses well");
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        let stream = decoded(chunks(vec![Ok(Bytes::from(encoded.clone()))]), &headers)
+            .await
+            .unwrap();
+        assert_eq!(crate::proxy::read_success(stream).await.unwrap(), plain);
+        crate::proxy::SUCCESS_BODY_CAP.with(|cap| cap.set(64 << 10));
+        let stream = decoded(chunks(vec![Ok(Bytes::from(encoded))]), &headers).await.unwrap();
+        let result = crate::proxy::read_success(stream).await;
+        crate::proxy::SUCCESS_BODY_CAP.with(|cap| cap.set(crate::proxy::MAX_SUCCESS_BODY));
+        let error = result.unwrap_err();
+        assert_eq!(error.status, 502);
+        assert_eq!(error.scope, FailureScope::Transport);
+        assert_eq!(
+            error.body.as_ref(),
+            format!("upstream response body exceeds {} bytes", 64 << 10).as_bytes()
+        );
     }
 
     #[tokio::test]

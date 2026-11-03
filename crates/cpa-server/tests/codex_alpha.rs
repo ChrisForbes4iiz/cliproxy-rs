@@ -129,3 +129,38 @@ async fn alpha_search_uses_policy_eligible_credential_and_passes_upstream_throug
     assert_eq!(headers["version"], "0.150.0");
     assert_eq!(headers["session_id"], "s-1");
 }
+
+/// A body nested far deeper than any native stack holds frames for gets the answer any
+/// other invalid body gets: the routing fields stay empty and selection finds nothing.
+/// The vendor gjson validator recursed once per level and aborted the process here.
+#[tokio::test]
+async fn deeply_nested_alpha_search_body_gets_the_invalid_body_answer() {
+    let rt = Arc::new(cpa_server::testing::runtime(
+        Config::parse("{}").unwrap(),
+        vec![],
+        Executors {
+            claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+            codex: CodexExecutor::with_client(wreq::Client::new(), CodexOAuth::new(wreq::Client::new())),
+            devices: Default::default(),
+            openai: Default::default(),
+            google: Default::default(),
+        },
+    ));
+    let proxy = serve(router(rt)).await;
+    let post = |body: String| {
+        let proxy = proxy.clone();
+        async move {
+            let response = wreq::Client::new()
+                .post(format!("{proxy}/backend-api/codex/alpha/search"))
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            (response.status().as_u16(), response.text().await.unwrap())
+        }
+    };
+    let shallow = post("[".to_owned()).await;
+    assert_eq!(shallow.0, 503);
+    assert_eq!(shallow.1, r#"{"error":"auth_not_found: no auth available"}"#);
+    assert_eq!(post("[".repeat(200_000)).await, shallow);
+}

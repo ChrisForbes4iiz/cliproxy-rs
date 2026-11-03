@@ -25,7 +25,7 @@ impl cpa_core::registry::Overlay for Overlay {
             return Vec::new();
         };
         rt.registry()
-            .available_by_provider(provider, |client, model| rt.suspension(client, model))
+            .available_by_provider(provider, rt.suspensions())
             .iter()
             .map(|s| s.to_info())
             .collect()
@@ -43,10 +43,7 @@ impl cpa_core::registry::Overlay for Overlay {
             return Vec::new();
         };
         let registry = rt.registry();
-        registry
-            .available_with(|c, m| rt.suspension(c, m))
-            .map(|s| s.to_info())
-            .collect()
+        registry.available_with(rt.suspensions()).map(|s| s.to_info()).collect()
     }
 }
 

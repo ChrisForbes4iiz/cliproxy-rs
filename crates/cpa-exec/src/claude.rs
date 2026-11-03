@@ -806,12 +806,9 @@ fn header_value(headers: &http::HeaderMap, name: &str) -> String {
     detect::header(headers, name).to_owned()
 }
 
-async fn collect(mut raw: cpa_core::exec::ExecStream) -> Result<Bytes, ExecError> {
-    let mut out = BytesMut::new();
-    while let Some(chunk) = raw.next().await {
-        out.extend_from_slice(&chunk?);
-    }
-    Ok(out.freeze())
+/// Go `io.ReadAll` of a 2xx body, capped at `proxy::MAX_SUCCESS_BODY`.
+async fn collect(raw: cpa_core::exec::ExecStream) -> Result<Bytes, ExecError> {
+    crate::proxy::read_success(raw).await
 }
 
 /// A non-2xx upstream answer. `headers` are already decoded (no Content-Encoding or

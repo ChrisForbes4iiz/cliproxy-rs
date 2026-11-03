@@ -625,3 +625,25 @@ async fn home_device_pools_match_go() {
         }
     }
 }
+
+/// Bodies Go appends to OAuth status errors keep short diagnostics but never a
+/// token-shaped value, and stay short.
+#[test]
+fn redact_body_strips_token_shaped_values_and_truncates() {
+    assert_eq!(redact_body(b"  maintenance \n"), "maintenance");
+    assert_eq!(redact_body(br#"{"message":" busy "}"#), r#"{"message":" busy "}"#);
+    assert_eq!(redact_body(br#"{"error":"slow"}"#), r#"{"error":"slow"}"#);
+    let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1In0.c2lnbmF0dXJlLXNpZ25hdHVyZQ";
+    assert_eq!(
+        redact_body(format!(r#"{{"access_token":"{jwt}","refresh_token":"rt-0123456789abcdefghijklmn"}}"#).as_bytes()),
+        r#"{"access_token":"[redacted]","refresh_token":"[redacted]"}"#
+    );
+    // A token ending the body is redacted too.
+    assert_eq!(redact_body(b"token sk-ant-0123456789abcdefghijkl"), "token [redacted]");
+    let long = "word ".repeat(200);
+    let out = redact_body(long.as_bytes());
+    assert_eq!(out.len(), 512 + 3);
+    assert!(out.ends_with("..."));
+    let wide = "\u{e9} ".repeat(400);
+    assert!(redact_body(wide.as_bytes()).ends_with("..."));
+}

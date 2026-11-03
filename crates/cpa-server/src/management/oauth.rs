@@ -11,7 +11,7 @@ use cpa_core::gostr::GoStr;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use axum::extract::{RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -410,12 +410,6 @@ pub(super) fn install_callback_sink(state: &Arc<Management>) {
 
 fn status_error(status: StatusCode, message: &str) -> Response {
     respond(status, &json!({"status": "error", "error": message}))
-}
-
-fn unix_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos())
 }
 
 /// Go `misc.GenerateRandomState`: 16 random bytes, hex.
@@ -1053,7 +1047,12 @@ async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
     } else {
         ("kimi", "kmi")
     };
-    let sid = format!("{prefix}-{}", unix_nanos());
+    let Some(random) = random_state() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
+    };
+    // Go uses the Unix time in nanoseconds; a random suffix cannot be guessed by
+    // probing the key-less callback route (docs/DIFFERENCES-FROM-GO.md).
+    let sid = format!("{prefix}-{random}");
     let mut flow = DeviceFlow::new(login_client(&state), &domain, "");
     if let Some(base) = &state.login_base {
         flow = flow.with_oauth_host(base);
@@ -1115,7 +1114,12 @@ async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
 async fn start_meta(state: Arc<Management>) -> Response {
     use cpa_exec::meta_auth::{MetaAuth, create_token_storage, save_login};
     const MAX_POLL_SECONDS: i64 = 15 * 60;
-    let sid = format!("meta-{}", unix_nanos());
+    let Some(random) = random_state() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
+    };
+    // Go uses the Unix time in nanoseconds; a random suffix cannot be guessed by
+    // probing the key-less callback route (docs/DIFFERENCES-FROM-GO.md).
+    let sid = format!("meta-{random}");
     let mut auth = MetaAuth::new(login_client(&state));
     if let Some(base) = &state.login_base {
         auth = auth
@@ -1166,7 +1170,12 @@ async fn start_meta(state: Arc<Management>) -> Response {
 /// Go `RequestXAIToken`: device flow; the poller saves the credential file.
 async fn start_xai(state: Arc<Management>) -> Response {
     use cpa_exec::xai_auth::{LoginRecord, MAX_POLL_DURATION, XaiAuth, login_record, saved_document};
-    let sid = format!("xai-{}", unix_nanos());
+    let Some(random) = random_state() else {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
+    };
+    // Go uses the Unix time in nanoseconds; a random suffix cannot be guessed by
+    // probing the key-less callback route (docs/DIFFERENCES-FROM-GO.md).
+    let sid = format!("xai-{random}");
     let mut auth = XaiAuth::new(login_client(&state));
     if let Some(base) = &state.login_base {
         auth = auth
@@ -1298,10 +1307,14 @@ async fn forward(mut stream: tokio::net::TcpStream, target: String) {
         return;
     }
     let line = head.split(|b| *b == b'\n').next().unwrap_or_default();
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    // Go's net/http answers 400 to a request target holding a control byte; the target's
+    // query is copied into the Location header, so such bytes would split the response.
+    let control = line.iter().any(|&b| b < b' ' || b == 0x7f);
     let line = String::from_utf8_lossy(line);
-    let mut parts = line.trim_end_matches('\r').split(' ');
+    let mut parts = line.split(' ');
     let response = match (parts.next(), parts.next(), parts.next()) {
-        (Some(method), Some(uri), Some(version)) if version.starts_with("HTTP/") => {
+        (Some(method), Some(uri), Some(version)) if !control && version.starts_with("HTTP/") => {
             redirect_bytes(method, &target, uri.split_once('?').map(|(_, q)| q))
         }
         _ => b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -1321,7 +1334,20 @@ fn redirect_bytes(method: &str, target: &str, query: Option<&str>) -> Vec<u8> {
         Some(q) => format!("{target}?{q}"),
         None => target.to_owned(),
     };
-    let mut out = format!("HTTP/1.1 302 Found\r\nCache-Control: no-store\r\nLocation: {location}\r\n");
+    // The header carries ASCII only: any other character is percent-encoded, and a
+    // control character (refused by the caller) never reaches it.
+    let mut header = String::with_capacity(location.len());
+    for c in location.chars() {
+        if c.is_ascii() && !c.is_ascii_control() {
+            header.push(c);
+        } else {
+            let mut utf8 = [0u8; 4];
+            for b in c.encode_utf8(&mut utf8).bytes() {
+                header.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    let mut out = format!("HTTP/1.1 302 Found\r\nCache-Control: no-store\r\nLocation: {header}\r\n");
     let body = if matches!(method, "GET" | "HEAD") {
         let escaped = location
             .replace('&', "&amp;")
@@ -1707,6 +1733,35 @@ mod tests {
             post.ends_with("Content-Length: 0\r\nConnection: close\r\n\r\n"),
             "{post}"
         );
+    }
+
+    /// A request target holding a control byte (here a bare CR that would inject a
+    /// header) gets 400 and nothing of it reaches a Location header.
+    #[tokio::test]
+    async fn forwarder_refuses_control_bytes_in_the_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                tokio::spawn(forward(s, "http://127.0.0.1:1/x".into()));
+            }
+        });
+        for target in [&b"/?a\rX-Injected:1"[..], b"/?a\x00b", b"/?a\tb", b"/?a\x7fb"] {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let request = [&b"GET "[..], target, b" HTTP/1.1\r\nHost: x\r\n\r\n"].concat();
+            stream.write_all(&request).await.unwrap();
+            let mut out = String::new();
+            stream.read_to_string(&mut out).await.unwrap();
+            assert!(out.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{out:?}");
+            assert!(!out.contains("Location") && !out.contains("X-Injected"), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn forwarder_location_header_is_ascii() {
+        let r = String::from_utf8(redirect_bytes("GET", "http://h/cb", Some("a=\u{e9}"))).unwrap();
+        assert!(r.contains("\r\nLocation: http://h/cb?a=%C3%A9\r\n"), "{r}");
     }
 
     /// A client that never finishes its request head is dropped after Go's 5 s

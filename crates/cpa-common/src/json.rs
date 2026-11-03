@@ -2398,14 +2398,40 @@ fn atoui(p: &PathPart) -> (isize, bool) {
     )
 }
 
-/// appendRepeat: a negative count repeats nothing.
-fn repeat(buf: &mut Vec<u8>, s: &[u8], n: isize) {
-    for _ in 0..n.max(0) {
+/// The most `null` elements one edit may pad a missing array index with, across all of
+/// its path parts: 1,048,576 (about 5 MiB of `null,`), the size of a large request body.
+///
+/// ponytail: sjson pads `arr.N` with N nulls, and a numeric part can come from client data
+/// (a tool-schema property named `9999999999` becomes `properties.9999999999`), so Go
+/// allocates without bound. Past this ceiling the edit fails like any other sjson error and
+/// the document is left unchanged. Raise it, or make it a per-call argument, if a real
+/// caller ever needs sparser arrays.
+const MAX_NULL_PAD: isize = 1 << 20;
+
+/// appendRepeat: a negative count repeats nothing. `budget` is what is left of
+/// [`MAX_NULL_PAD`] for this edit.
+fn repeat(buf: &mut Vec<u8>, s: &[u8], n: isize, budget: &mut isize) -> Result<(), SetError> {
+    let n = n.max(0);
+    if n > *budget {
+        return Err(SetError::Invalid(format!(
+            "array index padding exceeds the limit of {MAX_NULL_PAD} elements"
+        )));
+    }
+    *budget -= n;
+    for _ in 0..n {
         buf.extend_from_slice(s);
     }
+    Ok(())
 }
 
-fn append_build(buf: &mut Vec<u8>, array: bool, paths: &[PathPart], raw: &[u8], stringify: bool) {
+fn append_build(
+    buf: &mut Vec<u8>,
+    array: bool,
+    paths: &[PathPart],
+    raw: &[u8],
+    stringify: bool,
+    budget: &mut isize,
+) -> Result<(), SetError> {
     if !array {
         append_stringify(buf, &paths[0].part);
         buf.push(b':');
@@ -2414,12 +2440,12 @@ fn append_build(buf: &mut Vec<u8>, array: bool, paths: &[PathPart], raw: &[u8], 
         let (n, numeric) = atoui(&paths[1]);
         if numeric || (!paths[1].force && paths[1].part == b"-1") {
             buf.push(b'[');
-            repeat(buf, b"null,", n);
-            append_build(buf, true, &paths[1..], raw, stringify);
+            repeat(buf, b"null,", n, budget)?;
+            append_build(buf, true, &paths[1..], raw, stringify, budget)?;
             buf.push(b']');
         } else {
             buf.push(b'{');
-            append_build(buf, false, &paths[1..], raw, stringify);
+            append_build(buf, false, &paths[1..], raw, stringify, budget)?;
             buf.push(b'}');
         }
     } else if stringify {
@@ -2427,6 +2453,7 @@ fn append_build(buf: &mut Vec<u8>, array: bool, paths: &[PathPart], raw: &[u8], 
     } else {
         buf.extend_from_slice(raw);
     }
+    Ok(())
 }
 
 fn delete_tail_item(buf: &mut Vec<u8>) -> bool {
@@ -2494,6 +2521,7 @@ fn append_raw_paths(
     raw: &[u8],
     stringify: bool,
     del: bool,
+    budget: &mut isize,
 ) -> Result<(), SetError> {
     let mut res = None;
     if del && paths[0].part == b"-1" && !paths[0].force {
@@ -2507,7 +2535,7 @@ fn append_raw_paths(
         let end = res.index + res.raw.len();
         if paths.len() > 1 {
             buf.extend_from_slice(&jstr[..res.index]);
-            append_raw_paths(buf, &res.raw, &paths[1..], raw, stringify, del)?;
+            append_raw_paths(buf, &res.raw, &paths[1..], raw, stringify, del, budget)?;
             buf.extend_from_slice(&jstr[end..]);
             return Ok(());
         }
@@ -2558,7 +2586,7 @@ fn append_raw_paths(
             if comma {
                 buf.push(b',');
             }
-            append_build(buf, false, paths, raw, stringify);
+            append_build(buf, false, paths, raw, stringify, budget)?;
             buf.push(b'}');
             Ok(())
         }
@@ -2571,7 +2599,7 @@ fn append_raw_paths(
                     if comma {
                         buf.push(b',');
                     }
-                    append_build(buf, true, paths, raw, stringify);
+                    append_build(buf, true, paths, raw, stringify, budget)?;
                     buf.push(b']');
                     return Ok(());
                 }
@@ -2589,14 +2617,14 @@ fn append_raw_paths(
                 buf.extend_from_slice(&item.raw);
             }
             if items.is_empty() {
-                repeat(buf, b"null,", n);
+                repeat(buf, b"null,", n, budget)?;
             } else {
-                repeat(buf, b",null", n.wrapping_sub(items.len() as isize));
+                repeat(buf, b",null", n.wrapping_sub(items.len() as isize), budget)?;
                 if comma {
                     buf.push(b',');
                 }
             }
-            append_build(buf, true, paths, raw, stringify);
+            append_build(buf, true, paths, raw, stringify, budget)?;
             buf.push(b']');
             Ok(())
         }
@@ -2620,7 +2648,8 @@ fn set_impl(jstr: &[u8], path: &[u8], raw: &[u8], stringify: bool, del: bool) ->
         return set_complex(jstr, path, raw, stringify);
     };
     let mut buf = Vec::with_capacity(jstr.len() + raw.len() + path.len() + 8);
-    append_raw_paths(&mut buf, jstr, &paths, raw, stringify, del)?;
+    let mut budget = MAX_NULL_PAD;
+    append_raw_paths(&mut buf, jstr, &paths, raw, stringify, del, &mut budget)?;
     // Sized for an insertion: replacing a large value (a request's messages or system)
     // leaves the old value's length unused, often in what becomes the next document.
     // One shrinking `realloc`, only for those.
@@ -2816,26 +2845,111 @@ pub enum AnyValue {
     Object(std::collections::BTreeMap<Vec<u8>, AnyValue>),
 }
 
-impl AnyValue {
-    pub fn from_res(r: &Res<'_>) -> Self {
-        match r.kind {
-            Kind::Null => Self::Null,
-            Kind::True => Self::Bool(true),
-            Kind::False => Self::Bool(false),
-            Kind::Number => Self::Number(r.num),
-            Kind::String => Self::String(r.s.to_vec()),
-            Kind::Json => match r.raw.iter().find(|&&c| c > b' ' || c == b'{' || c == b'[') {
-                Some(b'{') => {
-                    let mut map = std::collections::BTreeMap::new();
-                    for (key, value) in array_or_map(&r.raw, b'{', 0).1 {
-                        map.entry(key).or_insert_with(|| Self::from_res(&value));
-                    }
-                    Self::Object(map)
-                }
-                Some(b'[') => Self::Array(array_or_map(&r.raw, b'[', 0).0.iter().map(Self::from_res).collect()),
-                _ => Self::Null,
-            },
+/// Drops children on a heap stack, as [`GoValue`] does: a derived drop recurses once per
+/// nesting level.
+impl Drop for AnyValue {
+    fn drop(&mut self) {
+        let mut pending: Vec<AnyValue> = match self {
+            Self::Array(items) if !items.is_empty() => std::mem::take(items),
+            Self::Object(map) if !map.is_empty() => std::mem::take(map).into_values().collect(),
+            _ => return,
+        };
+        while let Some(mut value) = pending.pop() {
+            match &mut value {
+                Self::Array(items) => pending.append(items),
+                Self::Object(map) => pending.extend(std::mem::take(map).into_values()),
+                _ => {}
+            }
         }
+    }
+}
+
+impl AnyValue {
+    /// `Result.Value()`, containers on an explicit stack so a deeply nested client value
+    /// (a tool schema) cannot overflow the native stack.
+    pub fn from_res(r: &Res<'_>) -> Self {
+        use std::collections::BTreeMap;
+        use std::vec::IntoIter;
+        enum Open<'d> {
+            Array(Vec<AnyValue>, IntoIter<Res<'d>>),
+            /// The map so far, the members still to convert, and the key of the one being
+            /// converted.
+            Object(BTreeMap<Vec<u8>, AnyValue>, IntoIter<(Vec<u8>, Res<'d>)>, Vec<u8>),
+        }
+        /// A scalar's value, or the container `r` opens.
+        fn start(r: Res<'_>) -> Result<AnyValue, Open<'_>> {
+            match r.kind {
+                Kind::Null => return Ok(AnyValue::Null),
+                Kind::True => return Ok(AnyValue::Bool(true)),
+                Kind::False => return Ok(AnyValue::Bool(false)),
+                Kind::Number => return Ok(AnyValue::Number(r.num)),
+                Kind::String => return Ok(AnyValue::String(r.s.to_vec())),
+                Kind::Json => {}
+            }
+            let raw = match r.raw {
+                Cow::Borrowed(raw) => raw,
+                // Members always borrow their document; an owned one starts its own walk.
+                Cow::Owned(raw) => {
+                    return Ok(AnyValue::from_res(&Res {
+                        kind: Kind::Json,
+                        raw: Cow::Owned(raw),
+                        ..Res::default()
+                    }));
+                }
+            };
+            match raw.iter().find(|&&c| c > b' ' || c == b'{' || c == b'[') {
+                Some(b'{') => Err(Open::Object(
+                    BTreeMap::new(),
+                    array_or_map(raw, b'{', 0).1.into_iter(),
+                    vec![],
+                )),
+                Some(b'[') => Err(Open::Array(vec![], array_or_map(raw, b'[', 0).0.into_iter())),
+                _ => Ok(AnyValue::Null),
+            }
+        }
+        let root = Res {
+            kind: r.kind,
+            raw: Cow::Borrowed(&r.raw[..]),
+            s: Cow::Borrowed(&r.s[..]),
+            num: r.num,
+            ..Res::default()
+        };
+        let mut stack = match start(root) {
+            Ok(value) => return value,
+            Err(open) => vec![open],
+        };
+        while let Some(top) = stack.last_mut() {
+            let child = match top {
+                Open::Array(_, rest) => rest.next(),
+                Open::Object(_, rest, key) => rest.next().map(|(k, v)| {
+                    *key = k;
+                    v
+                }),
+            };
+            let value = match child {
+                Some(child) => match start(child) {
+                    Ok(value) => value,
+                    Err(open) => {
+                        stack.push(open);
+                        continue;
+                    }
+                },
+                None => match stack.pop() {
+                    Some(Open::Array(items, _)) => Self::Array(items),
+                    Some(Open::Object(map, _, _)) => Self::Object(map),
+                    None => break,
+                },
+            };
+            match stack.last_mut() {
+                None => return value,
+                Some(Open::Array(items, _)) => items.push(value),
+                // array_or_map already kept the first of duplicate keys.
+                Some(Open::Object(map, _, key)) => {
+                    map.entry(std::mem::take(key)).or_insert(value);
+                }
+            }
+        }
+        Self::Null
     }
 
     /// `json.Marshal`: sorted keys, HTML-escaped strings. `None` for NaN or infinite
@@ -2846,36 +2960,57 @@ impl AnyValue {
         Some(out)
     }
 
+    /// Containers on an explicit stack, like [`AnyValue::from_res`].
     fn write(&self, out: &mut Vec<u8>) -> Option<()> {
-        match self {
-            Self::Null => out.extend_from_slice(b"null"),
-            Self::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
-            Self::Number(n) => out.extend_from_slice(json_float(*n)?.as_bytes()),
-            Self::String(s) => marshal_str(out, s, true),
-            Self::Array(items) => {
-                out.push(b'[');
-                for (i, item) in items.iter().enumerate() {
-                    if i > 0 {
-                        out.push(b',');
-                    }
-                    item.write(out)?;
+        enum Open<'v> {
+            Array(std::slice::Iter<'v, AnyValue>),
+            Object(std::collections::btree_map::Iter<'v, Vec<u8>, AnyValue>),
+        }
+        let mut stack: Vec<(Open<'_>, bool)> = vec![];
+        let mut value = self;
+        loop {
+            match value {
+                Self::Null => out.extend_from_slice(b"null"),
+                Self::Bool(b) => out.extend_from_slice(if *b { b"true" } else { b"false" }),
+                Self::Number(n) => out.extend_from_slice(json_float(*n)?.as_bytes()),
+                Self::String(s) => marshal_str(out, s, true),
+                Self::Array(items) => {
+                    out.push(b'[');
+                    stack.push((Open::Array(items.iter()), true));
                 }
-                out.push(b']');
+                Self::Object(map) => {
+                    out.push(b'{');
+                    stack.push((Open::Object(map.iter()), true));
+                }
             }
-            Self::Object(map) => {
-                out.push(b'{');
-                for (i, (key, value)) in map.iter().enumerate() {
-                    if i > 0 {
+            // The next value to write, closing every container that has none left.
+            loop {
+                let Some((open, first)) = stack.last_mut() else {
+                    return Some(());
+                };
+                let next = match open {
+                    Open::Array(items) => items.next(),
+                    Open::Object(members) => members.next().map(|(key, item)| {
+                        if !*first {
+                            out.push(b',');
+                        }
+                        marshal_str(out, key, true);
+                        out.push(b':');
+                        item
+                    }),
+                };
+                if let Some(item) = next {
+                    if matches!(open, Open::Array(_)) && !*first {
                         out.push(b',');
                     }
-                    marshal_str(out, key, true);
-                    out.push(b':');
-                    value.write(out)?;
+                    *first = false;
+                    value = item;
+                    break;
                 }
-                out.push(b'}');
+                out.push(if matches!(open, Open::Array(_)) { b']' } else { b'}' });
+                stack.pop();
             }
         }
-        Some(())
     }
 
     /// `out, _ = sjson.SetBytes(out, path, value)` for this value: scalars use sjson's
@@ -3522,6 +3657,33 @@ mod tests {
         assert_eq!(s(try_set_str(b"{}", "a", "é<\"").unwrap()), "{\"a\":\"é\\u003c\\\"\"}");
     }
 
+    /// sjson pads a missing array index with nulls; past MAX_NULL_PAD per edit the edit
+    /// fails like any sjson error instead of allocating gigabytes, and the document stays.
+    #[test]
+    fn null_padding_is_capped_per_edit() {
+        assert_eq!(s(try_set_raw(b"{}", "a.2", "1").unwrap()), r#"{"a":[null,null,1]}"#);
+        assert_eq!(
+            s(try_set_raw(br#"{"a":[1]}"#, "a.3", "2").unwrap()),
+            r#"{"a":[1,null,null,2]}"#
+        );
+        let limit = MAX_NULL_PAD as usize;
+        let at_limit = try_set_raw(b"{}", &format!("a.{limit}"), "1").unwrap();
+        assert_eq!(at_limit.len(), r#"{"a":[1]}"#.len() + limit * 5);
+        for (doc, path) in [
+            (&b"{}"[..], format!("a.{}", limit + 1)),
+            (&b"{}"[..], "properties.9999999999".to_owned()),
+            (&br#"{"a":[1]}"#[..], "a.9999999999".to_owned()),
+            (&b"[]"[..], "9999999999".to_owned()),
+            // The ceiling covers the whole edit, not each path part.
+            (&b"{}"[..], format!("a.{}.{}", limit / 2 + 1, limit / 2 + 1)),
+        ] {
+            assert!(try_set_raw(doc, &path, "1").is_err(), "{path}");
+            let mut out = doc.to_vec();
+            assert!(!set_raw(&mut out, &path, "1"), "{path}");
+            assert_eq!(out, doc, "{path}");
+        }
+    }
+
     /// `valid` jumps over plain string bytes; a byte that decides validity must be seen
     /// wherever it sits in a long string.
     #[test]
@@ -3633,6 +3795,48 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    /// AnyValue converts, marshals and drops a value 10,000 levels deep on a 2 MiB
+    /// thread, whose stack the recursive versions overflow in a debug build.
+    #[test]
+    fn any_value_deep_value_and_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let mut doc = "[{\"d\":".repeat(5_000);
+                doc.push_str("\"leaf\"");
+                doc.push_str(&"}]".repeat(5_000));
+                let value = AnyValue::from_res(&parse(doc.as_bytes()));
+                let (mut depth, mut v) = (0, &value);
+                loop {
+                    v = match v {
+                        AnyValue::Array(items) => &items[0],
+                        AnyValue::Object(map) => &map[&b"d"[..]],
+                        _ => break,
+                    };
+                    depth += 1;
+                }
+                assert_eq!(depth, 10_000);
+                assert!(matches!(v, AnyValue::String(s) if s == b"leaf"));
+                assert_eq!(value.marshal().as_deref(), Some(doc.as_bytes()));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// AnyValue keeps gjson's shapes: first duplicate key, scalars, empty containers.
+    #[test]
+    fn any_value_round_trip() {
+        let doc = br#"{"b":[1,2.5,"x<",true,false,null,[],{}],"a":{"k":1,"k":2},"c":[[{"z":[]}]]}"#;
+        let value = AnyValue::from_res(&parse(doc));
+        assert_eq!(
+            value.marshal().as_deref(),
+            Some(&br#"{"a":{"k":1},"b":[1,2.5,"x\u003c",true,false,null,[],{}],"c":[[{"z":[]}]]}"#[..])
+        );
+        assert_eq!(AnyValue::from_res(&parse(b"7")).marshal().as_deref(), Some(&b"7"[..]));
+        assert_eq!(AnyValue::from_res(&parse(b"[]")).marshal().as_deref(), Some(&b"[]"[..]));
     }
 
     // The string scans jump to the next quote and count the backslashes before it: an

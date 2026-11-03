@@ -809,10 +809,15 @@ pub(crate) fn retry_after(status: u16, headers: &HeaderMap, body: &[u8], now: Sy
         if let Ok(seconds) = raw.parse::<i64>()
             && seconds >= 0
         {
-            return Some(Duration::from_secs(seconds as u64));
+            return Some(crate::quota::go_seconds(seconds as u64));
         }
         if let Some(deadline) = crate::openai_compat_go::parse_http_time(raw) {
-            return Some(deadline.duration_since(now).unwrap_or_default());
+            return Some(
+                deadline
+                    .duration_since(now)
+                    .unwrap_or_default()
+                    .min(crate::quota::GO_MAX_DURATION),
+            );
         }
     }
     let code = gj::get(body, "error.code").str().trim().go_lower();
@@ -966,6 +971,11 @@ mod tests {
             ),
             Some(Duration::from_secs(60))
         );
+        // Go's Duration tops out near 292 years; a larger hint saturates there.
+        h.insert("retry-after", "99999999999999".parse().unwrap());
+        assert_eq!(retry_after(429, &h, b"", now), Some(crate::quota::GO_MAX_DURATION));
+        h.insert("retry-after", "Fri, 31 Dec 9999 23:59:59 GMT".parse().unwrap());
+        assert_eq!(retry_after(429, &h, b"", now), Some(crate::quota::GO_MAX_DURATION));
     }
 
     #[test]

@@ -29,13 +29,37 @@ fail() {
   exit 1
 }
 
+# Release downloads use HTTPS only, redirects included. http:// is accepted for a mirror on
+# this machine's loopback address (the installer tests serve releases that way).
+release_proto() {
+  case "$1" in
+    https://*) printf '=https' ;;
+    http://127.0.0.1[:/]* | http://localhost[:/]* | 'http://[::1]'[:/]*) printf '=http,https' ;;
+    *) return 1 ;;
+  esac
+}
+
+# A path for the systemd unit. Every setting expands % specifiers, so % is doubled. The
+# value of WorkingDirectory= and of StandardOutput=append: is the rest of the line, used as
+# it is (systemd does not unquote these), so they are not quoted.
+unit_path() { printf '%s' "$1" | sed 's/%/%%/g'; }
+# An ExecStart= argument inside double quotes: systemd also unquotes C-style escapes and
+# expands $VARIABLE there, so \, " and $ are escaped as well.
+unit_arg() { printf '%s' "$1" | sed -e 's/%/%%/g' -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/$$/g'; }
+# A path for the launchd plist, which is XML.
+xml_text() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"; }
+
 # Everything runs from main, so a download cut short cannot run half a script.
 main() {
   releases="${CLIPROXY_RELEASES:-https://github.com/vayungodara/cliproxy-rs/releases}"
   dir="${CLIPROXY_INSTALL_DIR:-$HOME/.local/bin}"
   home="${CLIPROXY_HOME:-$HOME/.cliproxy-rs}"
+  proto=$(release_proto "$releases") || fail "CLIPROXY_RELEASES must be an https:// URL (http:// only on loopback): $releases"
   bin="$dir/cliproxy"
   config="$home/config.yaml" keys="$home/keys.env" log="$home/cliproxy.log" pidfile="$home/cliproxy.pid"
+  # The paths go into one-line settings of a systemd unit or a launchd plist.
+  case "$dir$home" in *'
+'*) fail "the install directory and CLIPROXY_HOME cannot contain a line break" ;; esac
   label=io.github.vayungodara.cliproxy-rs
   os=$(uname -s)
   if [ "$os" = Darwin ]; then
@@ -68,7 +92,7 @@ main() {
   tag="${CLIPROXY_VERSION:-}"
   if [ -z "$tag" ]; then
     # /releases/latest redirects to /releases/tag/<tag> once a release exists.
-    latest=$(curl -fsSLI --retry 3 -o /dev/null -w '%{url_effective}' "$releases/latest") || fail "cannot reach $releases"
+    latest=$(curl -fsSLI --proto "$proto" --tlsv1.2 --retry 3 -o /dev/null -w '%{url_effective}' "$releases/latest") || fail "cannot reach $releases"
     tag=${latest##*/tag/}
     [ "$tag" != "$latest" ] || fail "no release is published yet; build from source (docs/INSTALL.md)"
   fi
@@ -110,8 +134,8 @@ main() {
   if [ -z "$current" ]; then
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    curl -fsSL --retry 3 -o "$tmp/$name.tar.gz" "$releases/download/$tag/$name.tar.gz" || fail "could not download $name.tar.gz from release $tag"
-    curl -fsSL --retry 3 -o "$tmp/SHA256SUMS" "$releases/download/$tag/SHA256SUMS" || fail "could not download SHA256SUMS from release $tag"
+    curl -fsSL --proto "$proto" --tlsv1.2 --retry 3 -o "$tmp/$name.tar.gz" "$releases/download/$tag/$name.tar.gz" || fail "could not download $name.tar.gz from release $tag"
+    curl -fsSL --proto "$proto" --tlsv1.2 --retry 3 -o "$tmp/SHA256SUMS" "$releases/download/$tag/SHA256SUMS" || fail "could not download SHA256SUMS from release $tag"
     expected=$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")
     [ -n "$expected" ] || fail "$name.tar.gz is not listed in SHA256SUMS"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -187,10 +211,10 @@ EOF
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$label</string>
-  <key>ProgramArguments</key><array><string>$bin</string><string>--config</string><string>$config</string></array>
-  <key>WorkingDirectory</key><string>$home</string>
-  <key>StandardOutPath</key><string>$log</string>
-  <key>StandardErrorPath</key><string>$log</string>
+  <key>ProgramArguments</key><array><string>$(xml_text "$bin")</string><string>--config</string><string>$(xml_text "$config")</string></array>
+  <key>WorkingDirectory</key><string>$(xml_text "$home")</string>
+  <key>StandardOutPath</key><string>$(xml_text "$log")</string>
+  <key>StandardErrorPath</key><string>$(xml_text "$log")</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict>
@@ -210,9 +234,9 @@ EOF
 Description=cliproxy-rs
 
 [Service]
-ExecStart="$bin" --config "$config"
-WorkingDirectory=$home
-StandardOutput=append:$log
+ExecStart="$(unit_arg "$bin")" --config "$(unit_arg "$config")"
+WorkingDirectory=$(unit_path "$home")
+StandardOutput=append:$(unit_path "$log")
 StandardError=inherit
 Restart=on-failure
 

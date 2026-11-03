@@ -1046,18 +1046,21 @@ pub(crate) fn normalize_tool_call_outputs<'a>(items: Vec<Res<'a>>) -> Vec<Res<'a
 
 /// normalizeCodexAgentMessages: Codex `agent_message` items become user messages, with
 /// encrypted parts turned into input text.
+///
+/// Go edits the whole payload by path (`input.N.content.M.type`, ...), copying it per edit.
+/// Each item is edited on its own here, with the same paths relative to it, and the edited
+/// items are spliced back in one pass: the same bytes, linear in the payload.
 fn normalize_codex_agent_messages(payload: &[u8]) -> Vec<u8> {
     let input = gj::get(payload, "input");
     if !input.is_array() {
         return payload.to_vec();
     }
-    let mut updated = payload.to_vec();
-    let mut changed = false;
+    let mut edits = vec![];
     for (index, item) in input.array().iter().enumerate() {
         if trim_space(&item.get("type").bytes()) != b"agent_message" {
             continue;
         }
-        let item_path = format!("input.{index}");
+        let mut updated = item.raw.to_vec();
         let content = item.get("content");
         if content.is_array() {
             for (part_index, part) in content.array().iter().enumerate() {
@@ -1068,7 +1071,7 @@ fn normalize_codex_agent_messages(payload: &[u8]) -> Vec<u8> {
                 if enc.kind != Kind::String {
                     continue;
                 }
-                let path = format!("{item_path}.content.{part_index}");
+                let path = format!("content.{part_index}");
                 if !gj::set_str(&mut updated, &format!("{path}.type"), "input_text")
                     || !gj::set_str(&mut updated, &format!("{path}.text"), &enc.s)
                     || !gj::delete(&mut updated, &format!("{path}.encrypted_content"))
@@ -1077,14 +1080,12 @@ fn normalize_codex_agent_messages(payload: &[u8]) -> Vec<u8> {
                 }
             }
         }
-        if !gj::set_str(&mut updated, &format!("{item_path}.role"), "user")
-            || !gj::set_str(&mut updated, &format!("{item_path}.type"), "message")
-        {
+        if !gj::set_str(&mut updated, "role", "user") || !gj::set_str(&mut updated, "type", "message") {
             return payload.to_vec();
         }
-        changed = true;
+        edits.push((index, updated));
     }
-    if changed { updated } else { payload.to_vec() }
+    common::replace_array_items(payload, "input", &edits)
 }
 
 // ---------------------------------------------------------------------------------------

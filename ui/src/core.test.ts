@@ -11,6 +11,7 @@ import {
   level,
   lineDiff,
   otherSignals,
+  promptName,
   quotaWindows,
   reconcile,
   signalWindows,
@@ -30,6 +31,20 @@ test("v8 paths, URL boundaries, and structural equality", () => {
   assert.equal(equal({ b: null, a: [1, false] }, { a: [1, false], b: null }), true);
   assert.equal(equal({ a: [1, 2] }, { a: [2, 1] }), false);
   assert.equal(equal({ a: false }, { a: null }), false);
+});
+
+test("confirm() names lose control and bidi characters and stay short", () => {
+  assert.equal(promptName("plain-name"), "plain-name");
+  assert.equal(promptName(undefined), "");
+  assert.equal(promptName("a\nb\r\tc\u0000d\u007f\u0085e"), "abcde");
+  assert.equal(promptName("x\u2028y\u2029z"), "xyz");
+  assert.equal(promptName("ok\u202Egnp.exe\u202C\u2066i\u2069\u200E\u200F\u061C"), "okgnp.exei");
+  const long = promptName("n".repeat(200));
+  assert.equal(Array.from(long).length, 80);
+  assert.equal(long, `${"n".repeat(79)}…`);
+  assert.equal(promptName("n".repeat(80)), "n".repeat(80));
+  // Cut by code point, never through a surrogate pair.
+  assert.equal(promptName("\u{1F600}".repeat(100), 3), "\u{1F600}\u{1F600}…");
 });
 
 test("diff keeps both sides of a change", () => {

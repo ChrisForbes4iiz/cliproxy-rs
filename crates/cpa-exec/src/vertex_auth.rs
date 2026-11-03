@@ -599,10 +599,14 @@ pub async fn access_token(client: &wreq::Client, sa: &Map<String, Value>, now: i
             .ok()
             .and_then(|s| s.canonical_reason())
             .unwrap_or_default();
-        return Err(format!(
-            "oauth2: cannot fetch token: {status} {reason}\nResponse: {}",
-            String::from_utf8_lossy(&data)
-        ));
+        // Go's RetrieveError appends the whole body; only its OAuth error code is kept,
+        // as the error is logged (DIFFERENCES-FROM-GO).
+        let code = crate::codex_oauth::oauth_code(&data);
+        return Err(if code.is_empty() {
+            format!("oauth2: cannot fetch token: {status} {reason}")
+        } else {
+            format!("oauth2: cannot fetch token: {status} {reason}\nResponse: {code}")
+        });
     }
     parse_token(&data)
 }

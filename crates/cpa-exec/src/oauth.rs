@@ -631,6 +631,51 @@ pub(crate) fn random_hex(n: usize) -> Result<String, ExecError> {
 /// The error text for a token endpoint that answered with an error status.
 const HTTP_FAILURE: &str = "Claude OAuth acquisition failed";
 
+/// An OAuth endpoint's error body as an error or log may show it when Go's text includes
+/// the body: trimmed (Go's `strings.TrimSpace`), every run of 24 or more token
+/// characters (letters, digits and `-._~+/=`, which covers JWTs, opaque tokens, device
+/// codes and secrets) replaced by `[redacted]`, and cut to 512 bytes. Short diagnostics
+/// such as `{"error":"slow"}` or `maintenance` stay as Go shows them.
+pub(crate) fn redact_body(body: &[u8]) -> String {
+    const MIN_TOKEN: usize = 24;
+    const MAX_LEN: usize = 512;
+    let text = String::from_utf8_lossy(body);
+    let token_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | '+' | '/' | '=');
+    let mut out = String::with_capacity(text.len().min(MAX_LEN + 16));
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if run.len() >= MIN_TOKEN {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.trim().chars() {
+        if token_char(c) {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+        if out.len() > MAX_LEN {
+            break;
+        }
+    }
+    if out.len() <= MAX_LEN {
+        flush(&mut run, &mut out);
+    }
+    if out.len() > MAX_LEN {
+        let mut cut = MAX_LEN;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+        out.push_str("...");
+    }
+    out
+}
+
 /// The OAuth error code of a token endpoint's error body (an RFC 6749 `error`, or an
 /// Anthropic API `error.type`) when it is a [`known_error_code`].
 fn oauth_error_code(body: &[u8]) -> Option<&'static str> {

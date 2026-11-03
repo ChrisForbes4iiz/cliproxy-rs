@@ -113,7 +113,7 @@
             type="password"
             required
             bind:value={secret}
-            autocomplete="current-password"
+            autocomplete="off"
           /></label
         >
         {#if failure}<p class="note error" role="alert">

@@ -109,7 +109,7 @@ The simplest safe way is [Tailscale](https://tailscale.com/), which puts your ma
 2. In `config.yaml`, set `server.host` to the proxy machine's Tailscale address (the `100.x.y.z` address from `tailscale ip -4`), so only your tailnet can connect, and restart. Keep `access.api-keys` set.
 3. On the other machines, use `http://<machine-name>:8317` (or the `100.x.y.z` address) as the base URL.
 
-If you use `tailscale serve` to add HTTPS, it forwards from `127.0.0.1`, so also set `server.trusted-proxies: [127.0.0.1, "::1"]`. To open the dashboard from another machine, set `management.allow-remote: true`. Never expose the proxy to the internet, with Tailscale Funnel or any other tunnel, unless `access.api-keys` is set: without client keys anyone who finds the address can use your accounts.
+If you use `tailscale serve` to add HTTPS, it forwards from `127.0.0.1`, so also set `server.trusted-proxies: [127.0.0.1, "::1"]`. To open the dashboard from another machine, set `management.allow-remote: true`. Never expose the proxy to the internet, with Tailscale Funnel or any other tunnel, unless `access.api-keys` is set: without client keys anyone who finds the address can use your accounts. The same applies to any reverse proxy or tunnel on the same machine, such as nginx, Caddy or cloudflared: list its address in `server.trusted-proxies` and restart. Without that, a request the proxy forwards with `X-Forwarded-For`, `Forwarded`, `X-Real-IP` or `CF-Connecting-IP` is treated as remote, so `management.allow-remote: false` refuses it and the `--password` local password does not work through the proxy.
 
 ## A worked example: three Claude and two Codex accounts
 

@@ -1134,3 +1134,28 @@ async fn a_refused_baseline_alone_does_not_refuse_the_request() {
     );
     assert_eq!(mock.request(), None);
 }
+
+/// Bodies nested 300 deep (structurally, or as brackets inside a string field) still
+/// translate: the shared guard runs a recursive walker on a stack sized for them, and a
+/// guard nested inside it runs in place.
+#[test]
+fn deep_stack_runs_deep_bodies() {
+    fn walk(depth: usize) -> usize {
+        let pad = std::hint::black_box([0u8; 512]);
+        if depth == 0 {
+            usize::from(pad[0])
+        } else {
+            1 + walk(depth - 1)
+        }
+    }
+    let nested = format!("{}{}", "[".repeat(300), "]".repeat(300));
+    let in_string = format!(r#"{{"schema":"{}"}}"#, "[".repeat(300));
+    for body in [nested, in_string] {
+        assert_eq!(cpa_translate::levels(&[body.as_bytes()]), 300);
+        assert_eq!(deep_stack(body.as_bytes(), || Ok(walk(300))).unwrap(), 300);
+        let inner = deep_stack(body.as_bytes(), || deep_stack(body.as_bytes(), || Ok(walk(300))));
+        assert_eq!(inner.unwrap(), 300);
+    }
+    let error = deep_stack(b"[[1]]", || Err::<(), _>(cpa_translate::Error("bad".into()))).unwrap_err();
+    assert_eq!(error.0, "bad");
+}

@@ -1126,6 +1126,9 @@ mod sys {
         io::Error::last_os_error()
     }
 
+    /// Win32 `MAXIMUM_WAIT_OBJECTS`: the most handles one `WaitForMultipleObjects` takes.
+    const MAXIMUM_WAIT_OBJECTS: usize = 64;
+
     fn fail(shared: &Shared, e: io::Error) {
         *shared.failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(e);
         shared.changed.notify_one();
@@ -1165,10 +1168,30 @@ mod sys {
                 let handles: Vec<HANDLE> = std::iter::once(shared.control.0)
                     .chain(pending.iter().map(|p| p.done.0))
                     .collect();
+                // One wait covers at most 64 handles (the control event and 63 folders,
+                // as many auth files symlinked from distinct folders can need): past it
+                // the watcher falls back to polling, and the log names why.
+                if handles.len() > MAXIMUM_WAIT_OBJECTS {
+                    return fail(
+                        shared,
+                        io::Error::other(format!(
+                            "{} folders to watch exceed the {} that one WaitForMultipleObjects call can wait on",
+                            handles.len() - 1,
+                            MAXIMUM_WAIT_OBJECTS - 1
+                        )),
+                    );
+                }
                 // SAFETY: every handle stays open while waited on.
                 let r = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, INFINITE) };
                 if r == WAIT_FAILED {
-                    return fail(shared, io::Error::last_os_error());
+                    let error = io::Error::last_os_error();
+                    return fail(
+                        shared,
+                        io::Error::new(
+                            error.kind(),
+                            format!("WaitForMultipleObjects on {} handles: {error}", handles.len()),
+                        ),
+                    );
                 }
                 let index = r.wrapping_sub(WAIT_OBJECT_0) as usize;
                 if index == 0 {

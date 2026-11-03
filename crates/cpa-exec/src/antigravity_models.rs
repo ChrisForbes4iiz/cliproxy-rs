@@ -245,7 +245,7 @@ async fn fetch_one(client: &wreq::Client, base: &str, token: &str, timeout: Dura
     if matches!(answer.status, 401 | 403) {
         return (Hints::new(), Status::AuthError);
     }
-    let Ok(body) = proxy::read_all(answer.body, usize::MAX, false).await else {
+    let Ok(body) = proxy::read_success(answer.body).await else {
         return (Hints::new(), Status::Transient);
     };
     if !(200..300).contains(&answer.status) {

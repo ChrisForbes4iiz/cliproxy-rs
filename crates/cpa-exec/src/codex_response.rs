@@ -4,7 +4,7 @@
 
 use cpa_core::gostr::GoStr;
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use cpa_core::exec::{ExecError, ExecStream, FailureScope};
@@ -134,17 +134,14 @@ fn usage_retry_after(status: u16, body: &str, now: SystemTime) -> Option<Duratio
             continue;
         }
         let at = quota.get("resets_at").i64();
-        if at > 0 {
-            let reset = UNIX_EPOCH + Duration::from_secs(at as u64);
-            if let Ok(wait) = reset.duration_since(now)
-                && !wait.is_zero()
-            {
-                return Some(wait);
-            }
+        if at > 0
+            && let Some(wait) = crate::quota::until_unix(at as u64, now)
+        {
+            return Some(wait);
         }
         let secs = quota.get("resets_in_seconds").i64();
         if secs > 0 {
-            return Some(Duration::from_secs(secs as u64));
+            return Some(crate::quota::go_seconds(secs as u64));
         }
     }
     None
@@ -161,7 +158,7 @@ pub(crate) fn request_fault(status: u16, body: &str) -> bool {
             .map(|p| gjson::get(body, p).str().trim().to_ascii_lowercase())
             .collect::<Vec<_>>()
     };
-    let valid = gjson::valid(body.trim());
+    let valid = cpa_common::json::valid(body.trim().as_bytes());
     let types = if valid {
         field(&["error.type", "type", "response.error.type", "body.error.type"])
     } else {
@@ -1190,5 +1187,44 @@ pub(crate) async fn bootstrap(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::UNIX_EPOCH;
+
+    /// A 13-digit (millisecond) `resets_at` read as seconds lies past Windows'
+    /// `SystemTime` range: it saturates like Go's `Time.Sub` instead of panicking.
+    #[test]
+    fn usage_limit_resets_saturate_instead_of_panicking() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_762_000_000);
+        let body = |quota: &str| format!(r#"{{"error":{{"type":"usage_limit_reached",{quota}}}}}"#);
+        assert_eq!(
+            usage_retry_after(429, &body(r#""resets_at":1762000000000"#), now),
+            Some(crate::quota::GO_MAX_DURATION)
+        );
+        assert_eq!(
+            usage_retry_after(429, &body(r#""resets_at":1762000060"#), now),
+            Some(Duration::from_secs(60))
+        );
+        // A past reset falls through to resets_in_seconds, which saturates as well.
+        assert_eq!(
+            usage_retry_after(
+                429,
+                &body(r#""resets_at":1,"resets_in_seconds":9223372036854775807"#),
+                now
+            ),
+            Some(crate::quota::GO_MAX_DURATION)
+        );
+        assert_eq!(
+            usage_retry_after(429, &body(r#""resets_in_seconds":90"#), now),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(usage_retry_after(400, &body(r#""resets_at":1762000000000"#), now), None);
+        // The status error built from such a body carries the saturated hint.
+        let error = status_error_raw(429, &body(r#""resets_at":1762000000000"#), HeaderMap::new(), false);
+        assert_eq!(error.retry_after, Some(crate::quota::GO_MAX_DURATION));
     }
 }

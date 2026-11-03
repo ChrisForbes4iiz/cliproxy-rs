@@ -311,11 +311,17 @@ impl GoClients {
         if let (Some(default), Proxy::Inherit | Proxy::Invalid) = (&self.default, proxy) {
             return default.clone();
         }
-        if matches!(proxy, Proxy::Invalid) {
+        if matches!(proxy, Proxy::Invalid) && first_warning("invalid") {
             tracing::warn!("unusable proxy configuration; using the default transport");
         }
         self.try_get(proxy).unwrap_or_else(|| {
-            tracing::warn!(proxy = %match proxy { Proxy::Url(u) => redact(u), _ => String::new() }, "proxy client failed; using the default transport");
+            let shown = match proxy {
+                Proxy::Url(u) => redact(u),
+                _ => String::new(),
+            };
+            if first_warning(&format!("failed {shown}")) {
+                tracing::warn!(proxy = %shown, "proxy client failed; using the default transport");
+            }
             self.default.clone().unwrap_or_else(|| plain_client(self.timed))
         })
     }
@@ -347,6 +353,24 @@ impl GoClients {
         cache.truncate(CACHE_CAPACITY);
         Some(client)
     }
+}
+
+/// Whether a proxy warning for `key` is the first in this process. Go logs a bad proxy
+/// once per transport it builds; a per-request warning would repeat on every request
+/// of a credential with an unusable `proxy_url`.
+// ponytail: a process-wide set capped at 1024 keys; past the cap every warning is logged
+// again rather than tracked.
+fn first_warning(key: &str) -> bool {
+    static SEEN: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Mutex::default);
+    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if seen.contains(key) {
+        return false;
+    }
+    if seen.len() < 1024 {
+        seen.insert(key.to_owned());
+    }
+    true
 }
 
 /// A plain client whose redirects are followed by [`send`], not by wreq, with Go's
@@ -563,9 +587,74 @@ pub struct Upstream {
 // exhausting a small VPS while covering any real provider error.
 pub const MAX_ERROR_BODY: usize = 16 << 20;
 
+/// Largest successful (2xx) upstream body read whole, counted after decompression.
+// ponytail: Go reads these with io.ReadAll without a bound; 64 MiB, the client request-body
+// limit, keeps a hostile upstream or a compression bomb from exhausting a small VPS while
+// covering any real non-streaming answer. Streamed bodies are not capped here.
+pub const MAX_SUCCESS_BODY: usize = 64 << 20;
+
+#[cfg(test)]
+thread_local! {
+    /// Lowers [`MAX_SUCCESS_BODY`] for tests running on this thread.
+    pub(crate) static SUCCESS_BODY_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_SUCCESS_BODY) };
+}
+
+/// [`MAX_SUCCESS_BODY`], or a test's lower cap on this thread.
+#[cfg(not(test))]
+pub(crate) fn success_body_cap() -> usize {
+    MAX_SUCCESS_BODY
+}
+
+/// [`MAX_SUCCESS_BODY`], or a test's lower cap on this thread.
+#[cfg(test)]
+pub(crate) fn success_body_cap() -> usize {
+    SUCCESS_BODY_CAP.with(std::cell::Cell::get)
+}
+
+/// How a 2xx body over [`MAX_SUCCESS_BODY`] ends: as a read failure of that body, which
+/// is what Go's `io.ReadAll` error becomes here too (502, transport scope).
+pub(crate) fn body_too_large(cap: usize) -> ExecError {
+    ExecError::local(
+        502,
+        FailureScope::Transport,
+        format!("upstream response body exceeds {cap} bytes"),
+    )
+}
+
+/// Go `io.ReadAll` of a 2xx body: every byte, a read error fails the call, and so does a
+/// body longer than [`MAX_SUCCESS_BODY`] once decoded.
+pub async fn read_success<S>(mut body: S) -> Result<Bytes, ExecError>
+where
+    S: futures_util::Stream<Item = Result<Bytes, ExecError>> + Unpin,
+{
+    let cap = success_body_cap();
+    let mut out = bytes::BytesMut::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk?;
+        if chunk.len() > cap - out.len() {
+            return Err(body_too_large(cap));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out.freeze())
+}
+
 fn body_error(_: std::io::Error) -> ExecError {
     ExecError::local(502, FailureScope::Transport, "upstream request failed")
 }
+
+/// Headers the executors fill from a credential besides `Authorization`: Claude and
+/// Anthropic-compatible API keys, Gemini/Vertex API keys, Azure-style `api-key`, the
+/// Codex account ID and Kimi's device ID. Go's `http.Client` forwards these across a
+/// redirect to another domain; here they are dropped with `Authorization`
+/// (DIFFERENCES-FROM-GO).
+const PROVIDER_SECRET_HEADERS: [&str; 5] = [
+    "X-Api-Key",
+    "X-Goog-Api-Key",
+    "Api-Key",
+    "Chatgpt-Account-Id",
+    "X-Msh-Device-Id",
+];
 
 /// POSTs `body` the way Go's `http.Client.Do` does, following redirects itself: at
 /// most ten requests, 301/302/303 turn a POST into a body-less GET, 307/308 resend the
@@ -1009,7 +1098,10 @@ async fn exchange(
                 "Cookie2",
                 "Proxy-Authorization",
                 "Proxy-Authenticate",
-            ] {
+            ]
+            .into_iter()
+            .chain(PROVIDER_SECRET_HEADERS)
+            {
                 hop_headers.take(name);
             }
         }
@@ -1440,6 +1532,48 @@ mod tests {
     /// the upstream ended it early; a reset keeps the generic transport text. Every
     /// reply sends five of the hundred bytes or a partial chunked body, then, once the
     /// client holds the response, closes or resets the connection.
+    /// A 2xx body from a mock upstream reads whole up to the success cap; one byte more
+    /// fails as a read error (502) instead of growing without bound.
+    #[tokio::test]
+    async fn success_bodies_over_the_cap_fail() {
+        const CAP: usize = 4096;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|uri: http::Uri| async move {
+            let size = if uri.path() == "/over" { CAP + 1 } else { CAP };
+            vec![b'x'; size]
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        SUCCESS_BODY_CAP.with(|cap| cap.set(CAP));
+        let client = default_client();
+        let at_cap = send(
+            &client,
+            &format!("http://{addr}/at"),
+            GoHeaders::new(),
+            Bytes::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        let at_cap = read_success(at_cap.body).await;
+        let over = send(
+            &client,
+            &format!("http://{addr}/over"),
+            GoHeaders::new(),
+            Bytes::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(over.status, 200);
+        let over = read_success(over.body).await;
+        SUCCESS_BODY_CAP.with(|cap| cap.set(MAX_SUCCESS_BODY));
+        assert_eq!(at_cap.unwrap().len(), CAP);
+        let error = over.unwrap_err();
+        assert_eq!((error.status, error.scope), (502, FailureScope::Transport));
+        assert_eq!(error.body.as_ref(), b"upstream response body exceeds 4096 bytes");
+    }
+
     #[tokio::test]
     async fn scanned_bodies_name_only_an_early_end_unexpected_eof() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -2062,6 +2196,103 @@ mod tests {
             let want = case["hops"].as_array().unwrap();
             assert_eq!(&got, &want[..refused.unwrap_or(want.len())], "{name}");
         }
+    }
+
+    /// A bad proxy is reported once per distinct value, not on every request.
+    #[test]
+    fn proxy_warnings_are_logged_once_per_value() {
+        let key = format!("test-{}", std::process::id());
+        assert!(first_warning(&key));
+        assert!(!first_warning(&key));
+        assert!(first_warning(&format!("{key}-other")));
+        let clients = GoClients::new(Hooks::default());
+        // Building the fallback client twice warns (and checks the cache) without panicking.
+        let _ = clients.get(&Proxy::Invalid);
+        let _ = clients.get(&Proxy::Invalid);
+        assert!(!first_warning("invalid"));
+    }
+
+    /// A redirect to another host drops provider secrets carried outside `Authorization`
+    /// (x-api-key, x-goog-api-key, api-key, chatgpt-account-id, x-msh-device-id) along with
+    /// it; a redirect within the host keeps them all.
+    #[tokio::test]
+    async fn cross_host_redirects_drop_provider_secret_headers() {
+        use axum::response::IntoResponse;
+        type Seen = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+        const NAMES: [&str; 6] = [
+            "authorization",
+            "x-api-key",
+            "x-goog-api-key",
+            "api-key",
+            "chatgpt-account-id",
+            "x-msh-device-id",
+        ];
+        let seen: Seen = Arc::default();
+        let main = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let other = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (main_addr, other_port) = (main.local_addr().unwrap(), other.local_addr().unwrap().port());
+        for listener in [main, other] {
+            let seen = seen.clone();
+            let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+                let seen = seen.clone();
+                async move {
+                    let present = NAMES
+                        .iter()
+                        .filter(|name| request.headers().contains_key(**name))
+                        .map(|name| (*name).to_owned())
+                        .collect();
+                    let path = request.uri().path().to_owned();
+                    seen.lock().unwrap().push((path.clone(), present));
+                    match path.as_str() {
+                        "/same" => (
+                            http::StatusCode::TEMPORARY_REDIRECT,
+                            [(http::header::LOCATION, "/done")],
+                        )
+                            .into_response(),
+                        "/cross" => (
+                            http::StatusCode::TEMPORARY_REDIRECT,
+                            [(http::header::LOCATION, format!("http://localhost:{other_port}/done"))],
+                        )
+                            .into_response(),
+                        _ => "done".into_response(),
+                    }
+                }
+            });
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        }
+        let headers = || {
+            let mut h = GoHeaders::new();
+            h.set("Authorization", "Bearer secret");
+            h.set("x-api-key", "sk-ant-secret");
+            h.set("x-goog-api-key", "AIza-secret");
+            h.set("api-key", "azure-secret");
+            h.set("chatgpt-account-id", "acct-1");
+            h.set("X-Msh-Device-Id", "device-1");
+            h
+        };
+        let client = default_client();
+        for path in ["/same", "/cross"] {
+            let upstream = send(
+                &client,
+                &format!("http://{main_addr}{path}"),
+                headers(),
+                Bytes::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(upstream.status, 200, "{path}");
+        }
+        let all: Vec<String> = NAMES.iter().map(|n| (*n).to_owned()).collect();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ("/same".to_owned(), all.clone()),
+                ("/done".to_owned(), all.clone()),
+                ("/cross".to_owned(), all),
+                ("/done".to_owned(), vec![]),
+            ]
+        );
     }
 
     /// Go's `Client.Timeout` bounds the whole exchange: redirect hops share one deadline

@@ -506,9 +506,20 @@ mod access {
                 let status = res.status().as_u16();
                 let version = res.headers().contains_key("x-cpa-version");
                 let body = res.text().await.unwrap();
-                assert_eq!(status, step["status"], "{name}[{i}] {body}");
+                // Deliberate differences (docs/DIFFERENCES-FROM-GO.md): an untrusted
+                // loopback peer sending forwarding headers is remote, and a key-less
+                // request does not count toward the ban.
+                let (want_status, want_body) = match (name, i) {
+                    ("untrusted_forwarded_headers_are_ignored", 1) => (
+                        Value::from(403),
+                        Value::from(r#"{"error":"remote management disabled"}"#),
+                    ),
+                    ("ban_after_five_failures_including_missing", 5) => (Value::from(200), Value::Null),
+                    _ => (step["status"].clone(), step["body"].clone()),
+                };
+                assert_eq!(status, want_status, "{name}[{i}] {body}");
                 if status != 200 {
-                    assert_eq!(body, step["body"].as_str().unwrap(), "{name}[{i}]");
+                    assert_eq!(body, want_body.as_str().unwrap(), "{name}[{i}]");
                 }
                 assert_eq!(version, step["x_cpa_version"] != "", "{name}[{i}] version header");
                 steps += 1;

@@ -352,7 +352,7 @@ pub(crate) fn parse_items(array: &gjson::Value<'_>) -> Vec<Item> {
 /// `responsesWebsocketPreviousInputNoCopy`: the remembered request's `input` array.
 /// Errors carry Go's text (`encoding/json` type mismatch on `input`).
 fn previous_input(last_request: &str) -> Result<String, String> {
-    if !gjson::valid(last_request) {
+    if !gj::valid(last_request.as_bytes()) {
         return Err("invalid previous request input".into());
     }
     let root = gjson::parse(last_request);
@@ -398,7 +398,7 @@ pub(crate) fn merge_input(last_request: &str, last_output: &str, append: &str) -
     let previous = previous_input(last_request)?;
     let mut items = parse_items(&gjson::parse(&previous));
     let output = last_output.trim();
-    if output.starts_with('[') && gjson::valid(output) {
+    if output.starts_with('[') && gj::valid(output.as_bytes()) {
         let output = gjson::parse(output);
         if contains_full_transcript(&output) {
             items.retain(|i| i.kind != "compaction_trigger");
@@ -409,7 +409,7 @@ pub(crate) fn merge_input(last_request: &str, last_output: &str, append: &str) -
         "" => "[]",
         a => a,
     };
-    if !gjson::valid(append) {
+    if !gj::valid(append.as_bytes()) {
         return Err("invalid request input".into());
     }
     let parsed = gjson::parse(append);
@@ -496,7 +496,7 @@ fn without_compaction_items(input: &gjson::Value<'_>) -> String {
 /// `normalizeResponsesWebsocketPassthroughRequest`: a turn for the pinned upstream
 /// socket keeps its type and `previous_response_id`.
 pub(crate) fn normalize_passthrough(raw: &str, model: &str) -> Result<String, WsError> {
-    if !gjson::valid(raw) {
+    if !gj::valid(raw.as_bytes()) {
         return Err(WsError::bad("invalid websocket request JSON"));
     }
     let kind = field(raw, "type");
@@ -587,13 +587,13 @@ pub(crate) fn payloads_from_chunk(chunk: &[u8]) -> Vec<String> {
         if line.is_empty() || line == "[DONE]" {
             continue;
         }
-        if gjson::valid(&line) {
+        if gj::valid(line.as_bytes()) {
             payloads.push(line);
         }
     }
     if payloads.is_empty() {
         let whole = strip(chunk.trim_ascii());
-        if !whole.is_empty() && whole != "[DONE]" && gjson::valid(&whole) {
+        if !whole.is_empty() && whole != "[DONE]" && gj::valid(whole.as_bytes()) {
             payloads.push(whole);
         }
     }
@@ -814,7 +814,7 @@ fn http_status_text(status: u16) -> &'static str {
 /// `handlers.BuildErrorResponseBodyWithError` (no terminal-auth classification).
 fn error_body(status: u16, text: &str) -> String {
     let trimmed = text.trim();
-    if !trimmed.is_empty() && gjson::valid(trimmed) {
+    if !trimmed.is_empty() && gj::valid(trimmed.as_bytes()) {
         return crate::errors::compact_json(trimmed);
     }
     let (kind, code) = match status {
@@ -859,7 +859,7 @@ pub(crate) fn error_payload(status: u16, message: &str, addon: Option<&axum::htt
         }
         payload = set_raw(&payload, "headers", &headers);
     }
-    if gjson::valid(&body) {
+    if gj::valid(body.as_bytes()) {
         let error = gjson::get(&body, "error");
         payload = if error.exists() {
             set_raw(&payload, "error", error.json())

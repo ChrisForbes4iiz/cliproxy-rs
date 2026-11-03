@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store, Res } from "../store.svelte";
   import { api, configValue } from "../api";
-  import { readPath, fieldPath, type Data } from "../core";
+  import { readPath, fieldPath, promptName, type Data } from "../core";
   import Editor from "../Editor.svelte";
   import Load from "../Load.svelte";
 
@@ -22,7 +22,7 @@
     });
   }
   function install(p: Data) {
-    if (!confirm(`Install ${text(p.name || p.id)}? Plugins are native code that runs inside the server with its full access. Install only from publishers you trust.`)) return;
+    if (!confirm(`Install ${promptName(text(p.name || p.id))}? Plugins are native code that runs inside the server with its full access. Install only from publishers you trust.`)) return;
     store.act(async () => {
       const r = await api(`/plugins/store/${encodeURIComponent(p.id)}/install${p.source_id ? `?source=${encodeURIComponent(p.source_id)}` : ""}`, "POST", {});
       await after();
@@ -67,7 +67,7 @@
               <button
                 class="key small quiet danger"
                 disabled={store.busy}
-                onclick={() => store.call("DELETE", `/plugins/${encodeURIComponent(p.id)}`, undefined, "Plugin deleted.", `Delete plugin ${p.id}, its binary and its settings?`, after)}
+                onclick={() => store.call("DELETE", `/plugins/${encodeURIComponent(p.id)}`, undefined, "Plugin deleted.", `Delete plugin ${promptName(p.id)}, its binary and its settings?`, after)}
                 >Delete</button
               >
             </li>

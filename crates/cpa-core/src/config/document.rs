@@ -631,18 +631,26 @@ impl ConfigDocument {
         }
     }
 
-    /// Go keeps the inode for single-file Docker bind mounts (config_basic.go).
+    /// Replaces the file atomically: an exclusively created sibling temp file with the
+    /// existing file's mode (0600 for a new one), synced, then renamed over it, so a
+    /// crash or a full disk leaves the old config whole. Go truncates and writes in place
+    /// (config_basic.go). A symlinked config is resolved and its target replaced, so the
+    /// link survives. Where the rename is refused (a single-file Docker bind mount is a
+    /// busy mount point, the temp file cannot be created beside it, or another device),
+    /// the file is written in place as Go does, which keeps the mount's inode.
     /// All parsing/normalization must finish before calling this function.
     pub fn write(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        // Unix: a new file is private. Windows has no mode bits (Go's mode is ignored).
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(path)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
+        let target = match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => match std::fs::canonicalize(path) {
+                Ok(resolved) => resolved,
+                // A dangling link: Go's write creates its target.
+                Err(_) => return Ok(write_in_place(path, text.as_bytes())?),
+            },
+            _ => path.to_path_buf(),
+        };
+        if !write_atomic(&target, text.as_bytes())? {
+            write_in_place(&target, text.as_bytes())?;
+        }
         Ok(())
     }
 
@@ -1178,9 +1186,166 @@ fn legacy_groups(value: Value, family: &str) -> anyhow::Result<Value> {
     Ok(Value::Sequence(groups))
 }
 
+/// Go's `os.WriteFile`: truncates and writes the file itself (0600 when new).
+fn write_in_place(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    // Unix: a new file is private. Windows has no mode bits (Go's mode is ignored).
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Replaces `target` through a uniquely named sibling and a rename (the server's
+/// `write_bytes_atomic`, which cpa-core cannot depend on, plus the existing file's
+/// mode and owner). `Ok(false)` when the rename route is unavailable here and nothing
+/// was changed: the caller writes in place.
+// ponytail: the owner is copied best-effort (only root may give a file away); ACLs and
+// extended attributes of the old file are not carried over.
+fn write_atomic(target: &std::path::Path, bytes: &[u8]) -> std::io::Result<bool> {
+    use std::io::{ErrorKind, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let existing = std::fs::metadata(target).ok();
+    let dir = match target.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let (tmp, file) = loop {
+        let tmp = dir.join(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // create_new is O_CREAT|O_EXCL: it never follows or reuses an existing path.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            // A writable file in a folder this process cannot create in (a single-file
+            // mount): only the in-place write can work.
+            Err(e) if matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem) => {
+                return Ok(false);
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    fn fill(mut file: std::fs::File, bytes: &[u8], existing: Option<&std::fs::Metadata>) -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        #[cfg(unix)]
+        if let Some(meta) = existing {
+            use std::os::unix::fs::MetadataExt;
+            let _ = std::os::unix::fs::fchown(&file, Some(meta.uid()), Some(meta.gid()));
+            file.set_permissions(meta.permissions())?;
+        }
+        #[cfg(not(unix))]
+        let _ = existing;
+        file.sync_all()
+    }
+    let result = fill(file, bytes, existing.as_ref()).and_then(|()| std::fs::rename(&tmp, target));
+    match result {
+        Ok(()) => {
+            // The rename itself is durable once the folder is synced (Unix only; Windows
+            // cannot open a folder this way).
+            #[cfg(unix)]
+            if let Ok(folder) = std::fs::File::open(dir) {
+                let _ = folder.sync_all();
+            }
+            Ok(true)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            // EBUSY: the target is a mount point (a single-file bind mount). EXDEV: the
+            // temp file landed on another device. Windows refuses to replace a file
+            // another process holds open without delete sharing.
+            let refused = matches!(e.kind(), ErrorKind::ResourceBusy | ErrorKind::CrossesDevices)
+                || (cfg!(windows) && e.kind() == ErrorKind::PermissionDenied);
+            if refused { Ok(false) } else { Err(e) }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_scratch(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cpa-core-write-{name}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// cliproxy-rs-7ea.13: the write replaces the whole file and leaves no temp file.
+    #[test]
+    fn write_replaces_the_file_and_leaves_no_temp_file() {
+        let dir = write_scratch("replace");
+        let path = dir.join("config.yaml");
+        ConfigDocument::write(&path, "port: 1\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "port: 1\n");
+        ConfigDocument::write(&path, "port: 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "port: 2\n");
+        assert_eq!(entries(&dir), vec!["config.yaml".to_owned()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// cliproxy-rs-7ea.13: a new file is private; an existing file keeps its mode.
+    #[cfg(unix)]
+    #[test]
+    fn write_keeps_the_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = write_scratch("mode");
+        let path = dir.join("config.yaml");
+        ConfigDocument::write(&path, "port: 1\n").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        ConfigDocument::write(&path, "port: 2\n").unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        // A new inode: the content arrived by rename, never by truncating the old file.
+        assert_ne!(std::os::unix::fs::MetadataExt::ino(&after), before);
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "port: 2\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// cliproxy-rs-7ea.13: a symlinked config stays a link; its target is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn write_keeps_a_symlinked_config_a_link() {
+        let dir = write_scratch("link");
+        let real = dir.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let target = real.join("config.yaml");
+        std::fs::write(&target, "port: 1\n").unwrap();
+        let link = dir.join("config.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        ConfigDocument::write(&link, "port: 2\n").unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "port: 2\n");
+        assert_eq!(entries(&real), vec!["config.yaml".to_owned()]);
+        assert_eq!(entries(&dir), vec!["config.yaml".to_owned(), "real".to_owned()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn legacy_migration_and_nested_block_sequences_roundtrip() {

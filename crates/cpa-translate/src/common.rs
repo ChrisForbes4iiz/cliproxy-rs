@@ -1266,9 +1266,68 @@ pub fn parse_rfc3339_unix(s: &[u8]) -> Option<i64> {
     Some(days * 86400 + hour * 3600 + min * 60 + sec - offset)
 }
 
+/// `doc` with elements of the array at `path` replaced in one pass: `edits` holds
+/// (element index, new raw bytes) in ascending index order. The bytes equal one
+/// `set_raw(doc, "{path}.{index}", bytes)` per edit (an element edited by sub-path in
+/// place is the element edited on its own and swapped back), without copying the whole
+/// document per edit. An element whose offset does not locate its bytes (a synthesized
+/// result) falls back to those per-path edits.
+pub(crate) fn replace_array_items(doc: &[u8], path: &str, edits: &[(usize, Vec<u8>)]) -> Vec<u8> {
+    if edits.is_empty() {
+        return doc.to_vec();
+    }
+    let items = gj::get(doc, path).array();
+    let added: usize = edits.iter().map(|(_, bytes)| bytes.len()).sum();
+    let mut out = Vec::with_capacity(doc.len() + added);
+    let mut at = 0;
+    for (index, bytes) in edits {
+        let located = items.get(*index).and_then(|item| {
+            let end = item.index.checked_add(item.raw.len())?;
+            (item.index > 0 && item.index >= at && doc.get(item.index..end) == Some(&item.raw[..]))
+                .then_some((item.index, end))
+        });
+        let Some((start, end)) = located else {
+            let mut slow = doc.to_vec();
+            for (index, bytes) in edits {
+                gj::set_raw(&mut slow, &format!("{path}.{index}"), bytes);
+            }
+            return slow;
+        };
+        out.extend_from_slice(&doc[at..start]);
+        out.extend_from_slice(bytes);
+        at = end;
+    }
+    out.extend_from_slice(&doc[at..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One pass gives the bytes of one set_raw per element, whitespace and all.
+    #[test]
+    fn replace_array_items_matches_per_path_set_raw() {
+        let doc = br#"{"a":1, "input" : [ {"x":1} ,{"y":[2]},  "s" , {"z":3} ] ,"b":[0]}"#;
+        let edits = vec![
+            (0, br#"{"x":10}"#.to_vec()),
+            (2, br#""t""#.to_vec()),
+            (3, b"{}".to_vec()),
+        ];
+        let mut want = doc.to_vec();
+        for (index, bytes) in &edits {
+            assert!(gj::set_raw(&mut want, &format!("input.{index}"), bytes));
+        }
+        assert_eq!(replace_array_items(doc, "input", &edits), want);
+        assert_eq!(replace_array_items(doc, "input", &[]), doc.to_vec());
+        // An index past the end takes sjson's own path (append, padding with nulls).
+        let past = vec![(1, b"7".to_vec()), (6, b"8".to_vec())];
+        let mut want = doc.to_vec();
+        for (index, bytes) in &past {
+            gj::set_raw(&mut want, &format!("input.{index}"), bytes);
+        }
+        assert_eq!(replace_array_items(doc, "input", &past), want);
+    }
 
     #[test]
     fn rfc3339_formats_like_go_in_utc() {

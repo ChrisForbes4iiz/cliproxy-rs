@@ -42,9 +42,10 @@ pub(crate) async fn send(
     crate::proxy::send(client, url, headers, body, None).await
 }
 
-/// Go `io.ReadAll` of a response body; read errors fail the call.
+/// Go `io.ReadAll` of a response body; read errors fail the call, and so does a body
+/// over `proxy::MAX_SUCCESS_BODY`.
 pub(crate) async fn read_all(upstream: Upstream) -> Result<Bytes, ExecError> {
-    crate::proxy::read_all(upstream.body, usize::MAX, false).await
+    crate::proxy::read_success(upstream.body).await
 }
 
 /// Go `io.ReadAll` of an error body, bounded, read errors ignored.

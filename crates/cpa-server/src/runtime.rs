@@ -31,14 +31,24 @@ use crate::scheduler::{Policy, Scheduler};
 /// The config snapshot and credential epoch a registry was built from.
 type RegistryCache = (Arc<Config>, (u64, u64, u64), Arc<Registry>);
 
+/// The OAuth model aliases of one config snapshot.
+type Aliases = Arc<HashMap<String, Vec<crate::registry::OAuthAlias>>>;
+type AliasCache = (Arc<Config>, Aliases);
+
 pub struct Runtime {
     config: RwLock<Arc<Config>>,
     store: Arc<CredentialStore>,
     pub executors: Executors,
     refresh_task: Mutex<Option<tokio::task::AbortHandle>>,
     refresh_state: Mutex<RefreshState>,
-    /// The registry derived from the current config and credential generation.
+    /// The registry derived from the current config and credential generation. Held
+    /// only to read or publish the cache, never across a build.
     registry: Mutex<Option<RegistryCache>>,
+    /// Serializes registry builds, so `models_registered` sees snapshots in order and
+    /// concurrent misses build once.
+    registry_build: Mutex<()>,
+    /// Go's `oauth.model-alias` table of the config it was parsed from.
+    aliases: Mutex<Option<AliasCache>>,
     oauth_sink: RwLock<Option<OAuthCallbackSink>>,
     /// Go `modelPoolOffsets`: rotation cursors for OpenAI-compatible alias pools.
     pool_offsets: Mutex<HashMap<String, usize>>,
@@ -116,6 +126,8 @@ impl Runtime {
             refresh_task: Mutex::default(),
             refresh_state: Mutex::default(),
             registry: Mutex::default(),
+            registry_build: Mutex::default(),
+            aliases: Mutex::default(),
             oauth_sink: RwLock::default(),
             pool_offsets: Mutex::default(),
             usage: Arc::default(),
@@ -297,15 +309,51 @@ impl Runtime {
     }
 
     /// One credential's projected state for one registered model (Go
-    /// `clientModelProjectionForAuth`), for listings and `auto`.
+    /// `clientModelProjectionForAuth`). One lookup; listings and `auto` take
+    /// [`Self::suspensions`].
     pub fn suspension(&self, credential_id: &str, model: &str) -> crate::registry::Suspension {
         use crate::registry::Suspension;
         let Some(credential) = self.store.get(credential_id) else {
             return Suspension::None;
         };
-        let aliases = crate::registry::global_aliases(&self.config());
+        let aliases = self.aliases();
         let key = crate::registry::selection_model(&aliases, &credential, model);
         self.store.suspension(&credential, &key)
+    }
+
+    /// [`Self::suspension`] for every (credential, model) pair of a listing or an `auto`
+    /// resolution: the alias table and a credential index are taken once per call, not
+    /// once per pair (2,000 credentials by 20 models is 40,000 pairs).
+    pub fn suspensions(&self) -> impl Fn(&str, &str) -> crate::registry::Suspension + '_ {
+        let aliases = self.aliases();
+        let snapshot = self.store.snapshot();
+        let mut by_id: HashMap<String, Arc<Credential>> = HashMap::with_capacity(snapshot.len());
+        for credential in snapshot {
+            // The first credential of each ID, as `CredentialStore::get` finds.
+            by_id.entry(credential.id.clone()).or_insert(credential);
+        }
+        move |credential_id, model| match by_id.get(credential_id) {
+            Some(credential) => {
+                let key = crate::registry::selection_model(&aliases, credential, model);
+                self.store.suspension(credential, &key)
+            }
+            None => crate::registry::Suspension::None,
+        }
+    }
+
+    /// Go's `oauth.model-alias` table for the current config, parsed once per published
+    /// config rather than on every lookup.
+    pub(crate) fn aliases(&self) -> Aliases {
+        let config = self.config();
+        let mut cache = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cfg, aliases)) = cache.as_ref()
+            && Arc::ptr_eq(cfg, &config)
+        {
+            return aliases.clone();
+        }
+        let aliases = Arc::new(crate::registry::global_aliases(&config));
+        *cache = Some((config, aliases.clone()));
+        aliases
     }
 
     /// Wires OAuth callback delivery (management owns pending login sessions).
@@ -330,29 +378,53 @@ impl Runtime {
 
     /// The model registry for the current config and credential set. Rebuilt only when
     /// either changed, so it is always derived, never separately maintained.
+    ///
+    /// A hit holds the cache lock only to clone the `Arc`. A miss builds under
+    /// `registry_build`, outside the cache lock, so requests whose key is cached never
+    /// wait for a build; builds run one at a time and publish in order.
+    // ponytail: the key is the store epoch, which every token refresh bumps, so a
+    // refresh still costs a rebuild; skipping it needs proof that `models_for` reads
+    // none of the patched keys (Antigravity's refresh writes `project_id`).
     pub fn registry(&self) -> Arc<Registry> {
         let config = self.config();
-        // A refreshed static catalog re-registers every credential (Go's model refresh
-        // callback), so the catalog generation is part of the key.
-        // Capability probes (Antigravity web search) refine registered models later.
-        let generation = (
-            self.store.epoch(),
-            cpa_core::registry::catalog_generation(),
-            cpa_core::registry::dynamic::capabilities_generation(),
-        );
-        let mut cache = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((cfg, g, registry)) = cache.as_ref()
-            && Arc::ptr_eq(cfg, &config)
-            && *g == generation
-        {
-            return registry.clone();
+        let generation = self.registry_generation();
+        if let Some(registry) = self.cached_registry(&config, generation) {
+            return registry;
+        }
+        let _build = self.registry_build.lock().unwrap_or_else(PoisonError::into_inner);
+        // Another build may have published while this one waited: build for what is
+        // current now (read before the snapshot, so a later change misses the key).
+        let config = self.config();
+        let generation = self.registry_generation();
+        if let Some(registry) = self.cached_registry(&config, generation) {
+            return registry;
         }
         let snapshot = self.store.snapshot();
         let registry = Arc::new(Registry::build(&config, &snapshot));
         let credentials: Vec<_> = snapshot.iter().map(|c| self.for_executor(c)).collect();
         self.executors.models_registered(&credentials, &config);
-        *cache = Some((config, generation, registry.clone()));
+        *self.registry.lock().unwrap_or_else(PoisonError::into_inner) = Some((config, generation, registry.clone()));
         registry
+    }
+
+    /// What a registry is built from besides the config: the credential epoch, and the
+    /// static catalog and capability generations (a refreshed catalog re-registers every
+    /// credential, as Go's model refresh callback does; capability probes, such as
+    /// Antigravity web search, refine registered models later).
+    fn registry_generation(&self) -> (u64, u64, u64) {
+        (
+            self.store.epoch(),
+            cpa_core::registry::catalog_generation(),
+            cpa_core::registry::dynamic::capabilities_generation(),
+        )
+    }
+
+    fn cached_registry(&self, config: &Arc<Config>, generation: (u64, u64, u64)) -> Option<Arc<Registry>> {
+        let cache = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .as_ref()
+            .filter(|(cfg, g, _)| Arc::ptr_eq(cfg, config) && *g == generation)
+            .map(|(_, _, registry)| registry.clone())
     }
 
     pub fn policy(&self) -> Arc<Policy> {
@@ -527,6 +599,14 @@ impl Runtime {
         self.codex_refreshes.shutdown.cancel();
         self.codex_refreshes.tasks.close();
         self.codex_refreshes.tasks.wait().await;
+        self.flush_persistence().await;
+    }
+
+    /// Waits for the cooldown and credential writes recorded results queued
+    /// ([`CredentialStore::flush_persistence`]) without blocking a worker.
+    pub async fn flush_persistence(&self) {
+        let store = self.store.clone();
+        let _ = tokio::task::spawn_blocking(move || store.flush_persistence()).await;
     }
 
     /// The credential lock of the Codex file at `path`, for a write that is not a refresh
@@ -1147,9 +1227,10 @@ fn ready<'a>(
     now: Instant,
     configured: bool,
 ) -> Result<(Vec<(&'a Arc<Credential>, String)>, Vec<(&'a Arc<Credential>, String)>), AcquireError> {
+    let exclude = Ids::new(&selection.exclude);
     let eligible: Vec<_> = creds
         .iter()
-        .filter(|c| !c.disabled && !selection.exclude.contains(&c.id))
+        .filter(|c| !c.disabled && !exclude.contains(&c.id))
         .filter(|c| policy.retry_limit(c) >= selection.retry_round && (!configured || scheduler.admits(c, policy)))
         .filter_map(|c| admit(c).map(|m| (c, m)))
         .collect();
@@ -1177,6 +1258,34 @@ fn ready<'a>(
         });
     }
     Ok((eligible, candidates))
+}
+
+/// Membership in a request's list of credential IDs (excluded, attempted): a scan while
+/// the list is short, a set once a retry pass over many accounts has grown it, so a
+/// pass over C credentials stays O(C) per pick instead of O(C^2).
+enum Ids<'a> {
+    Few(&'a [String]),
+    Many(std::collections::HashSet<&'a str>),
+}
+
+impl<'a> Ids<'a> {
+    /// Up to this many IDs a scan is cheaper than building a set.
+    const SCAN: usize = 16;
+
+    fn new(ids: &'a [String]) -> Self {
+        if ids.len() <= Self::SCAN {
+            Self::Few(ids)
+        } else {
+            Self::Many(ids.iter().map(String::as_str).collect())
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        match self {
+            Self::Few(ids) => ids.iter().any(|i| i == id),
+            Self::Many(ids) => ids.contains(id),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1247,6 +1356,16 @@ impl Selection {
             vec![self.provider.clone()]
         } else {
             self.providers.clone()
+        }
+    }
+
+    /// Whether `key` is one of [`Self::provider_keys`], without building the list (it is
+    /// asked once per credential per pick).
+    pub(crate) fn allows_provider(&self, key: &str) -> bool {
+        if self.providers.is_empty() {
+            !self.provider.is_empty() && self.provider == key
+        } else {
+            self.providers.iter().any(|p| p == key)
         }
     }
 }
@@ -1334,7 +1453,7 @@ pub fn admission<'a>(
 ) -> impl Fn(&Credential) -> Option<String> + 'a {
     move |c| {
         let provider = crate::registry::provider_key(c);
-        if !selection.provider_keys().contains(&provider)
+        if !selection.allows_provider(&provider)
             || !(executors.supports(&c.provider) || plugins.has_executor(&c.provider))
         {
             return None;
@@ -1560,10 +1679,64 @@ pub struct CredentialStore {
     /// refreshes, registered with every change to the set
     /// ([`crate::plugins::refresh::register`]).
     refresh_schedules: crate::plugins::refresh::Schedules,
+    /// This store, for the persistence worker a recorded result hands its writes to.
+    me: std::sync::Weak<CredentialStore>,
+    /// Writes a recorded result asks for, done off the tokio workers ([`Persister`]).
+    persister: Persister,
 }
 
 /// Ends the upstream WebSocket sessions of one removed credential.
 type SessionCloser = Box<dyn Fn(&str) + Send + Sync>;
+
+/// The cooldown snapshot and credential saves recorded results ask for. Go MarkResult
+/// persists from the request's goroutine; here a lease ends on whichever tokio worker
+/// dropped it, so the fsyncs and the auth-dir walk move to one worker thread.
+///
+/// Requests coalesce: one pending cooldown snapshot (taken when it is written, so the
+/// last write is the newest state, as `cooldown_write` already guarantees) and the
+/// newest revision asked for per credential (written only while still current, by
+/// [`CredentialStore::persist_credential`]). One worker drains them at a time, so the
+/// writes to one file keep their order.
+#[derive(Default)]
+struct Persister {
+    queue: Mutex<PersistQueue>,
+    /// Signalled whenever the worker stops, for [`CredentialStore::flush_persistence`].
+    idle: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PersistQueue {
+    cooldowns: bool,
+    credentials: HashMap<String, Arc<Credential>>,
+    /// A worker is draining the queue. It clears this under the lock when it finds the
+    /// queue empty, so nothing queued is left without a worker.
+    running: bool,
+}
+
+impl PersistQueue {
+    fn pending(&self) -> bool {
+        self.cooldowns || !self.credentials.is_empty()
+    }
+}
+
+/// Clears `running` if a drain unwinds, so a later request starts a new worker.
+struct Draining<'a> {
+    persister: &'a Persister,
+    armed: bool,
+}
+
+impl Drop for Draining<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.persister
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .running = false;
+            self.persister.idle.notify_all();
+        }
+    }
+}
 
 /// The ids in `before` that `after` no longer has.
 fn removed_ids(before: &[Arc<Credential>], after: &[Arc<Credential>]) -> Vec<String> {
@@ -1656,7 +1829,7 @@ impl CredentialStore {
         let refresh_schedules = crate::plugins::refresh::Schedules::default();
         crate::plugins::refresh::register(&refresh_schedules, &[], &inner.creds, &[]);
         crate::plugins::refresh::begin_bootstrap(&refresh_schedules);
-        Arc::new(Self {
+        Arc::new_cyclic(|me| Self {
             inner: RwLock::new(inner),
             policy: RwLock::new(Arc::new(Policy::default())),
             scheduler: Mutex::default(),
@@ -1677,6 +1850,8 @@ impl CredentialStore {
             unauthorized_noted: tokio::sync::watch::Sender::new(()),
             session_closer: std::sync::OnceLock::new(),
             refresh_schedules,
+            me: me.clone(),
+            persister: Persister::default(),
         })
     }
 
@@ -1852,15 +2027,8 @@ impl CredentialStore {
         let Source::File(path) = &credential.source else {
             return;
         };
-        // Go also skips runtime-only credentials and plugin-virtual ones.
-        if credential.disabled || marked(credential, "runtime_only") || marked(credential, "plugin_virtual") {
+        if !self.needs_persist(credential) {
             return;
-        }
-        {
-            let persisted = self.persisted.lock().unwrap_or_else(PoisonError::into_inner);
-            if persisted.get(&credential.id) == Some(&credential.revision) {
-                return;
-            }
         }
         // Written only while the credential is still at this revision: a refresh committed
         // after this request started must not be overwritten with the older token.
@@ -1920,6 +2088,22 @@ impl CredentialStore {
             .insert(credential.id.clone(), credential.revision);
     }
 
+    /// Whether [`Self::persist_credential`] has anything to check: a file credential
+    /// whose revision is not yet known to hold Go's persisted form. Cheap, so the
+    /// request path asks it before queueing a write.
+    fn needs_persist(&self, credential: &Credential) -> bool {
+        // Go also skips runtime-only credentials and plugin-virtual ones.
+        if !matches!(credential.source, Source::File(_))
+            || credential.disabled
+            || marked(credential, "runtime_only")
+            || marked(credential, "plugin_virtual")
+        {
+            return false;
+        }
+        let persisted = self.persisted.lock().unwrap_or_else(PoisonError::into_inner);
+        persisted.get(&credential.id) != Some(&credential.revision)
+    }
+
     /// Go `updateInternalLocked` for a credential a reload, save, import or upsert
     /// replaced with other tokens or another API key (`CredentialsChanged`), enabled
     /// before and after: its unauthorized cooldowns go, so the new token is selectable
@@ -1927,12 +2111,16 @@ impl CredentialStore {
     /// Called with the change, under the write lock; returns whether anything was
     /// cleared, for the caller to persist.
     fn clear_replaced_unauthorized(&self, before: &[Arc<Credential>], after: &[Arc<Credential>]) -> bool {
+        // The first credential of each ID, as a search of `before` would find.
+        let mut previous: HashMap<&str, &Credential> = HashMap::with_capacity(before.len());
+        for c in before {
+            previous.entry(c.id.as_str()).or_insert(c);
+        }
         let replaced: Vec<&str> = after
             .iter()
             .filter(|next| {
-                before
-                    .iter()
-                    .find(|c| c.id == next.id)
+                previous
+                    .get(next.id.as_str())
                     .is_some_and(|previous| !previous.disabled && !next.disabled && credentials_changed(previous, next))
             })
             .map(|c| c.id.as_str())
@@ -2100,7 +2288,7 @@ impl CredentialStore {
         let live = |m: &str| {
             scheduler
                 .cooldowns
-                .get(&(credential.id.clone(), crate::scheduler::canonical_model(m).to_owned()))
+                .get(&credential.id, crate::scheduler::canonical_model(m))
                 .filter(|s| s.deadline > now)
         };
         if let Some(state) = live(model) {
@@ -2157,6 +2345,7 @@ impl CredentialStore {
         admit: &Admit<'_>,
         now: Instant,
     ) -> Option<Duration> {
+        let attempted = Ids::new(attempted);
         let inner = self.read();
         let scheduler = self.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
         let wait = inner
@@ -2279,11 +2468,105 @@ impl CredentialStore {
                     self.unauthorized_noted.send_replace(());
                 }
             }
-            if changed {
+            // Go persists on every recorded result, a client-cancelled stream included.
+            let credential = self.needs_persist(&lease.credential).then_some(&lease.credential);
+            self.persist_later(changed, credential);
+        }
+    }
+
+    /// Runs the cooldown snapshot (`cooldowns`) and the credential save a recorded
+    /// result asks for on the persistence worker ([`Persister`]), so the tokio worker
+    /// that ended the lease never blocks on a file. Outside a tokio runtime (a plain
+    /// test, a drop after shutdown) they run here, as before.
+    fn persist_later(&self, cooldowns: bool, credential: Option<&Arc<Credential>>) {
+        if !cooldowns && credential.is_none() {
+            return;
+        }
+        let me = match self.me.upgrade() {
+            Some(me) if tokio::runtime::Handle::try_current().is_ok() => me,
+            _ => {
+                if cooldowns {
+                    self.persist_cooldowns();
+                }
+                if let Some(credential) = credential {
+                    self.persist_credential(credential);
+                }
+                return;
+            }
+        };
+        let start = {
+            let mut queue = self.persister.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.cooldowns |= cooldowns;
+            if let Some(credential) = credential {
+                match queue.credentials.get(&credential.id) {
+                    Some(queued) if queued.revision >= credential.revision => {}
+                    _ => {
+                        queue.credentials.insert(credential.id.clone(), credential.clone());
+                    }
+                }
+            }
+            !std::mem::replace(&mut queue.running, true)
+        };
+        if start {
+            let worker = me.clone();
+            let spawned = std::thread::Builder::new()
+                .name("cpa-persist".into())
+                .spawn(move || worker.drain_persistence());
+            if let Err(error) = spawned {
+                tracing::warn!(%error, "persistence worker did not start; writing inline");
+                me.drain_persistence();
+            }
+        }
+    }
+
+    /// Writes what [`Self::persist_later`] queued until the queue is empty. The caller
+    /// set `running`; this clears it.
+    fn drain_persistence(&self) {
+        let mut draining = Draining {
+            persister: &self.persister,
+            armed: true,
+        };
+        loop {
+            let (cooldowns, credentials) = {
+                let mut queue = self.persister.queue.lock().unwrap_or_else(PoisonError::into_inner);
+                if !queue.pending() {
+                    queue.running = false;
+                    draining.armed = false;
+                    self.persister.idle.notify_all();
+                    return;
+                }
+                (
+                    std::mem::take(&mut queue.cooldowns),
+                    std::mem::take(&mut queue.credentials),
+                )
+            };
+            if cooldowns {
                 self.persist_cooldowns();
             }
-            // Go persists on every recorded result, a client-cancelled stream included.
-            self.persist_credential(&lease.credential);
+            for credential in credentials.into_values() {
+                self.persist_credential(&credential);
+            }
+        }
+    }
+
+    /// Blocks until every write a recorded result queued has landed: at shutdown, and in
+    /// tests that read the `.cds` or credential files right after an attempt. Blocking:
+    /// call it from `spawn_blocking` or outside the runtime.
+    #[doc(hidden)]
+    pub fn flush_persistence(&self) {
+        let mut queue = self.persister.queue.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if queue.running {
+                queue = self.persister.idle.wait(queue).unwrap_or_else(PoisonError::into_inner);
+            } else if queue.pending() {
+                // Left by a worker that unwound: drain it here.
+                queue.running = true;
+                drop(queue);
+                self.drain_persistence();
+                queue = self.persister.queue.lock().unwrap_or_else(PoisonError::into_inner);
+            } else {
+                return;
+            }
         }
     }
 
@@ -2880,11 +3163,38 @@ impl CredentialStore {
     /// Go `Service.removeAuth` (1e37b52b): a credential that left the set ends only the
     /// upstream WebSocket sessions it serves. Runs with the set's locks released.
     fn close_sessions(&self, removed: Vec<String>) {
+        self.forget_removed(&removed);
         if let Some(close) = self.session_closer.get() {
             for id in removed {
                 close(&id);
             }
         }
+    }
+
+    /// Drops the per-ID bookkeeping of removed credentials: activity, the persisted
+    /// revision, and the preparation and write locks nobody holds (a held lock stays, so
+    /// a waiter and a later credential with the same ID still share it).
+    fn forget_removed(&self, removed: &[String]) {
+        if removed.is_empty() {
+            return;
+        }
+        let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+        self.prepare_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, lock| !removed.contains(id.as_str()) || Arc::strong_count(lock) > 1);
+        self.write_locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, lock| !removed.contains(id.as_str()) || Arc::strong_count(lock) > 1);
+        self.activity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, _| !removed.contains(id.as_str()));
+        self.persisted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|id, _| !removed.contains(id.as_str()));
     }
 
     /// Replaces the credential set (watcher reload, management import/delete). Unchanged
@@ -3168,6 +3478,9 @@ impl CredentialStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .reconcile(&inner.creds);
+        let removed = removed_ids(&before, &inner.creds);
+        drop(inner);
+        self.forget_removed(&removed);
     }
 
     fn read(&self) -> std::sync::RwLockReadGuard<'_, Inner> {
@@ -3883,15 +4196,24 @@ impl Stream for Completing {
             s.waker = Some(cx.waker().clone());
         }
         let item = ready!(s.inner.poll_next_unpin(cx));
-        match &item {
-            Some(Ok(_)) => {}
-            None => s.lease.take().unwrap().complete(Outcome::Success),
+        // The lease ends after the slot is unlocked: its report takes the store's locks
+        // and must not hold up the watcher.
+        let ended = match &item {
+            Some(Ok(_)) => None,
+            None => s.lease.take().map(|lease| (lease, Outcome::Success, None)),
             Some(Err(e)) => {
-                // The upstream body closes before the lease ends: a remote lease's release
-                // must not reach the control plane while the response is still open.
-                s.inner = Box::pin(futures_util::stream::empty());
-                s.lease.take().unwrap().complete(Outcome::Failure(e.clone()));
+                let closed = std::mem::replace(&mut s.inner, Box::pin(futures_util::stream::empty()));
+                s.lease
+                    .take()
+                    .map(|lease| (lease, Outcome::Failure(e.clone()), Some(closed)))
             }
+        };
+        drop(s);
+        if let Some((lease, outcome, closed)) = ended {
+            // The upstream body closes before the lease ends: a remote lease's release
+            // must not reach the control plane while the response is still open.
+            drop(closed);
+            lease.complete(outcome);
         }
         Poll::Ready(item)
     }
@@ -4847,13 +5169,12 @@ pub(crate) mod tests {
         assert_eq!(first.execution_model, "m");
         assert!(store.select(selection.clone()).is_none(), "reserved");
         // The first probe's hold lapses, and the next pick probes again.
-        let key = ("a.json".to_owned(), "m".to_owned());
         store
             .scheduler
             .lock()
             .unwrap()
             .cooldowns
-            .get_mut(&key)
+            .get_mut("a.json", "m")
             .unwrap()
             .trust
             .probe = Some(Instant::now());
@@ -5104,6 +5425,132 @@ pub(crate) mod tests {
         store.persist_credential(&committed);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A result recorded on a tokio worker hands its file writes to the persistence
+    /// worker: the lease ends while the write is still stalled on disk, and a flush
+    /// waits for it.
+    #[tokio::test]
+    async fn a_recorded_result_writes_its_file_off_the_worker() {
+        let (dir, _cfg, store) = stalled_store("persist-off-worker", &["a.json"]);
+        let path = dir.join("a.json");
+        let (entered, release) = stall_next_write(&path);
+        let lease = store.select(Selection::new("claude", "m")).unwrap();
+        let handle = tokio::runtime::Handle::current();
+        let ended = spawn_bounded(move || {
+            let _runtime = handle.enter();
+            lease.complete(Outcome::Success);
+        });
+        ended
+            .recv_timeout(BOUND)
+            .expect("the lease ends without waiting for the file");
+        entered.recv_timeout(BOUND).expect("the worker writes the credential");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"type":"claude","access_token":"old"}"#,
+            "still stalled"
+        );
+        drop(release);
+        let flushing = store.clone();
+        spawn_bounded(move || flushing.flush_persistence())
+            .recv_timeout(BOUND)
+            .expect("the flush returns once the write lands");
+        let written: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["disabled"], false, "Go's persisted form: {written}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_runtime() -> Runtime {
+        crate::testing::runtime(
+            Config::parse("").unwrap(),
+            Vec::new(),
+            Executors {
+                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        )
+    }
+
+    /// A cached registry is served while another request's build runs: the cache lock
+    /// is never held across a build.
+    #[test]
+    fn a_cached_registry_does_not_wait_for_a_build() {
+        let rt = test_runtime();
+        rt.store.reconcile(vec![cred("a.json", "claude", false)]);
+        let built = rt.registry();
+        let building = rt.registry_build.lock().unwrap();
+        let rt = &rt;
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let _ = tx.send(rt.registry());
+            });
+            let hit = rx.recv_timeout(BOUND);
+            drop(building);
+            let hit = hit.expect("the cached registry is served during a build");
+            assert!(Arc::ptr_eq(&hit, &built));
+        });
+    }
+
+    /// A listing's suspensions answer exactly as one lookup each, unknown IDs included,
+    /// and the alias table is parsed once per config.
+    #[test]
+    fn suspensions_answer_like_single_lookups() {
+        use crate::registry::Suspension;
+        let rt = test_runtime();
+        rt.store
+            .reconcile(vec![cred("a.json", "claude", false), cred("b.json", "claude", false)]);
+        let a = rt.store.get("a.json").unwrap();
+        rt.store.scheduler.lock().unwrap().record(
+            &a,
+            "m",
+            &weekly_limit(FailureScope::Model),
+            &Policy::default(),
+            Instant::now(),
+        );
+        let all = rt.suspensions();
+        for (id, model) in [("a.json", "m"), ("a.json", "n"), ("b.json", "m"), ("gone.json", "m")] {
+            assert_eq!(all(id, model), rt.suspension(id, model), "{id} {model}");
+        }
+        assert_eq!(all("a.json", "m"), Suspension::Quota);
+        assert_eq!(all("gone.json", "m"), Suspension::None);
+        assert!(Arc::ptr_eq(&rt.aliases(), &rt.aliases()), "one parse per config");
+    }
+
+    /// Exclusion and attempted lists answer membership the same way short or long.
+    #[test]
+    fn id_lists_answer_membership_at_any_length() {
+        for n in [0, 3, Ids::SCAN, Ids::SCAN + 1, 200] {
+            let ids: Vec<String> = (0..n).map(|i| format!("c{i}.json")).collect();
+            let set = Ids::new(&ids);
+            assert!(matches!(set, Ids::Many(_)) == (n > Ids::SCAN), "{n}");
+            for i in 0..n {
+                assert!(set.contains(&format!("c{i}.json")), "{n} {i}");
+            }
+            assert!(!set.contains("other.json"), "{n}");
+        }
+    }
+
+    /// A removed credential's bookkeeping goes with it, except a lock someone still
+    /// holds.
+    #[test]
+    fn a_removed_credential_leaves_no_bookkeeping_behind() {
+        let store = CredentialStore::new(vec![cred("a.json", "claude", false), cred("b.json", "claude", false)]);
+        let held = store.prepare_lock("a.json");
+        drop(store.prepare_lock("b.json"));
+        for id in ["a.json", "b.json"] {
+            store.note_activity(id, true);
+            store.persisted.lock().unwrap().insert(id.into(), 1);
+        }
+        store.reconcile(Vec::new());
+        assert!(store.prepare_locks.lock().unwrap().contains_key("a.json"), "held");
+        assert!(!store.prepare_locks.lock().unwrap().contains_key("b.json"));
+        assert!(store.activity.lock().unwrap().is_empty());
+        assert!(store.persisted.lock().unwrap().is_empty());
+        drop(held);
     }
 
     /// Go `save-cooldown-status`: a cooldown change writes `<auth-dir>/<file>.cds`, a new

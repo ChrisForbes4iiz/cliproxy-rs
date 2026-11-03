@@ -192,6 +192,36 @@ async fn refresh_retry_policy_matches_go_attempt_counts() {
     }
 }
 
+/// Go's code exchange error appends the token endpoint's body; only its OAuth error
+/// code is kept, since a token endpoint's body can echo what it was sent.
+#[tokio::test]
+async fn exchange_errors_keep_only_the_oauth_error_code() {
+    let mock = Mock::start().await;
+    let oauth = oauth(&mock).await;
+    for (body, want) in [
+        (
+            r#"{"error":"invalid_grant","error_description":"code-SECRET-FAKE was used"}"#,
+            "token exchange failed with status 400: invalid_grant",
+        ),
+        (
+            r#"{"echo":"code-SECRET-FAKE"}"#,
+            "token exchange failed with status 400",
+        ),
+    ] {
+        mock.script("/oauth/token", vec![json(400, body)]);
+        let error = oauth
+            .exchange(
+                "code-SECRET-FAKE",
+                &redirect_uri(DEFAULT_CALLBACK_PORT),
+                "verifier-FAKE",
+            )
+            .await
+            .unwrap_err();
+        mock.take();
+        assert_eq!(String::from_utf8_lossy(&error.body), want);
+    }
+}
+
 /// Go reports `failed to parse token response: <decoder error>`; the decoder can quote
 /// response values, so only Go's prefix is reported.
 #[tokio::test]

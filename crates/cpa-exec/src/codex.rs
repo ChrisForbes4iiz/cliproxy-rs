@@ -321,7 +321,7 @@ impl CodexExecutor {
         let body = if sse {
             ResponseBody::Stream(crate::upstream::framed(upstream.body))
         } else {
-            match crate::proxy::read_all(upstream.body, usize::MAX, false).await {
+            match crate::proxy::read_success(upstream.body).await {
                 Ok(body) => ResponseBody::Buffered(body),
                 Err(error) => {
                     wire.exec_error(&error);
@@ -439,10 +439,16 @@ impl CodexExecutor {
                 .await?;
             // Go reads the whole body (`io.ReadAll`, whatever its type), records every
             // byte that arrived, then parses it, a read error's partial tail included.
+            // More than `proxy::MAX_SUCCESS_BODY` bytes end the read like a read error.
             let mut upstream = res.body;
+            let cap = crate::proxy::success_body_cap();
             let (mut data, mut failed) = (Vec::new(), None);
             while let Some(chunk) = upstream.next().await {
                 match chunk {
+                    Ok(chunk) if chunk.len() > cap - data.len() => {
+                        failed = Some(crate::proxy::body_too_large(cap));
+                        break;
+                    }
                     Ok(chunk) => data.extend_from_slice(&chunk),
                     Err(error) => {
                         failed = Some(error);

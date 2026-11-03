@@ -454,6 +454,7 @@ impl PostgresStore {
             pg: self.pg.clone(),
             table: self.cooldown_table.clone(),
             previous: Arc::default(),
+            pending: Arc::default(),
         }
     }
 }
@@ -466,6 +467,16 @@ pub struct PgCooldown {
     table: String,
     /// Rows this process last loaded or saved, with their `updated_at`.
     previous: Arc<StdMutex<HashMap<CooldownKey, DateTime<Utc>>>>,
+    /// The newest save not yet taken by the worker. Each save is the complete live set,
+    /// so a newer one replaces a queued one instead of queueing behind it.
+    pending: Arc<StdMutex<Option<PendingSave>>>,
+}
+
+/// One encoded cooldown save: the rows to upsert, their keys, and its `now`.
+struct PendingSave {
+    encoded: Vec<(CooldownKey, String, DateTime<Utc>)>,
+    current: HashMap<CooldownKey, DateTime<Utc>>,
+    now: DateTime<Utc>,
 }
 
 fn cooldown_key(record: &Record) -> CooldownKey {
@@ -512,7 +523,9 @@ impl cpa_server::cooldown_store::Backend for PgCooldown {
     }
 
     // ponytail: queued without waiting (Go blocks the caller on the transaction);
-    // order is kept and a failure is logged by the worker.
+    // order is kept and a failure is logged by the worker. Saves still waiting for the
+    // worker coalesce into the newest, so a stalled database holds one save, not one per
+    // cooldown change.
     fn save(&self, records: Vec<Record>, now: SystemTime) -> Result<(), String> {
         let now = micros(now);
         let mut current = HashMap::with_capacity(records.len());
@@ -554,7 +567,24 @@ impl cpa_server::cooldown_store::Backend for PgCooldown {
             self.table
         );
         let previous = self.previous.clone();
-        self.pg.submit(move |client| async move {
+        let save = PendingSave { encoded, current, now };
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(save)
+            .is_some()
+        {
+            // The queued job has not started yet and will take this newer save.
+            return Ok(());
+        }
+        let pending = self.pending.clone();
+        let queued = self.pg.submit(move |client| async move {
+            // The guard is dropped here, before any await.
+            let taken = pending.lock().unwrap_or_else(PoisonError::into_inner).take();
+            let Some(PendingSave { encoded, current, now }) = taken else {
+                return;
+            };
             let result = async {
                 let client = client?;
                 let stale: Vec<(CooldownKey, DateTime<Utc>)> = previous
@@ -605,6 +635,10 @@ impl cpa_server::cooldown_store::Backend for PgCooldown {
                 tracing::warn!(%error, "failed to persist cooldown state");
             }
         });
+        if !queued {
+            // Nothing will take it: the next save starts a new job.
+            self.pending.lock().unwrap_or_else(PoisonError::into_inner).take();
+        }
         Ok(())
     }
 }
@@ -641,5 +675,38 @@ mod tests {
         assert_eq!(clean(Path::new("../x")), PathBuf::from("../x"));
         assert_eq!(clean(Path::new("/../x")), PathBuf::from("/x"));
         assert_eq!(clean(Path::new("")), PathBuf::from("."));
+    }
+
+    /// cliproxy-rs-7ea.22: cooldown saves waiting for a stalled worker coalesce into
+    /// one queued job holding the newest set; a save that finds the queue full is
+    /// dropped and leaves nothing pending, so the next one queues again.
+    #[test]
+    fn queued_cooldown_saves_coalesce() {
+        use cpa_server::cooldown_store::Backend;
+        let record = |id: &str| Record {
+            auth_id: id.to_owned(),
+            ..Record::default()
+        };
+        let (pg, _queue) = Pg::stalled(2);
+        let backend = PgCooldown {
+            pg: pg.clone(),
+            table: "cooldown_store".into(),
+            previous: Arc::default(),
+            pending: Arc::default(),
+        };
+        for id in ["a", "b", "c"] {
+            backend.save(vec![record(id)], SystemTime::now()).unwrap();
+        }
+        assert_eq!(pg.queued(), 1);
+        let pending = backend.pending.lock().unwrap();
+        let keys: Vec<&CooldownKey> = pending.as_ref().unwrap().current.keys().collect();
+        assert_eq!(keys, vec![&("c".to_owned(), String::new())]);
+        drop(pending);
+
+        assert!(pg.submit(|_| async {}));
+        backend.pending.lock().unwrap().take();
+        backend.save(vec![record("d")], SystemTime::now()).unwrap();
+        assert_eq!(pg.queued(), 2);
+        assert!(backend.pending.lock().unwrap().is_none());
     }
 }

@@ -71,6 +71,9 @@ struct Relay {
     body: ExecStream,
     reverse: Arc<Reverse>,
     line: BytesMut,
+    /// Bytes of `line` already searched for a newline, so a long line arriving in many
+    /// chunks is scanned once instead of again from its start for every chunk.
+    scanned: usize,
     event: BytesMut,
     ready: VecDeque<Result<Bytes, ExecError>>,
     message_id: String,
@@ -125,6 +128,7 @@ impl Relay {
 
     fn take_partial(&mut self) {
         let mut partial = std::mem::take(&mut self.line);
+        self.scanned = 0;
         if partial.is_empty() {
             return;
         }
@@ -167,7 +171,13 @@ impl Relay {
 
     fn chunk(&mut self, chunk: &[u8]) {
         self.line.extend_from_slice(chunk);
-        while let Some(pos) = self.line.iter().position(|b| *b == b'\n') {
+        loop {
+            let from = self.scanned.min(self.line.len());
+            let Some(found) = self.line[from..].iter().position(|b| *b == b'\n') else {
+                break;
+            };
+            let pos = from + found;
+            self.scanned = 0;
             // bufio.Scanner holds at most MAX_LINE bytes: the line and its newline must fit.
             if pos + 1 > MAX_LINE {
                 self.fail(super::plain_error("bufio.Scanner: token too long"));
@@ -182,6 +192,7 @@ impl Relay {
                 return;
             }
         }
+        self.scanned = self.line.len();
         if self.line.len() > MAX_LINE {
             self.fail(super::plain_error("bufio.Scanner: token too long"));
         }
@@ -246,6 +257,7 @@ fn relay_with(
         body,
         reverse,
         line: BytesMut::new(),
+        scanned: 0,
         event: BytesMut::new(),
         ready: VecDeque::new(),
         message_id: String::new(),
@@ -349,6 +361,78 @@ mod tests {
 
     fn chunks(items: Vec<Result<&'static [u8], ExecError>>) -> ExecStream {
         futures_util::stream::iter(items.into_iter().map(|r| r.map(Bytes::from_static))).boxed()
+    }
+
+    fn bare_relay() -> Relay {
+        Relay {
+            body: futures_util::stream::empty().boxed(),
+            reverse: Arc::default(),
+            line: BytesMut::new(),
+            scanned: 0,
+            event: BytesMut::new(),
+            ready: VecDeque::new(),
+            message_id: String::new(),
+            completed: false,
+            finished: false,
+            eager_terminal: false,
+            done: Some(Box::new(|_| {})),
+            usage: Default::default(),
+            capture: Default::default(),
+        }
+    }
+
+    /// A long line split over many chunks is searched once: the cursor covers every
+    /// buffered byte after each chunk, so no chunk rescans the line from its start.
+    /// Lines, CRLF (also with the CR and LF in different chunks) and the event
+    /// boundaries come out as with one chunk.
+    #[test]
+    fn long_lines_split_into_many_chunks_are_scanned_once() {
+        let long = "x".repeat(200_000);
+        let input = format!("event: a\r\ndata: {long}\r\n\r\nevent: b\ndata: {{}}\r\n\n");
+        let whole = {
+            let mut relay = bare_relay();
+            relay.chunk(input.as_bytes());
+            relay.ready.drain(..).map(Result::unwrap).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            whole,
+            [
+                Bytes::from(format!("event: a\ndata: {long}\n\n")),
+                Bytes::from_static(b"event: b\ndata: {}\n\n"),
+            ]
+        );
+        for size in [1, 7, 4096] {
+            let mut relay = bare_relay();
+            let mut out = Vec::new();
+            for piece in input.as_bytes().chunks(size) {
+                relay.chunk(piece);
+                assert_eq!(relay.scanned, relay.line.len(), "chunk size {size}");
+                out.extend(relay.ready.drain(..).map(Result::unwrap));
+            }
+            assert_eq!(out, whole, "chunk size {size}");
+        }
+        // The CR ends one chunk and its LF starts the next.
+        let mut relay = bare_relay();
+        for piece in [b"data: 1\r".as_slice(), b"\ndata: 2\r", b"\n\r", b"\n"] {
+            relay.chunk(piece);
+        }
+        let out: Vec<_> = relay.ready.drain(..).map(Result::unwrap).collect();
+        assert_eq!(out, [Bytes::from_static(b"data: 1\ndata: 2\n\n")]);
+    }
+
+    /// MAX_LINE still applies to a line assembled from many chunks.
+    #[test]
+    fn a_line_over_max_line_fails_across_chunks() {
+        let mut relay = bare_relay();
+        let piece = vec![b'x'; MAX_LINE / 4];
+        for _ in 0..4 {
+            relay.chunk(&piece);
+            assert!(relay.ready.is_empty());
+        }
+        relay.chunk(b"x");
+        let error = relay.ready.pop_front().unwrap().unwrap_err();
+        assert_eq!(error.body.as_ref(), b"bufio.Scanner: token too long");
+        assert!(relay.finished);
     }
 
     /// Request logs: every scanner line before restore, then Go's

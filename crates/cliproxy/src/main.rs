@@ -778,6 +778,9 @@ mod heap_trim {
 }
 
 async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String)>) -> anyhow::Result<()> {
+    for warning in secret_flag_warnings(&args) {
+        tracing::warn!("{warning}");
+    }
     // An explicit remote URL makes `-tui` a pure management client: it needs no local
     // config, store or Home bootstrap (Go loads them first and can fail or wait there).
     // Login, import and plugin flags still run first, as in Go.
@@ -1048,9 +1051,38 @@ impl QuietStdio {
     }
 }
 
+/// A random local management password for the standalone TUI: 16 bytes from the OS,
+/// hex. Go uses `tui-<pid>-<nanos>`, which any local process can reconstruct from
+/// `/proc/<pid>/stat` (and then lock the owner out through the failed-login ban).
+fn tui_password() -> String {
+    let mut bytes = [0u8; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        // ponytail: without OS randomness there is nothing better than Go's value.
+        tracing::warn!("no OS randomness for the TUI password ({error}); using a predictable one");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        return format!("tui-{}-{nanos}", std::process::id());
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Warnings for secrets passed as flags: a command line is visible to every local user
+/// (`ps`, `/proc/<pid>/cmdline`, WMI `Win32_Process.CommandLine`).
+fn secret_flag_warnings(args: &Args) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if !args.password.is_empty() {
+        warnings.push("-password is visible in process listings; prefer the MANAGEMENT_PASSWORD environment variable");
+    }
+    if !args.home_jwt.trim().is_empty() {
+        warnings.push("-home-jwt is visible in process listings; prefer the HOME_JWT environment variable");
+    }
+    warnings
+}
+
 /// Go's `-tui -standalone`: the server runs in this process with a local management
-/// password (`tui-<pid>-<nanos>` unless -password is set), its log lines feed the logs
-/// tab, and it stops after the TUI quits.
+/// password (random unless -password is set), its log lines feed the logs tab, and it
+/// stops after the TUI quits.
 async fn standalone_tui(
     config: Config,
     config_path: PathBuf,
@@ -1065,14 +1097,7 @@ async fn standalone_tui(
         Ok((guard, tty)) => (Some(guard), Box::new(tty)),
         Err(_) => (None, Box::new(io::stdout())),
     };
-    let password = if password.is_empty() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        format!("tui-{}-{nanos}", std::process::id())
-    } else {
-        password
-    };
+    let password = if password.is_empty() { tui_password() } else { password };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let shutdown = async {
         let _ = stopped.await;
@@ -1527,6 +1552,9 @@ async fn serve(
     }
     // Server.Stop closes the HTTP server without draining (http.Server.Close).
     drop(server);
+    // Results recorded by requests that finished during cleanup are written off the
+    // request path; write them before the process exits.
+    rt.flush_persistence().await;
     served
 }
 
@@ -1713,6 +1741,38 @@ mod tests {
                 .discover
         );
         assert!(parse(&["-plugin-mode", "fast", "-discover"]).is_err());
+    }
+
+    /// cliproxy-rs-7ea.38: the standalone TUI password is 16 random bytes in hex.
+    #[test]
+    fn the_tui_password_is_random_hex() {
+        let a = tui_password();
+        let b = tui_password();
+        assert_eq!(a.len(), 32, "{a}");
+        assert!(
+            a.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "{a}"
+        );
+        assert_ne!(a, b);
+    }
+
+    /// cliproxy-rs-7ea.38: secret flags draw a warning naming the environment variable.
+    #[test]
+    fn secret_flags_warn_once_each() {
+        let parse = |a: &[&str]| {
+            let flags = go_flags(
+                &Args::command(),
+                std::iter::once("cliproxy").chain(a.iter().copied()).map(String::from),
+                &(),
+            )
+            .unwrap();
+            Args::try_parse_from(flags).unwrap()
+        };
+        assert!(secret_flag_warnings(&parse(&[])).is_empty());
+        let warnings = secret_flag_warnings(&parse(&["-password", "fake-local", "-home-jwt", "fake-jwt"]));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("MANAGEMENT_PASSWORD") && warnings[1].contains("HOME_JWT"));
+        assert!(!warnings.iter().any(|w| w.contains("fake-")), "never echoes the secret");
     }
 
     #[test]

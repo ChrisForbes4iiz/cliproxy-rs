@@ -62,7 +62,9 @@ pub fn go_remarshal_object(
     json: &str,
     edit: impl FnOnce(&mut std::collections::BTreeMap<String, String>) -> bool,
 ) -> Option<String> {
-    if !gjson::valid(json) {
+    // encoding/json's check: gjson's grammar plus the 10000-level nesting limit, walked
+    // iteratively (the vendor validator recurses once per level on a client body).
+    if !gj::std_valid(json.as_bytes()) {
         return None;
     }
     let root = gjson::parse(json);
@@ -140,5 +142,77 @@ mod tests {
         assert_eq!(out, r#"{"ab":"\u003cx\u003e","z":{"k":1}}"#);
         assert!(go_remarshal_object("[1]", |_| true).is_none());
         assert!(go_remarshal_object(r#"{"a":1} x"#, |_| true).is_none());
+    }
+
+    /// A client body nested far deeper than any stack is rejected like any invalid body,
+    /// on the default test thread stack: validation walks it without recursion. Go's
+    /// json.Unmarshal stops at 10000 levels, so 10000 decodes and 10001 does not.
+    #[test]
+    fn remarshal_rejects_deep_bodies_without_recursion() {
+        let open = "[".repeat(200_000);
+        assert!(go_remarshal_object(&open, |_| true).is_none());
+        assert!(go_remarshal_object(&format!("{{\"a\":{open}"), |_| true).is_none());
+        let closed = format!("{{\"a\":{open}{}}}", "]".repeat(200_000));
+        assert!(go_remarshal_object(&closed, |_| true).is_none());
+        assert!(go_remarshal_object(r#"{"a":1"#, |_| true).is_none());
+        let nested = |n: usize| format!("{{\"a\":{}{}}}", "[".repeat(n), "]".repeat(n));
+        assert!(go_remarshal_object(&nested(9_999), |_| true).is_some());
+        assert!(go_remarshal_object(&nested(10_000), |_| true).is_none());
+    }
+
+    /// The iterative validator accepts exactly what the vendor gjson validator accepts.
+    #[test]
+    fn iterative_validator_agrees_with_vendor_gjson() {
+        let cases = [
+            "",
+            " ",
+            "1",
+            "-",
+            "-0",
+            "-01",
+            "0.",
+            "0.5",
+            "1e",
+            "1e+",
+            "1E-2",
+            "01",
+            "true",
+            "tru",
+            "null",
+            "nul",
+            "false",
+            "\"x\"",
+            "\"x",
+            "\"\\u00e9\"",
+            "\"\\u00g9\"",
+            "\"\\q\"",
+            "\"\t\"",
+            "[]",
+            "[ ]",
+            "[1,]",
+            "[,1]",
+            "[1 2]",
+            "[1,2]",
+            "{}",
+            "{ }",
+            "{\"a\"}",
+            "{\"a\":}",
+            "{\"a\":1,}",
+            "{\"a\":1 \"b\":2}",
+            "{\"a\":1,\"b\":[{}]}",
+            "{1:2}",
+            "[[[]]]",
+            "[[[]]",
+            "{\"a\":{\"b\":{}}}",
+            " {\"a\" : [ 1 , { } ] } ",
+            "1 2",
+            "[] x",
+            "{\"a\":1}\n",
+            "\u{feff}{}",
+            "{\"é\":\"ü\"}",
+        ];
+        for case in cases {
+            assert_eq!(gj::valid(case.as_bytes()), gjson::valid(case), "{case:?}");
+        }
     }
 }

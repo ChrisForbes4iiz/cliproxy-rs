@@ -39,7 +39,9 @@ fn error(status: u16, message: &str) -> Response {
 fn routing(body: &[u8]) -> (String, String) {
     let (mut id, mut model) = (String::new(), String::new());
     let text = String::from_utf8_lossy(body);
-    if !gjson::valid(&text) {
+    // cpa_common's validator is iterative: gjson's recurses once per nesting level, and a
+    // deep client body would overflow the worker's fixed native stack.
+    if !cpa_common::json::valid(text.as_bytes()) {
         return (id, model);
     }
     let root = gjson::parse(&text);

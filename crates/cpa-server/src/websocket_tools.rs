@@ -240,7 +240,7 @@ fn metadata_string(raw: &str) -> String {
 /// `repairResponsesWebsocketToolCallsWithCachesMode` without recording. `None` when the
 /// payload stays unchanged.
 fn repair(key: &str, payload: &str, turn: Option<&mut TurnCache>) -> Option<String> {
-    if !gjson::valid(payload) {
+    if !cpa_common::json::valid(payload.as_bytes()) {
         return None;
     }
     let root = gjson::parse(payload);

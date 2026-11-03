@@ -27,6 +27,91 @@ const GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const AUTHOR_NAME: &str = "CLIProxyAPI";
 const AUTHOR_EMAIL: &str = "cliproxy@local";
+/// Every git invocation is killed after this long. Go's go-git calls run under
+/// `context.Background()` (internal/store/gitstore.go), so there is no Go deadline to
+/// match; the store holds the persist lock while git runs, and a stalled fetch or push
+/// must not queue every later save forever. The store repository is a few small files
+/// with squashed history, so two minutes covers a slow network with a wide margin.
+const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Whether a path from the remote's tree (`ls-tree`, `diff --name-only`) may be joined to
+/// the working tree. Git's own checkout refuses the rest, which leaves them "missing",
+/// and restoring them by hand would write outside the repository or into `.git` (a
+/// `.git/config` with `core.fsmonitor` runs a command on the next git call). `.git` is
+/// compared with Go's case folding plus NTFS's trailing dots and spaces and its short
+/// name, since Windows and macOS file systems fold case.
+fn safe_tree_path(path: &str) -> bool {
+    !crate::escapes_root(path)
+        && path
+            .split('/')
+            .all(|segment| !segment.trim_end_matches(['.', ' ']).go_eq_fold(".git") && !segment.go_eq_fold("git~1"))
+}
+
+/// `child`'s output, or an error once `timeout` passes, after killing it.
+// ponytail: kills git itself, not a helper it started (git-remote-https, ssh); the
+// helper loses its parent and exits on the closed pipe. The reader threads of a killed
+// child are detached rather than joined, so a helper holding the pipe open cannot block
+// the caller. A process group kill would need libc.
+fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> std::io::Result<Output> {
+    use std::io::Read;
+    fn reader(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    }
+    let stdout = reader(child.stdout.take());
+    let stderr = reader(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("timed out after {}s", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(pause.min(deadline - now));
+        pause = (pause * 2).min(Duration::from_millis(50));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// `cmd` run to completion like `Command::output`, killed after `timeout`. Unlike
+/// `output`, `spawn` inherits stdout and stderr, so the caller sets both (piped to
+/// capture them).
+fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    wait_with_timeout(cmd.stdin(Stdio::null()).spawn()?, timeout)
+}
+
+/// A branch name taken from the remote (`ls-remote --symref`) before it reaches
+/// `git checkout`: a name such as `--orphan` would be parsed as an option. A subset of
+/// `git check-ref-format --branch`, enough to keep it a plain name.
+fn valid_remote_branch(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '/', '.'])
+        && !name.ends_with(['/', '.'])
+        && !name.ends_with(".lock")
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name
+            .chars()
+            .any(|c| c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+}
 
 pub struct GitStore {
     remote: String,
@@ -284,6 +369,9 @@ impl GitStore {
             .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
             .env("GIT_COMMITTER_NAME", AUTHOR_NAME)
             .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL);
+        // Fetched objects are checked (tree entries such as `.git` or `..` are refused);
+        // go-git has no such check, but the store only ever holds plain files.
+        let mut config: Vec<(&str, String)> = vec![("fetch.fsckObjects", "true".to_owned())];
         // Go `gitClientOptions`: HTTP basic auth, user "git" when only a token is set.
         // Passed through the environment so it never appears in a process listing.
         if !self.username.is_empty() || !self.password.is_empty() {
@@ -293,18 +381,29 @@ impl GitStore {
                 &self.username
             };
             let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{}", self.password));
-            cmd.env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.extraHeader")
-                .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {token}"));
+            config.push(("http.extraHeader", format!("Authorization: Basic {token}")));
+            // git sends an extra header on every request of the invocation, including
+            // after a redirect to another host; Go's net/http drops Authorization there.
+            config.push(("http.followRedirects", "false".to_owned()));
+        }
+        cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
+        for (i, (key, value)) in config.into_iter().enumerate() {
+            cmd.env(format!("GIT_CONFIG_KEY_{i}"), key)
+                .env(format!("GIT_CONFIG_VALUE_{i}"), value);
         }
         cmd
     }
 
     fn run_in(&self, dir: &Path, args: &[&str]) -> Result<Output> {
-        let output = self
-            .command(dir, args)
-            .output()
-            .map_err(|e| anyhow!("git token store: run git: {e} (is git installed?)"))?;
+        let mut cmd = self.command(dir, args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = output_with_timeout(&mut cmd, GIT_TIMEOUT).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                anyhow!("git token store: git {}: {e}", args.first().unwrap_or(&""))
+            } else {
+                anyhow!("git token store: run git: {e} (is git installed?)")
+            }
+        })?;
         Ok(output)
     }
 
@@ -379,7 +478,7 @@ impl GitStore {
                     self.git(&["symbolic-ref", "HEAD", &format!("refs/heads/{}", self.branch)])
                         .with_context(|| format!("git token store: set head to branch {}", self.branch))?;
                 }
-                self.git(&["remote", "add", "origin", &self.remote])
+                self.git(&["remote", "add", "--", "origin", &self.remote])
                     .context("git token store: configure remote")?;
                 for dir in ["auths", "config"] {
                     let keep = self.repo.join(dir).join(".gitkeep");
@@ -420,6 +519,9 @@ impl GitStore {
     fn tighten_permissions(&self) -> Result<()> {
         let listed = self.git(&["ls-files", "-z"])?;
         for path in split_nul(&listed) {
+            if !safe_tree_path(&path) {
+                continue;
+            }
             let full = self.repo.join(&path);
             if full.is_file() {
                 crate::private_fs::restrict(&full)?;
@@ -445,7 +547,7 @@ impl GitStore {
             return Ok(());
         }
         if self.rev(&reference)?.is_some() {
-            self.git(&["checkout", "-q", &target])
+            self.git(&["checkout", "-q", &target, "--"])
                 .with_context(|| format!("git token store: checkout branch {target}"))?;
             return Ok(());
         }
@@ -454,13 +556,29 @@ impl GitStore {
             self.git(&["fetch", "-q", "origin"])
                 .with_context(|| format!("git token store: checkout branch {target}: sync remote refs"))?;
         }
-        self.git(&["checkout", "-q", "-b", &target, "--track", &format!("origin/{target}")])
-            .with_context(|| format!("git token store: checkout branch {target}"))?;
+        self.git(&[
+            "checkout",
+            "-q",
+            "-b",
+            &target,
+            "--track",
+            &format!("origin/{target}"),
+            "--",
+        ])
+        .with_context(|| format!("git token store: checkout branch {target}"))?;
         Ok(())
     }
 
     /// Go `resolveRemoteDefaultBranch`: origin's HEAD target.
     fn remote_default_branch(&self) -> Result<String> {
+        let branch = self.remote_default_branch_name()?;
+        if !valid_remote_branch(&branch) {
+            bail!("resolve remote default: remote default branch {branch:?} is not a valid branch name");
+        }
+        Ok(branch)
+    }
+
+    fn remote_default_branch_name(&self) -> Result<String> {
         let listed = self.git(&["ls-remote", "--symref", "origin", "HEAD"])?;
         let text = String::from_utf8_lossy(&listed);
         for line in text.lines() {
@@ -567,6 +685,10 @@ impl GitStore {
             }
         }
         for path in &changed {
+            if !safe_tree_path(path) {
+                tracing::warn!(path = %path, "git token store: skip remote path outside the working tree");
+                continue;
+            }
             let destination = self.repo.join(path);
             match self.blob(remote, path)? {
                 Some(contents) => write_0600(&destination, &contents)?,
@@ -606,6 +728,10 @@ impl GitStore {
         }
         let tracked = split_nul(&self.git(&["ls-tree", "-r", "-z", "--name-only", "HEAD"])?);
         for path in tracked {
+            if !safe_tree_path(&path) {
+                tracing::warn!(path = %path, "git token store: skip tracked path outside the working tree");
+                continue;
+            }
             let destination = self.repo.join(&path);
             if destination.symlink_metadata().is_ok() {
                 continue;
@@ -625,12 +751,9 @@ impl GitStore {
             return Ok(());
         }
         let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        let archived = self
-            .command(&self.repo, &["archive", "--format=tar", &head])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| anyhow!("run git: {e}"))?;
+        let mut archive = self.command(&self.repo, &["archive", "--format=tar", &head]);
+        archive.stdout(Stdio::null()).stderr(Stdio::piped());
+        let archived = output_with_timeout(&mut archive, GIT_TIMEOUT).map_err(|e| anyhow!("run git: {e}"))?;
         if !archived.status.success() {
             bail!(
                 "object not found: {}",
@@ -1031,3 +1154,54 @@ pub(crate) async fn blocking<T: Send + 'static>(work: impl FnOnce() -> Result<T>
 #[cfg(all(test, unix))]
 #[path = "git_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod path_tests {
+    /// cliproxy-rs-7ea.3: every hostile tree path shape is refused before a join.
+    #[test]
+    fn hostile_tree_paths_are_refused() {
+        for path in [
+            "",
+            "/etc/passwd",
+            "../outside.json",
+            "auths/../../outside.json",
+            r"auths\..\x.json",
+            "C:x.json",
+            "c:/x.json",
+            ".git/config",
+            ".GIT/config",
+            ".Git/hooks/post-checkout",
+            ".git./config",
+            ".git /config",
+            "GIT~1/config",
+            "auths/.git/config",
+            ".git",
+        ] {
+            assert!(!super::safe_tree_path(path), "{path:?}");
+        }
+        for path in [
+            "auths/a.json",
+            "config/config.yaml",
+            ".gitkeep",
+            "auths/.gitkeep",
+            ".github/x",
+            "a..b",
+        ] {
+            assert!(super::safe_tree_path(path), "{path:?}");
+        }
+    }
+
+    /// cliproxy-rs-7ea.23: a remote default branch must stay a plain name.
+    #[test]
+    fn remote_branch_names_are_validated() {
+        for name in ["main", "master", "release/2026", "feature-x", "v1.2"] {
+            assert!(super::valid_remote_branch(name), "{name:?}");
+        }
+        for name in [
+            "", "-x", "--orphan", "a..b", "a b", "a~1", "a^", "a:b", "a?", "a*", "a[", r"a\b", "a@{1}", "/a", "a/",
+            "a.", "a.lock", ".a", "a//b", "a\nb",
+        ] {
+            assert!(!super::valid_remote_branch(name), "{name:?}");
+        }
+    }
+}

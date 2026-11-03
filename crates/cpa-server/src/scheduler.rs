@@ -679,6 +679,14 @@ const PROBE_HOLD: Duration = Duration::from_secs(30);
 const MAX_TRUST_WINDOW: u32 = 20;
 
 impl Cooldown {
+    /// An ended cooldown nothing reads any more: not a quota (whose level the next
+    /// backoff continues from), no trust state (a bounded window's count or probe), and
+    /// no live quota block under it. Reconcile drops these; picks, waits, records and
+    /// backoff are the same without them.
+    fn inert(&self, now: Instant) -> bool {
+        self.deadline <= now && !self.quota && self.trust == Trust::default() && self.quota_block(now).is_none()
+    }
+
     /// When this entry stops blocking picks: its deadline, or an unanswered probe.
     fn until(&self, now: Instant) -> Option<Instant> {
         let live = (self.deadline > now).then_some(self.deadline);
@@ -695,12 +703,93 @@ impl Cooldown {
     }
 }
 
+/// Cooldowns by credential ID, then model key (empty for the credential-wide one), as
+/// Go keeps model states per auth. Per-credential work (a result's bookkeeping, its
+/// records, a reset) touches only that credential's entries, and a lookup needs no owned
+/// key.
+#[derive(Default)]
+pub(crate) struct Cooldowns(HashMap<String, HashMap<String, Cooldown>>);
+
+impl Cooldowns {
+    pub(crate) fn get(&self, id: &str, model: &str) -> Option<&Cooldown> {
+        self.0.get(id)?.get(model)
+    }
+
+    pub(crate) fn get_mut(&mut self, id: &str, model: &str) -> Option<&mut Cooldown> {
+        self.0.get_mut(id)?.get_mut(model)
+    }
+
+    pub(crate) fn insert(&mut self, (id, model): (String, String), cooldown: Cooldown) {
+        self.0.entry(id).or_default().insert(model, cooldown);
+    }
+
+    pub(crate) fn remove(&mut self, id: &str, model: &str) {
+        if let Some(models) = self.0.get_mut(id) {
+            models.remove(model);
+            if models.is_empty() {
+                self.0.remove(id);
+            }
+        }
+    }
+
+    /// The cooldowns of credential `id`, by model key.
+    fn of(&self, id: &str) -> impl Iterator<Item = (&String, &Cooldown)> {
+        self.0.get(id).into_iter().flatten()
+    }
+
+    fn of_mut(&mut self, id: &str) -> impl Iterator<Item = (&String, &mut Cooldown)> {
+        self.0.get_mut(id).into_iter().flatten()
+    }
+
+    /// Drops every cooldown of `id`, returning their model keys.
+    fn remove_all(&mut self, id: &str) -> Vec<String> {
+        self.0
+            .remove(id)
+            .map(|models| models.into_keys().collect())
+            .unwrap_or_default()
+    }
+
+    /// Keeps the cooldowns of `id` that `keep` accepts.
+    fn retain_of(&mut self, id: &str, mut keep: impl FnMut(&str, &mut Cooldown) -> bool) {
+        if let Some(models) = self.0.get_mut(id) {
+            models.retain(|model, c| keep(model.as_str(), c));
+            if models.is_empty() {
+                self.0.remove(id);
+            }
+        }
+    }
+
+    /// Keeps the credentials `keep` accepts, with all their cooldowns, and of those the
+    /// entries `entry` accepts. Returns whether any entry went.
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool, mut entry: impl FnMut(&Cooldown) -> bool) -> bool {
+        let mut changed = false;
+        self.0.retain(|id, models| {
+            if !keep(id.as_str()) {
+                changed = true;
+                return false;
+            }
+            let before = models.len();
+            models.retain(|_, c| entry(c));
+            changed |= models.len() != before;
+            !models.is_empty()
+        });
+        changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .flat_map(|(id, models)| models.keys().map(move |model| (id.as_str(), model.as_str())))
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Scheduler {
     rotations: HashMap<(String, String), Rotation>,
     /// Mixed-provider round-robin cursors (Go `mixedCursors`).
     cursors: HashMap<(String, String), usize>,
-    pub(crate) cooldowns: HashMap<(String, String), Cooldown>,
+    pub(crate) cooldowns: Cooldowns,
     /// Session affinity bindings (Go `SessionAffinitySelector.cache`).
     affinity: crate::affinity::Cache,
     /// Bindings of requests without an explicit session (Go
@@ -838,7 +927,7 @@ impl Scheduler {
         let model = canonical_model(model);
         [model, ""].into_iter().any(|m| {
             self.cooldowns
-                .get(&(c.id.clone(), m.to_owned()))
+                .get(&c.id, m)
                 .is_some_and(|s| s.quota && s.until(now).is_some())
         })
     }
@@ -849,7 +938,7 @@ impl Scheduler {
             .into_iter()
             .filter_map(|model| {
                 self.cooldowns
-                    .get(&(c.id.clone(), model.to_owned()))
+                    .get(&c.id, model)
                     .and_then(|s| s.until(now)?.checked_duration_since(now))
                     .filter(|d| !d.is_zero())
             })
@@ -859,19 +948,17 @@ impl Scheduler {
     /// Whether a cooldown deadline (not a probe reservation) is ahead for `model`.
     pub fn cooling(&self, c: &Credential, model: &str, now: Instant) -> bool {
         let model = canonical_model(model);
-        [model, ""].into_iter().any(|m| {
-            self.cooldowns
-                .get(&(c.id.clone(), m.to_owned()))
-                .is_some_and(|s| s.deadline > now)
-        })
+        [model, ""]
+            .into_iter()
+            .any(|m| self.cooldowns.get(&c.id, m).is_some_and(|s| s.deadline > now))
     }
 
     /// The last failure recorded for this credential and model, if any.
     pub fn last_error(&self, c: &Credential, model: &str) -> Option<&Cooldown> {
         let model = canonical_model(model);
         self.cooldowns
-            .get(&(c.id.clone(), model.to_owned()))
-            .or_else(|| self.cooldowns.get(&(c.id.clone(), String::new())))
+            .get(&c.id, model)
+            .or_else(|| self.cooldowns.get(&c.id, ""))
     }
 
     pub fn retry_eligible(&self, c: &Credential, model: &str, now: Instant) -> bool {
@@ -880,7 +967,7 @@ impl Scheduler {
         // for everyone, and holding requests to the window's end would release them
         // together as a burst of probes.
         [model, ""].into_iter().all(|model| {
-            self.cooldowns.get(&(c.id.clone(), model.to_owned())).is_none_or(|s| {
+            self.cooldowns.get(&c.id, model).is_none_or(|s| {
                 let probing = s.trust.probe.is_some_and(|p| p > now);
                 !probing && (s.deadline <= now || (retry_status(s.status) && !s.trust.bounded))
             })
@@ -905,7 +992,7 @@ impl Scheduler {
         let model = canonical_model(model);
         let mut credential_window = None;
         for m in [model, ""] {
-            if let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned()))
+            if let Some(s) = self.cooldowns.get_mut(&c.id, m)
                 && s.trust.bounded
                 && s.deadline <= now
                 && !s.newer_than(picked)
@@ -917,8 +1004,8 @@ impl Scheduler {
             }
         }
         if let Some(ended) = credential_window {
-            for ((id, m), s) in &mut self.cooldowns {
-                if *id == c.id && !m.is_empty() && s.trust.bounded && s.deadline == ended && !s.newer_than(picked) {
+            for (m, s) in self.cooldowns.of_mut(&c.id) {
+                if !m.is_empty() && s.trust.bounded && s.deadline == ended && !s.newer_than(picked) {
                     s.trust.accept();
                 }
             }
@@ -944,7 +1031,7 @@ impl Scheduler {
         let model = canonical_model(model);
         let next = self.generation.wrapping_add(1);
         for m in [model, ""] {
-            if let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned()))
+            if let Some(s) = self.cooldowns.get_mut(&c.id, m)
                 && s.trust.bounded
                 && s.deadline <= now
             {
@@ -1342,9 +1429,10 @@ impl Scheduler {
             if action.cooldown || model.is_empty() {
                 let disabled = policy.cooling_disabled(c) && !action.force_cooldown;
                 let all = crate::classify::credential_scoped(error) && !disabled;
-                for ((id, m), s) in &mut self.cooldowns {
-                    if *id == c.id && (all || m == model) {
-                        s.recorded = self.dispatched;
+                let dispatched = self.dispatched;
+                for (m, s) in self.cooldowns.of_mut(&c.id) {
+                    if all || m == model {
+                        s.recorded = dispatched;
                     }
                 }
             }
@@ -1362,11 +1450,10 @@ impl Scheduler {
         seq: u64,
         now: Instant,
     ) {
-        let key = (c.id.clone(), model.to_owned());
         // Any answer ends a probe reservation on the keys it touches, except one taken
         // after its lease was picked (a later probe's, once this one's hold lapsed).
         for m in [model, ""] {
-            if let Some(s) = self.cooldowns.get_mut(&(c.id.clone(), m.to_owned()))
+            if let Some(s) = self.cooldowns.get_mut(&c.id, m)
                 && !s.newer_than(picked)
             {
                 s.trust.probe = None;
@@ -1375,8 +1462,11 @@ impl Scheduler {
         let error = match outcome {
             Outcome::Success => {
                 // Active credential quota survives success on an in-flight sibling.
-                let global = (c.id.clone(), String::new());
-                if self.cooldowns.get(&global).is_some_and(|s| s.quota && s.deadline > now) {
+                if self
+                    .cooldowns
+                    .get(&c.id, "")
+                    .is_some_and(|s| s.quota && s.deadline > now)
+                {
                     return;
                 }
                 // A live cooldown recorded after this attempt was dispatched: the success
@@ -1385,7 +1475,7 @@ impl Scheduler {
                 if seq > 0
                     && self
                         .cooldowns
-                        .get(&key)
+                        .get(&c.id, model)
                         .is_some_and(|s| s.deadline > now && s.recorded >= seq)
                 {
                     return;
@@ -1394,27 +1484,23 @@ impl Scheduler {
                 // window's own probe.
                 if let Some(ended) = self
                     .cooldowns
-                    .get(&global)
+                    .get(&c.id, "")
                     .filter(|s| s.deadline <= now && !s.newer_than(picked))
                     .map(|s| s.deadline)
                 {
-                    self.cooldowns.remove(&global);
+                    self.cooldowns.remove(&c.id, "");
                     // The credential recovered: model keys that a credential-wide window
                     // escalated forget it too (their Go state is left as Go keeps it). A
                     // model's own ended bounded window still waits for its probe, and one
                     // a newer probe reserved or answered keeps its state.
-                    for ((id, _), s) in &mut self.cooldowns {
-                        if *id == c.id
-                            && s.deadline <= now
-                            && (!s.trust.bounded || s.deadline == ended)
-                            && !s.newer_than(picked)
-                        {
+                    for (_, s) in self.cooldowns.of_mut(&c.id) {
+                        if s.deadline <= now && (!s.trust.bounded || s.deadline == ended) && !s.newer_than(picked) {
                             s.trust = Trust::default();
                         }
                     }
                 }
-                if !self.cooldowns.get(&key).is_some_and(|s| s.newer_than(picked)) {
-                    self.cooldowns.remove(&key);
+                if !self.cooldowns.get(&c.id, model).is_some_and(|s| s.newer_than(picked)) {
+                    self.cooldowns.remove(&c.id, model);
                 }
                 return;
             }
@@ -1429,13 +1515,15 @@ impl Scheduler {
         let key = if credential_quota {
             (c.id.clone(), String::new())
         } else {
-            key
+            (c.id.clone(), model.to_owned())
         };
         // A forced cooldown applies the normal policy even when cooling is disabled.
         let disabled = policy.cooling_disabled(c) && !action.force_cooldown;
         let status = crate::classify::go_status(error);
+        // The whole text classifies the failure; the entry keeps a bounded copy.
         let text = crate::classify::error_text(error);
-        let prev = self.cooldowns.get(&key);
+        let kept = || crate::classify::kept_error_text(&text);
+        let prev = self.cooldowns.get(&key.0, &key.1);
         // An ended bounded window that a newer probe took over, or that opened after this
         // attempt was picked, waits for its own probe: this older answer neither renews
         // nor replaces it. Inside a live window the handling below applies.
@@ -1494,9 +1582,9 @@ impl Scheduler {
                             let old = window.deadline;
                             let deadline = reset.map_or(old, |r| old.min(r));
                             let mut window_trust = window.trust;
-                            if let Some(slot) = self.cooldowns.get_mut(&key) {
+                            if let Some(slot) = self.cooldowns.get_mut(&key.0, &key.1) {
                                 slot.deadline = deadline;
-                                slot.error = text;
+                                slot.error = kept();
                                 slot.trust.stated = reset.or(slot.trust.stated);
                                 window_trust = slot.trust;
                             }
@@ -1504,8 +1592,8 @@ impl Scheduler {
                                 // Model keys that inherited this credential window (same
                                 // deadline, bounded) follow it when it moves up; longer
                                 // independent cooldowns stand.
-                                for ((id, m), state) in &mut self.cooldowns {
-                                    if *id == c.id && !m.is_empty() && state.trust.bounded && state.deadline == old {
+                                for (m, state) in self.cooldowns.of_mut(&c.id) {
+                                    if !m.is_empty() && state.trust.bounded && state.deadline == old {
                                         state.deadline = deadline;
                                         state.trust.stated = window_trust.stated;
                                         state.trust.window = state.trust.window.max(window_trust.window);
@@ -1534,8 +1622,8 @@ impl Scheduler {
                         // Go `quotaCooldownAfterFailure`: an active quota deadline is
                         // reused, not extended.
                         let deadline = prev.deadline;
-                        if let Some(slot) = self.cooldowns.get_mut(&key) {
-                            slot.error = text;
+                        if let Some(slot) = self.cooldowns.get_mut(&key.0, &key.1) {
+                            slot.error = kept();
                         }
                         if credential_quota {
                             self.extend_siblings(c, deadline, None, now);
@@ -1558,7 +1646,7 @@ impl Scheduler {
             d => d,
         };
         let Some(next) = duration.and_then(|d| now.checked_add(d)) else {
-            self.cooldowns.remove(&key);
+            self.cooldowns.remove(&key.0, &key.1);
             return;
         };
         let deadline = prev_live.map_or(next, |p| p.max(next));
@@ -1567,9 +1655,12 @@ impl Scheduler {
         // its saved record keeps the stated reset and count. Only bounded windows; Go's
         // own cooldowns merge as Go does.
         if prev_live == Some(deadline)
-            && let Some(slot) = self.cooldowns.get_mut(&key).filter(|s| s.quota && s.trust.bounded)
+            && let Some(slot) = self
+                .cooldowns
+                .get_mut(&key.0, &key.1)
+                .filter(|s| s.quota && s.trust.bounded)
         {
-            slot.error = text;
+            slot.error = kept();
             // Go's level still counts a Cloudflare challenge (unchanged for other causes).
             slot.level = level;
             return;
@@ -1603,7 +1694,7 @@ impl Scheduler {
             level,
             status: error.status,
             quota,
-            error: text.clone(),
+            error: kept(),
             since: SystemTime::now(),
             credential: false,
             trust: provenance(deadline),
@@ -1627,10 +1718,10 @@ impl Scheduler {
                 // credential's window is bounded: then the own deadline stands.
                 let own_deadline = self
                     .cooldowns
-                    .get(&own)
+                    .get(&c.id, model)
                     .filter(|s| s.deadline > now)
                     .map_or(deadline, |s| s.deadline);
-                let own_trust = self.cooldowns.get(&own).map(|s| s.trust).unwrap_or_default();
+                let own_trust = self.cooldowns.get(&c.id, model).map(|s| s.trust).unwrap_or_default();
                 let own_window = own_trust.window;
                 let mut own_state = state(own_deadline, own_reason);
                 if own_deadline != deadline {
@@ -1661,10 +1752,10 @@ impl Scheduler {
     fn extend_siblings(&mut self, c: &Credential, deadline: Instant, renews: Option<Instant>, now: Instant) {
         let (level, trust, status) = self
             .cooldowns
-            .get(&(c.id.clone(), String::new()))
+            .get(&c.id, "")
             .map_or((0, Trust::default(), 429), |s| (s.level, s.trust, s.status));
-        for ((id, model), state) in &mut self.cooldowns {
-            if *id != c.id || model.is_empty() {
+        for (model, state) in self.cooldowns.of_mut(&c.id) {
+            if model.is_empty() {
                 continue;
             }
             let copy = state.trust.bounded && (state.deadline == deadline || Some(state.deadline) == renews);
@@ -1692,13 +1783,7 @@ impl Scheduler {
     /// Clears every cooldown of one credential (Go `ResetQuota`), returning the models
     /// that were cooling.
     pub fn reset(&mut self, id: &str) -> Vec<String> {
-        let mut models: Vec<String> = self
-            .cooldowns
-            .keys()
-            .filter(|(cid, _)| cid == id)
-            .map(|(_, m)| m.clone())
-            .collect();
-        self.cooldowns.retain(|(cid, _), _| cid != id);
+        let mut models = self.cooldowns.remove_all(id);
         self.affinity.invalidate(id);
         self.lcp.invalidate(id);
         self.probes.remove(id);
@@ -1712,9 +1797,9 @@ impl Scheduler {
         use crate::cooldown_store::{LastError, Quota, Record};
         let mut out: Vec<Record> = self
             .cooldowns
-            .iter()
-            .filter(|((id, _), state)| *id == c.id && state.deadline > now)
-            .map(|((_, model), state)| {
+            .of(&c.id)
+            .filter(|(_, state)| state.deadline > now)
+            .map(|(model, state)| {
                 let at = wall + (state.deadline - now);
                 // Go's recovery time is the stated reset; the probe time is the retry.
                 let recover = state
@@ -1837,8 +1922,8 @@ impl Scheduler {
             s => u16::try_from(s).unwrap_or(0),
         };
         let key = (c.id.clone(), canonical_model(model).to_owned());
-        let recorded = self.cooldowns.get(&key).map_or(0, |prev| prev.recorded);
-        let prev = self.cooldowns.get(&key).filter(|prev| prev.deadline > now);
+        let recorded = self.cooldowns.get(&key.0, &key.1).map_or(0, |prev| prev.recorded);
+        let prev = self.cooldowns.get(&key.0, &key.1).filter(|prev| prev.deadline > now);
         let prev_wins = prev.is_some_and(|p| p.deadline > deadline);
         let deadline = prev.map_or(deadline, |prev| prev.deadline.max(deadline));
         let mut quota = (
@@ -1886,11 +1971,11 @@ impl Scheduler {
                 level: record.quota.backoff_level,
                 status,
                 quota,
-                error: if error.message.is_empty() {
-                    record.reason.clone()
+                error: crate::classify::kept_error_text(if error.message.is_empty() {
+                    &record.reason
                 } else {
-                    error.message
-                },
+                    &error.message
+                }),
                 since: record.updated_at.unwrap_or(wall),
                 credential,
                 trust,
@@ -1906,22 +1991,26 @@ impl Scheduler {
     /// Go `clearDisabledCooldownStates`: drops cooldowns of credentials that are disabled
     /// or whose cooling the policy disables. Returns whether anything was cleared.
     pub fn clear_disabled(&mut self, credentials: &[std::sync::Arc<Credential>], policy: &Policy) -> bool {
-        let before = self.cooldowns.len();
-        self.cooldowns.retain(|(id, _), _| {
-            credentials
-                .iter()
-                .find(|c| c.id == *id)
-                .is_none_or(|c| !c.disabled && !policy.cooling_disabled(c))
-        });
-        self.cooldowns.len() != before
+        // The first credential of each ID decides, as a search of the list would.
+        let mut by_id: HashMap<&str, &Credential> = HashMap::with_capacity(credentials.len());
+        for c in credentials {
+            by_id.entry(c.id.as_str()).or_insert(c);
+        }
+        self.cooldowns.retain(
+            |id| by_id.get(id).is_none_or(|c| !c.disabled && !policy.cooling_disabled(c)),
+            |_| true,
+        )
     }
 
+    /// Drops the state of credentials no longer in the set, and expired cooldowns that
+    /// no longer decide anything ([`Cooldown::inert`]).
     pub fn reconcile(&mut self, credentials: &[std::sync::Arc<Credential>]) {
-        self.cooldowns
-            .retain(|(id, _), _| credentials.iter().any(|c| c.id == *id));
-        self.affinity.retain(|id| credentials.iter().any(|c| c.id == id));
-        self.lcp.retain(|id| credentials.iter().any(|c| c.id == id));
-        self.probes.retain(|id, _| credentials.iter().any(|c| c.id == *id));
+        let ids: std::collections::HashSet<&str> = credentials.iter().map(|c| c.id.as_str()).collect();
+        let now = Instant::now();
+        self.cooldowns.retain(|id| ids.contains(id), |c| !c.inert(now));
+        self.affinity.retain(|id| ids.contains(id));
+        self.lcp.retain(|id| ids.contains(id));
+        self.probes.retain(|id, _| ids.contains(id.as_str()));
     }
 }
 
@@ -1954,9 +2043,9 @@ impl Scheduler {
     pub(crate) fn cooldowns_of(&self, id: &str, now: Instant) -> Vec<CooldownState> {
         let mut out: Vec<CooldownState> = self
             .cooldowns
-            .iter()
-            .filter(|((cid, _), s)| cid == id && (s.deadline > now || recover_after(s, now).is_some()))
-            .map(|((_, model), s)| CooldownState {
+            .of(id)
+            .filter(|(_, s)| s.deadline > now || recover_after(s, now).is_some())
+            .map(|(model, s)| CooldownState {
                 model: model.clone(),
                 remaining: s.deadline.saturating_duration_since(now),
                 recover_in: recover_after(s, now),
@@ -1971,14 +2060,9 @@ impl Scheduler {
 
     /// Clears every cooldown of one credential; returns the model keys that had one.
     pub(crate) fn reset_cooldowns(&mut self, id: &str) -> Vec<String> {
-        let mut models: Vec<String> = self
-            .cooldowns
-            .keys()
-            .filter(|(cid, model)| cid == id && !model.is_empty())
-            .map(|(_, model)| model.clone())
-            .collect();
+        let mut models = self.cooldowns.remove_all(id);
+        models.retain(|model| !model.is_empty());
         models.sort();
-        self.cooldowns.retain(|(cid, _), _| cid != id);
         // A reset credential is probed again under `soonest-reset`; affinity is kept.
         self.probes.remove(id);
         models
@@ -1995,13 +2079,13 @@ impl Scheduler {
     /// cooldowns do not keep.
     pub(crate) fn clear_unauthorized(&mut self, id: &str, now: Instant) -> bool {
         let mut changed = false;
-        self.cooldowns.retain(|(cid, model), c| {
+        self.cooldowns.retain_of(id, |model, c| {
             let error = c.error.to_ascii_lowercase();
             let unauthorized = c.status == 401
                 || error.contains("status 401")
                 || error.contains("401 unauthorized")
                 || (!model.is_empty() && error.contains("unauthorized"));
-            if cid != id || !unauthorized {
+            if !unauthorized {
                 return true;
             }
             changed = true;
@@ -2121,16 +2205,13 @@ mod tests {
             s.cooldowns.insert((id.into(), model.into()), c);
         }
         assert!(s.clear_unauthorized("a", now));
-        let mut left: Vec<_> = s.cooldowns.keys().map(|(id, m)| (id.as_str(), m.as_str())).collect();
+        let mut left: Vec<_> = s.cooldowns.keys().collect();
         left.sort();
         assert_eq!(left, [("a", ""), ("a", "403"), ("b", "401")]);
         for (status, error) in [(401, "x"), (403, "Status 401: revoked"), (403, "HTTP 401 Unauthorized")] {
             s.cooldowns.insert(("a".into(), String::new()), cooldown(status, error));
             assert!(s.clear_unauthorized("a", now), "{status} {error}");
-            assert!(
-                !s.cooldowns.contains_key(&("a".into(), String::new())),
-                "{status} {error}"
-            );
+            assert!(s.cooldowns.get("a", "").is_none(), "{status} {error}");
         }
         assert!(!s.clear_unauthorized("a", now), "nothing left to clear");
     }
@@ -2428,7 +2509,83 @@ mod tests {
     }
 
     fn entry<'a>(s: &'a Scheduler, c: &Credential, model: &str) -> &'a Cooldown {
-        &s.cooldowns[&(c.id.clone(), model.to_owned())]
+        s.cooldowns.get(&c.id, model).expect("a cooldown")
+    }
+
+    /// Reconcile drops the cooldowns of removed credentials and the expired entries
+    /// nothing reads. An expired quota (the next backoff continues from its level), an
+    /// expired entry with trust state (a bounded window's count) and live entries stay.
+    #[test]
+    fn reconcile_evicts_removed_credentials_and_inert_expired_entries() {
+        let cooldown = |deadline: Instant, quota: bool| Cooldown {
+            deadline,
+            level: 2,
+            status: if quota { 429 } else { 503 },
+            quota,
+            error: "x".into(),
+            since: SystemTime::now(),
+            credential: false,
+            trust: Trust::default(),
+            quota_kind: None,
+            quota_under: None,
+            recorded: 7,
+        };
+        let ended = Instant::now();
+        let live = ended + secs(600);
+        let mut windowed = cooldown(ended, false);
+        windowed.trust.window = Some(0);
+        let mut s = Scheduler::default();
+        for (id, model, c) in [
+            ("a", "ended-5xx", cooldown(ended, false)),
+            ("a", "ended-quota", cooldown(ended, true)),
+            ("a", "ended-window", windowed),
+            ("a", "live", cooldown(live, false)),
+            ("gone", "live", cooldown(live, false)),
+        ] {
+            s.cooldowns.insert((id.into(), model.into()), c);
+        }
+        let a = std::sync::Arc::new(cred("a", serde_json::json!({})));
+        s.reconcile(&[a]);
+        let mut left: Vec<_> = s.cooldowns.keys().collect();
+        left.sort();
+        assert_eq!(left, [("a", "ended-quota"), ("a", "ended-window"), ("a", "live")]);
+    }
+
+    /// A failure's whole text classifies it, but its cooldown keeps a bounded copy (a
+    /// Cloudflare page is tens of KB per credential and model).
+    #[test]
+    fn a_cooldown_keeps_a_bounded_copy_of_the_error() {
+        let c = cred("a", serde_json::json!({}));
+        let mut s = Scheduler::default();
+        let page = format!("<html>{}", "x".repeat(64 * 1024));
+        let failure = Outcome::Failure(ExecError::local(503, FailureScope::Model, page.clone()));
+        s.record(&c, "m", &failure, &Policy::default(), Instant::now());
+        let kept = &entry(&s, &c, "m").error;
+        assert_eq!(kept.len(), crate::classify::KEPT_ERROR_BYTES);
+        assert!(page.starts_with(kept.as_str()));
+    }
+
+    /// Per-credential bookkeeping stays per credential: another credential's entries
+    /// are untouched by a reset, and clear_disabled drops only the disabled one's.
+    #[test]
+    fn per_credential_operations_touch_only_that_credential() {
+        let p = Policy::default();
+        let (a, b) = (cred("a", serde_json::json!({})), cred("b", serde_json::json!({})));
+        let mut s = Scheduler::default();
+        let now = Instant::now();
+        for c in [&a, &b] {
+            s.record(c, "m", &unhinted(FailureScope::Model), &p, now);
+            s.record(c, "n", &unhinted(FailureScope::Model), &p, now);
+        }
+        assert_eq!(s.reset("a"), ["m", "n"]);
+        assert!(s.cooling(&b, "m", now) && s.cooling(&b, "n", now));
+        s.record(&a, "m", &unhinted(FailureScope::Model), &p, now);
+        let off = cred("b", serde_json::json!({"disabled": true}));
+        let set = [std::sync::Arc::new(a.clone()), std::sync::Arc::new(off)];
+        assert!(s.clear_disabled(&set, &p));
+        assert!(s.cooling(&a, "m", now));
+        assert!(!s.cooling(&b, "m", now) && !s.cooling(&b, "n", now));
+        assert!(!s.clear_disabled(&set, &p), "nothing left to clear");
     }
 
     /// A stated reset six days away is trusted for one hour, then for doubling windows
@@ -2749,10 +2906,7 @@ mod tests {
         s.record_picked(&c, "m", &hinted(FailureScope::Model, days), &p, first, done);
         assert_eq!(s.wait(&c, "m", done), None, "no window from the superseded probe");
         s.record_picked(&c, "m", &Outcome::Success, &p, second, done + secs(1));
-        assert!(
-            !s.cooldowns.contains_key(&(c.id.clone(), "m".to_owned())),
-            "m recovered"
-        );
+        assert!(s.cooldowns.get(&c.id, "m").is_none(), "m recovered");
     }
 
     /// A probe whose hold lapsed was taken over by a later probe: its late 429 neither
@@ -3103,7 +3257,7 @@ mod tests {
         let stale = s.dispatch();
         let wide = s.dispatch();
         s.record_dispatched(&c, "m", &hinted(FailureScope::Credential, secs(H)), &p, g, wide, now);
-        s.cooldowns.remove(&(c.id.clone(), String::new()));
+        s.cooldowns.remove(&c.id, "");
         s.record_dispatched(&c, "other", &Outcome::Success, &p, g, stale, now);
         assert!(
             s.cooling(&c, "other", now),

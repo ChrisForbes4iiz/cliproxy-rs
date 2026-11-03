@@ -409,7 +409,7 @@ impl XaiAuth {
         if status != 200 {
             return Err(fail(format!(
                 "xai discovery failed with status {status}: {}",
-                String::from_utf8_lossy(&body).trim()
+                crate::oauth::redact_body(&body)
             )));
         }
         let wire = go_unmarshal(
@@ -461,7 +461,7 @@ impl XaiAuth {
         if status != 200 {
             return Err(fail(format!(
                 "xai device code request failed with status {status}: {}",
-                String::from_utf8_lossy(&body).trim()
+                crate::oauth::redact_body(&body)
             )));
         }
         let wire = go_unmarshal(
@@ -543,7 +543,7 @@ impl XaiAuth {
                 502,
                 format!(
                     "xai device token request failed with status {status}: {}",
-                    String::from_utf8_lossy(&body).trim()
+                    crate::oauth::redact_body(&body)
                 ),
             ));
         }

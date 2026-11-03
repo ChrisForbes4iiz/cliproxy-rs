@@ -272,8 +272,16 @@ fn lookup(state: &Management, name: &str, auth_index: &str) -> Option<Arc<Creden
         .find(|c| matches_name(c) && credentials::auth_index(c) == auth_index)
 }
 
+/// A name that is not one plain file name inside auth-dir. Besides Go's `/` and `\`,
+/// `:` and anything that is not a single normal path component are refused on every
+/// platform: on Windows `auth_dir.join("C:x.json")` replaces auth-dir with drive C's
+/// current directory (Go's `filepath.Join` keeps it inside auth-dir).
 fn unsafe_name(name: &str) -> bool {
-    name.trim().is_empty() || name.contains(['/', '\\'])
+    let path = Path::new(name);
+    name.trim().is_empty()
+        || name.contains(['/', '\\', ':'])
+        || path.components().any(|c| !matches!(c, std::path::Component::Normal(_)))
+        || path.file_name() != Some(std::ffi::OsStr::new(name))
 }
 
 fn ends_json(name: &str) -> bool {
@@ -2489,7 +2497,7 @@ fn dynamic_definitions(state: &Management, channel: &str) -> Vec<Value> {
     let rt = &state.rt;
     let mut models: Vec<_> = rt
         .registry()
-        .available_by_provider(channel, |client, model| rt.suspension(client, model))
+        .available_by_provider(channel, rt.suspensions())
         .iter()
         .map(|spec| spec.to_info().raw)
         .collect();
@@ -2756,6 +2764,28 @@ pub(crate) async fn refresh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_that_leave_auth_dir_are_unsafe_on_every_platform() {
+        for name in [
+            "C:x.json",
+            "c:\\x.json",
+            "..\\x.json",
+            "../x.json",
+            "a/b.json",
+            "/x.json",
+            "..",
+            ".",
+            "x:y.json",
+            "",
+            " ",
+        ] {
+            assert!(unsafe_name(name), "{name:?} must be refused");
+        }
+        for name in ["x.json", "codex-user@example.com.json", "..x.json", "a b.json"] {
+            assert!(!unsafe_name(name), "{name:?} is a plain file name");
+        }
+    }
 
     #[test]
     fn go_time_trims_fraction_like_rfc3339nano() {

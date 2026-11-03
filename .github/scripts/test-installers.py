@@ -228,6 +228,29 @@ if stop_pidfile; then exit 0; else exit 1; fi
                 assert "not installed" in install("--check")
                 assert not home.exists() and not bindir.exists()
                 assert not any("/download/" in r for r in requests)
+            # Release downloads use HTTPS; an http:// release URL is refused before any
+            # request unless it is on loopback, as the fixture server above is.
+            loopback, seen = env["CLIPROXY_RELEASES"], len(requests)
+            env["CLIPROXY_RELEASES"] = "http://downloads.example.invalid/releases"
+            try:
+                refused = install(success=False)
+            finally:
+                env["CLIPROXY_RELEASES"] = loopback
+            assert "must be an https:// URL" in refused, refused
+            assert len(requests) == seen
+            if not windows:
+                # Paths written into the systemd unit and the launchd plist: % is a systemd
+                # specifier, ExecStart= unquotes \ and " and expands $, and the plist is XML.
+                helpers = capture(["sh", "-c", '''
+eval "$(sed '$d' "$1")"
+unit_path "$2"; printf '|'; unit_arg "$2"; printf '|'; xml_text "$3"; printf '|'
+release_proto http://127.0.0.1:1/r; printf '|'; release_proto 'http://[::1]:1/r'; printf '|'
+release_proto https://example.com/r; printf '|'
+release_proto http://localhost.example.com/r || printf refused
+''', "unit-test", repo / "install.sh", '/h/100%/a\\b"$c', "/h/&<>\"'"], env=env)
+                assert helpers.returncode == 0, helpers.stdout
+                assert helpers.stdout == ('/h/100%%/a\\b"$c|/h/100%%/a\\\\b\\"$$c|/h/&amp;&lt;&gt;&quot;&apos;|'
+                                          '=http,https|=http,https|=https|refused'), helpers.stdout
             # Check the bracketed IPv6 wildcard and YAML boolean aliases without
             # asking the server to bind a bracketed literal (not a bind address).
             probe_config = root / "probe-only.yaml"

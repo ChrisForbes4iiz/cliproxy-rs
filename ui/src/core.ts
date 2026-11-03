@@ -94,6 +94,17 @@ export const flag = {
 };
 export const mask = (k: string) => (k.length > 10 ? `${k.slice(0, 3)}…${k.slice(-4)}` : "••••");
 
+// C0 and C1 controls (\n and \r among them), the line and paragraph separators, and the
+// bidi marks, embeddings, overrides and isolates, which can reorder the text around them.
+const unsafe = /[\p{Cc}\u2028\u2029\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
+/** A server-supplied name made safe to quote in a confirm() dialog: control and bidi
+ * characters removed, and at most `max` characters (code points), the last an ellipsis
+ * when the name was cut. */
+export function promptName(value: unknown, max = 80): string {
+  const chars = Array.from(String(value ?? "").replace(unsafe, ""));
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : chars.join("");
+}
+
 /** Durations like 45s, 4m, 2h 5m, 3d. */
 export function span(ms: number): string {
   const s = Math.max(0, Math.round(ms / 1000));

@@ -41,10 +41,7 @@ pub fn response(rt: &Runtime, client_version: &str) -> Response {
     crate::model_updater::codex_client_catalog_wanted();
     let cfg = rt.config();
     let registry = rt.registry();
-    let available: Vec<BTreeMap<String, GoValue>> = registry
-        .available_with(|c, m| rt.suspension(c, m))
-        .map(openai_map)
-        .collect();
+    let available: Vec<BTreeMap<String, GoValue>> = registry.available_with(rt.suspensions()).map(openai_map).collect();
     let facts = Facts(&registry);
     let apply_patch = |model: &str| {
         let providers = registry.providers(model);

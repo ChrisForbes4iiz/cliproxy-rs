@@ -444,9 +444,7 @@ fn route(
     // Go Home mode: no `auto` resolution; Home routes the model as sent.
     let remote = rt.remote_dispatch().is_some();
     let resolved = if base == "auto" && !remote {
-        let first = registry
-            .resolve_auto(|client, model| rt.suspension(client, model))
-            .unwrap_or_else(|| "auto".into());
+        let first = registry.resolve_auto(rt.suspensions()).unwrap_or_else(|| "auto".into());
         format!("{first}{}", &model[base.len()..])
     } else {
         model.to_owned()
@@ -1000,29 +998,36 @@ async fn run_routed(
     let (usage, unauthorized) = if home_count { (None, facts) } else { (facts, None) };
     // `WithPinnedAuthID`: every other credential is excluded in every round.
     // A remote dispatcher receives the pinned ID itself.
-    let mut pinned_exclusion: Vec<String> = match call.pinned() {
-        Some(pinned) if !pinned.is_empty() && rt.remote_dispatch().is_none() => rt
-            .store()
-            .snapshot()
-            .iter()
-            .filter(|c| c.id != pinned)
-            .map(|c| c.id.clone())
-            .collect(),
-        _ => Vec::new(),
-    };
+    let pinned = call
+        .pinned()
+        .filter(|pinned| !pinned.is_empty() && rt.remote_dispatch().is_none());
     // `WithDisallowFreeAuth`: free-plan Codex credentials are ineligible in every round.
     // ponytail: Home mode selects remotely and does not see this flag.
-    if call.media.as_ref().is_some_and(|m| m.disallow_free) {
+    let disallow_free = call.media.as_ref().is_some_and(|m| m.disallow_free);
+    // One snapshot, one pass: every credential but the pinned one, in snapshot order,
+    // then the pinned one when it is a free plan that the call disallows.
+    let mut pinned_exclusion: Vec<String> = Vec::new();
+    if pinned.is_some() || disallow_free {
+        let mut free_pinned = None;
         for credential in rt.store().snapshot() {
-            let free = credential.provider.trim().eq_ignore_ascii_case("codex")
+            let free = disallow_free
+                && credential.provider.trim().eq_ignore_ascii_case("codex")
                 && credential
                     .attributes
                     .get("plan_type")
                     .is_some_and(|plan| plan.trim().eq_ignore_ascii_case("free"));
-            if free && !pinned_exclusion.contains(&credential.id) {
-                pinned_exclusion.push(credential.id.clone());
+            match pinned.as_deref() {
+                Some(pinned) if credential.id == pinned => {
+                    if free {
+                        free_pinned = Some(credential.id.clone());
+                    }
+                }
+                Some(_) => pinned_exclusion.push(credential.id.clone()),
+                None if free => pinned_exclusion.push(credential.id.clone()),
+                None => {}
             }
         }
+        pinned_exclusion.extend(free_pinned);
     }
     let mut selection = Selection {
         providers: providers.clone(),
