@@ -1,0 +1,9 @@
+base: &b
+  x: 1
+  y: [1, 2]
+ref: *b
+list:
+  - &s str
+  - *s
+num: &n 42
+num_ref: *n

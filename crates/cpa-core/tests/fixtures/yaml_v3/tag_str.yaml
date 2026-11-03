@@ -1,0 +1,3 @@
+a: !!str 123
+b: !!str true
+c: !!str ~

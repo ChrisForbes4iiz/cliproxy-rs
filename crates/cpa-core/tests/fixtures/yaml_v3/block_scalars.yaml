@@ -1,0 +1,26 @@
+lit: |
+  line1
+  line2
+lit_strip: |-
+  x
+lit_keep: |+
+  x
+
+fold: >
+  a
+  b
+
+  c
+fold_strip: >-
+  a
+  b
+fold_keep: >+
+  a
+
+indent_indicator: |2
+    two
+more_indented: >
+  a
+    b
+  c
+last: end

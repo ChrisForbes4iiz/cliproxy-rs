@@ -1,0 +1,15 @@
+host: ""
+port: 8317
+debug: false
+api-keys:
+  - "k1"
+  - k2
+proxy-url: socks5://user:pass@127.0.0.1:1080
+request-retry: 3
+ratio: 0.5
+headers:
+  X-Test: yes
+  X-Num: 017
+nested:
+  name: n
+  enabled: on

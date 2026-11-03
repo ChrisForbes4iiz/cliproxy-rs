@@ -1,0 +1,19 @@
+sq: 'it''s'
+dq: "tab\tnl\nuni\u00e9 \x41 \U0001F600"
+dq_nul: "a\0b"
+dq_bell: "\a\b\e\f\v"
+dq_nel: "\N\_\L\P"
+dq_line_cont: "a\
+  b"
+plain_colon: a:b
+plain_hash: a#b
+plain_comment: a # c
+plain_multi: a
+  b
+dq_multi: "a
+  b"
+sq_multi: 'a
+
+  b'
+empty_sq: ''
+leading_space: '  x'

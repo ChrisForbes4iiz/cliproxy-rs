@@ -1,0 +1,3 @@
+# The yaml.v3 parity corpus is compared byte for byte (BOM, CR, CRLF, tabs and NEL
+# cases included), so checkouts must not convert its line endings.
+crates/cpa-core/tests/fixtures/yaml_v3/*.yaml -text

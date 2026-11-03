@@ -1,0 +1,5 @@
+1: int
+2.5: float
+true: bool
+0x10: hex
+str: s

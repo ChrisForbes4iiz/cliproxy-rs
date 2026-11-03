@@ -1,0 +1,10 @@
+# header
+a: 1 # trailing
+# between
+b:
+  # inside
+  c: 2 # nested trailing
+d: [1, # in flow
+  2]
+e: "#not a comment"
+f: 'x' #comment

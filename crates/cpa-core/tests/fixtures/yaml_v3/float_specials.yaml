@@ -1,0 +1,10 @@
+inf: .inf
+Inf: .Inf
+INF: .INF
+pinf: +.inf
+ninf: -.inf
+nan: .nan
+NaN: .NaN
+NAN: .NAN
+iNf: .iNf
+bare_inf: inf
