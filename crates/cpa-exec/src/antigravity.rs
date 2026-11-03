@@ -74,14 +74,14 @@ pub(crate) fn pool_settings(cfg: &Config) -> PoolSettings {
         .and_then(|p| p.get("antigravity"))
         .and_then(|a| a.get("connection-pool"));
     let field = |key: &str| pool.and_then(|p| p.get(key));
-    if field("enabled").and_then(serde_yaml_ng::Value::as_bool) != Some(true) {
+    if field("enabled").and_then(cpa_core::yaml::Value::as_bool) != Some(true) {
         return PoolSettings::Short;
     }
     let mut idle_timeout = DEFAULT_IDLE_TIMEOUT;
     let raw = match field("idle-conn-timeout") {
-        Some(serde_yaml_ng::Value::String(s)) => s.trim().to_owned(),
-        Some(serde_yaml_ng::Value::Number(n)) => n.to_string(),
-        Some(serde_yaml_ng::Value::Bool(b)) => b.to_string(),
+        Some(cpa_core::yaml::Value::String(s)) => s.trim().to_owned(),
+        Some(cpa_core::yaml::Value::Number(n)) => n.to_string(),
+        Some(cpa_core::yaml::Value::Bool(b)) => b.to_string(),
         _ => String::new(),
     };
     if !raw.is_empty() {
@@ -95,7 +95,7 @@ pub(crate) fn pool_settings(cfg: &Config) -> PoolSettings {
         }
     }
     let mut max_idle_per_host = DEFAULT_MAX_IDLE;
-    if let Some(value) = field("max-idle-conns-per-host").and_then(serde_yaml_ng::Value::as_i64) {
+    if let Some(value) = field("max-idle-conns-per-host").and_then(cpa_core::yaml::Value::as_i64) {
         if value < 0 {
             return PoolSettings::Short;
         }
@@ -187,7 +187,7 @@ fn cooling_disabled(credential: &Credential, cfg: &Config) -> bool {
         .document
         .get("home")
         .and_then(|h| h.get("enabled"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false);
     home || disable_cooling_override(credential).unwrap_or(cfg.routing.cooldown.disable_cooling)
 }

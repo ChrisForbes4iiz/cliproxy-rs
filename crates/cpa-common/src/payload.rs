@@ -18,8 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use cpa_core::config::Config;
+use cpa_core::yaml::Value as Yaml;
 use http::HeaderMap;
-use serde_yaml_ng::Value as Yaml;
 
 use crate::gostr::GoStr;
 use crate::json::{self, GoValue, Kind, Res};

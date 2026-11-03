@@ -1344,7 +1344,7 @@ fn keepalive_interval(cfg: &Config) -> Option<Duration> {
     let seconds = ["requests", "streaming", "keepalive-seconds"]
         .iter()
         .try_fold(&cfg.document, |v, k| v.get(*k))
-        .and_then(serde_yaml_ng::Value::as_i64)
+        .and_then(cpa_core::yaml::Value::as_i64)
         .unwrap_or(0);
     (seconds > 0).then(|| Duration::from_secs(seconds as u64))
 }

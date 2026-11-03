@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use serde_yaml_ng::Value;
+use cpa_core::yaml::Value;
 
 /// Go `config.HomeConfig`. YAML never sets it: Go tags it `yaml:"-"` on `Config`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -318,7 +318,7 @@ mod tests {
     use super::*;
 
     fn parse(yaml: &str) -> Result<CredentialConcurrency> {
-        let doc: Value = serde_yaml_ng::from_str(yaml).unwrap();
+        let doc: Value = cpa_core::yaml::from_str(yaml).unwrap();
         CredentialConcurrency::from_document(&doc)
     }
 

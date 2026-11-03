@@ -48,7 +48,7 @@ impl Settings {
         let flag = |path: &[&str]| {
             path.iter()
                 .try_fold(&cfg.document, |v, k| v.get(*k))
-                .and_then(serde_yaml_ng::Value::as_bool)
+                .and_then(cpa_core::yaml::Value::as_bool)
                 .unwrap_or(false)
         };
         Self {

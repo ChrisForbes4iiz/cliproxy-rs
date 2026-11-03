@@ -5,7 +5,7 @@
 
 use cpa_core::config::Config;
 use cpa_core::gostr::GoStr;
-use serde_yaml_ng::Value;
+use cpa_core::yaml::Value;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HeaderDefaults {

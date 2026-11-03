@@ -153,7 +153,7 @@ pub(super) fn inject(root: &mut Value, cfg: &Config, live: &HashMap<String, Stri
 /// Go `stripAPIKeysAuthIndexesFromUpdate`: `auth_index` and `auth-index` never reach
 /// the file, whether a client echoes a read back at the root, at `api-keys` or at one
 /// provider's list.
-pub(super) fn strip_update(parts: &[&str], value: &mut serde_yaml_ng::Value) {
+pub(super) fn strip_update(parts: &[&str], value: &mut cpa_core::yaml::Value) {
     match parts {
         [] => strip_root(value),
         ["api-keys"] => strip_providers(value),
@@ -163,13 +163,13 @@ pub(super) fn strip_update(parts: &[&str], value: &mut serde_yaml_ng::Value) {
 }
 
 /// Go `stripAPIKeysAuthIndexesFromRoot`.
-pub(super) fn strip_root(root: &mut serde_yaml_ng::Value) {
+pub(super) fn strip_root(root: &mut cpa_core::yaml::Value) {
     if let Some(api_keys) = root.get_mut("api-keys") {
         strip_providers(api_keys);
     }
 }
 
-fn strip_providers(api_keys: &mut serde_yaml_ng::Value) {
+fn strip_providers(api_keys: &mut cpa_core::yaml::Value) {
     if let Some(map) = api_keys.as_mapping_mut() {
         for (_, groups) in map.iter_mut() {
             strip_groups(groups);
@@ -177,21 +177,21 @@ fn strip_providers(api_keys: &mut serde_yaml_ng::Value) {
     }
 }
 
-fn strip_groups(groups: &mut serde_yaml_ng::Value) {
-    let strip = |group: &mut serde_yaml_ng::Value| {
+fn strip_groups(groups: &mut cpa_core::yaml::Value) {
+    let strip = |group: &mut cpa_core::yaml::Value| {
         let Some(group) = group.as_mapping_mut() else { return };
         group.remove("auth_index");
         group.remove("auth-index");
-        if let Some(keys) = group.get_mut("keys").and_then(serde_yaml_ng::Value::as_sequence_mut) {
-            for key in keys.iter_mut().filter_map(serde_yaml_ng::Value::as_mapping_mut) {
+        if let Some(keys) = group.get_mut("keys").and_then(cpa_core::yaml::Value::as_sequence_mut) {
+            for key in keys.iter_mut().filter_map(cpa_core::yaml::Value::as_mapping_mut) {
                 key.remove("auth_index");
                 key.remove("auth-index");
             }
         }
     };
     match groups {
-        serde_yaml_ng::Value::Sequence(list) => list.iter_mut().for_each(strip),
-        group @ serde_yaml_ng::Value::Mapping(_) => strip(group),
+        cpa_core::yaml::Value::Sequence(list) => list.iter_mut().for_each(strip),
+        group @ cpa_core::yaml::Value::Mapping(_) => strip(group),
         _ => {}
     }
 }

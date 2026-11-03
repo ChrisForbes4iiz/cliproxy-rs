@@ -11,6 +11,7 @@ use axum::body::Bytes;
 use axum::extract::{Path as UrlPath, RawQuery, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
+use cpa_core::yaml::Value as Yaml;
 use cpa_exec::proxy::Proxy;
 use cpa_plugin::config as pcfg;
 use cpa_plugin::store::{
@@ -18,7 +19,6 @@ use cpa_plugin::store::{
     InstallOptions, InstallResult, Manifest, Plugin, Release, Source, StoreError,
 };
 use serde_json::{Value, json};
-use serde_yaml_ng::Value as Yaml;
 
 use super::Management;
 use super::plugins::{

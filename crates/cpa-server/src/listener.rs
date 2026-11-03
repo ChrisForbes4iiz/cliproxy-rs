@@ -84,12 +84,12 @@ fn tls_settings(cfg: &Config) -> (bool, String, String) {
     let get = |k: &str| tls.and_then(|t| t.get(k));
     let text = |k: &str| {
         get(k)
-            .and_then(serde_yaml_ng::Value::as_str)
+            .and_then(cpa_core::yaml::Value::as_str)
             .unwrap_or_default()
             .trim()
             .to_owned()
     };
-    let enable = get("enable").and_then(serde_yaml_ng::Value::as_bool).unwrap_or(false);
+    let enable = get("enable").and_then(cpa_core::yaml::Value::as_bool).unwrap_or(false);
     (enable, text("cert"), text("key"))
 }
 

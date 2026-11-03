@@ -345,7 +345,7 @@ fn same(go: &Value, rust: &Value) -> bool {
                     b.get(k).is_some_and(|w| {
                         if k == "config_yaml" {
                             let parse = |v: &Value| {
-                                serde_yaml_ng::from_str::<serde_yaml_ng::Value>(v.as_str().unwrap_or_default()).ok()
+                                cpa_core::yaml::from_str::<cpa_core::yaml::Value>(v.as_str().unwrap_or_default()).ok()
                             };
                             parse(v) == parse(w)
                         } else {

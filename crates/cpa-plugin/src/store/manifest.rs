@@ -2,7 +2,7 @@
 //! records under `plugins.configs.<id>.store`, and the Home sync manifests.
 
 use cpa_core::gostr::GoStr;
-use serde_yaml_ng::{Mapping, Value as Yaml};
+use cpa_core::yaml::{Mapping, Value as Yaml};
 
 use super::client::Release;
 use super::registry::{

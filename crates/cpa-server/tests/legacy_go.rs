@@ -462,7 +462,7 @@ async fn v0_config_yaml_put_writes_like_go() {
         "config-version: 8\nmanagement:\n  secret-key: fake-secret\nnote: |\n  # first\n  second\n",
         &dir,
     );
-    serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&block).expect("valid as sent");
+    cpa_core::yaml::from_str::<cpa_core::yaml::Value>(&block).expect("valid as sent");
     let res = put(&block).await.unwrap();
     assert_eq!(res.status().as_u16(), 400);
     assert!(res.text().await.unwrap().starts_with(r#"{"error":"invalid_yaml""#));

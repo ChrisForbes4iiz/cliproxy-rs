@@ -1,6 +1,6 @@
 //! Editable document separate from the runtime snapshot. Presence wins over values.
+use crate::yaml::{Mapping, Value};
 use anyhow::{Context, bail};
-use serde_yaml_ng::{Mapping, Value};
 
 pub use super::text::archive_comments;
 use super::{lookup, validate_shape};
@@ -730,7 +730,7 @@ impl ConfigDocument {
             if !remove(child, rest) {
                 return false;
             }
-            if child.as_mapping().is_some_and(serde_yaml_ng::Mapping::is_empty) {
+            if child.as_mapping().is_some_and(crate::yaml::Mapping::is_empty) {
                 map.remove(*first);
             }
             true
@@ -1358,12 +1358,12 @@ mod tests {
         let mut doc = ConfigDocument::parse(original).unwrap();
         doc.update(
             &["requests", "payload", "default"],
-            serde_yaml_ng::from_str("[{models: [{name: '*', protocol: openai}], params: {temperature: 0.7}}]").unwrap(),
+            crate::yaml::from_str("[{models: [{name: '*', protocol: openai}], params: {temperature: 0.7}}]").unwrap(),
             false,
         )
         .unwrap();
         let text = doc.render_preserving(original).unwrap();
-        assert_eq!(serde_yaml_ng::from_str::<Value>(&text).unwrap(), *doc.value(), "{text}");
+        assert_eq!(crate::yaml::from_str::<Value>(&text).unwrap(), *doc.value(), "{text}");
         assert!(text.starts_with("# keep\n") && !text.contains('{'), "{text}");
     }
 
@@ -1399,7 +1399,7 @@ mod tests {
         let params = "[{models: [{name: m}], params: {a: '1_000', b: '007', c: '0b-1'}}]";
         doc.update(
             &["requests", "payload", "default"],
-            serde_yaml_ng::from_str(params).unwrap(),
+            crate::yaml::from_str(params).unwrap(),
             false,
         )
         .unwrap();
@@ -1408,7 +1408,7 @@ mod tests {
         let got = &cfg.document["requests"]["payload"]["default"][0]["params"];
         assert_eq!(
             *got,
-            serde_yaml_ng::from_str::<Value>("{a: '1_000', b: '007', c: '0b-1'}").unwrap(),
+            crate::yaml::from_str::<Value>("{a: '1_000', b: '007', c: '0b-1'}").unwrap(),
             "{text}"
         );
     }
@@ -1420,7 +1420,7 @@ mod tests {
                         debug: false\nrouting:\n  strategy: fill-first\n";
         let doc = ConfigDocument::parse(original).unwrap();
         let text = doc.migrated_text(original).expect("block layout migrates as text");
-        assert_eq!(serde_yaml_ng::from_str::<Value>(&text).unwrap(), *doc.value(), "{text}");
+        assert_eq!(crate::yaml::from_str::<Value>(&text).unwrap(), *doc.value(), "{text}");
         for kept in [
             "  # head\n  host: \"\" # any\n",
             "  # why\n  allow-remote: true\n",
@@ -1457,12 +1457,12 @@ mod tests {
         let mut d = ConfigDocument::parse(original).unwrap();
         d.update(
             &[],
-            serde_yaml_ng::from_str("routing: {cooldown: {disable-cooling: false}}\naccess: {api-keys: []}\n").unwrap(),
+            crate::yaml::from_str("routing: {cooldown: {disable-cooling: false}}\naccess: {api-keys: []}\n").unwrap(),
             true,
         )
         .unwrap();
         let file: yaml_edit::YamlFile = original.parse().unwrap();
-        let before: Value = serde_yaml_ng::from_str(original).unwrap();
+        let before: Value = crate::yaml::from_str(original).unwrap();
         sync_mapping(
             &file.document().unwrap().as_mapping().unwrap(),
             d.value().as_mapping().unwrap(),
@@ -1470,7 +1470,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            serde_yaml_ng::from_str::<Value>(&file.to_string()).unwrap(),
+            crate::yaml::from_str::<Value>(&file.to_string()).unwrap(),
             *d.value(),
             "{}",
             file
@@ -1479,7 +1479,7 @@ mod tests {
         let next = file.to_string();
         assert!(d.delete(&["routing", "retry", "request-retry"]));
         let file: yaml_edit::YamlFile = next.parse().unwrap();
-        let before: Value = serde_yaml_ng::from_str(&next).unwrap();
+        let before: Value = crate::yaml::from_str(&next).unwrap();
         let result = sync_mapping(
             &file.document().unwrap().as_mapping().unwrap(),
             d.value().as_mapping().unwrap(),
@@ -1487,7 +1487,7 @@ mod tests {
         );
         assert!(result.is_ok(), "{result:?}\n{file}");
         assert_eq!(
-            serde_yaml_ng::from_str::<Value>(&file.to_string()).unwrap(),
+            crate::yaml::from_str::<Value>(&file.to_string()).unwrap(),
             *d.value(),
             "{}",
             file
@@ -1525,7 +1525,7 @@ mod tests {
     fn paths_are_mapping_keys_and_patch_null_is_not_deletion() {
         let mut d = ConfigDocument::parse("access: {api-keys: [old]}\n").unwrap();
         assert!(d.update(&["access", "api-keys", "0"], Value::from("x"), false).is_err());
-        d.update(&["access"], serde_yaml_ng::from_str("{api-keys: null}").unwrap(), true)
+        d.update(&["access"], crate::yaml::from_str("{api-keys: null}").unwrap(), true)
             .unwrap();
         assert!(d.get(&["access", "api-keys"]).unwrap().is_null());
         assert!(d.delete(&["access", "api-keys"]));

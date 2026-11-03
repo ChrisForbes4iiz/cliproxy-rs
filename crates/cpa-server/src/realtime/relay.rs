@@ -9,8 +9,8 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use cpa_core::config::Config;
+use cpa_core::yaml::Value;
 use futures_util::future::BoxFuture;
-use serde_yaml_ng::Value;
 
 /// A relay failure: Go's `clienterror.HTTPStatusFromErrorOr(err, 502)` and its text.
 #[derive(Debug, Clone, PartialEq, Eq)]

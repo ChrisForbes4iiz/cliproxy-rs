@@ -29,17 +29,17 @@ pub(crate) struct CompatModel {
     pub input_modalities: Vec<String>,
 }
 
-fn yaml_str(v: Option<&serde_yaml_ng::Value>) -> String {
+fn yaml_str(v: Option<&cpa_core::yaml::Value>) -> String {
     match v {
-        Some(serde_yaml_ng::Value::String(s)) => s.clone(),
-        Some(serde_yaml_ng::Value::Number(n)) => n.to_string(),
-        Some(serde_yaml_ng::Value::Bool(b)) => b.to_string(),
+        Some(cpa_core::yaml::Value::String(s)) => s.clone(),
+        Some(cpa_core::yaml::Value::Number(n)) => n.to_string(),
+        Some(cpa_core::yaml::Value::Bool(b)) => b.to_string(),
         _ => String::new(),
     }
 }
 
-fn yaml_bool(v: Option<&serde_yaml_ng::Value>) -> bool {
-    v.and_then(serde_yaml_ng::Value::as_bool).unwrap_or(false)
+fn yaml_bool(v: Option<&cpa_core::yaml::Value>) -> bool {
+    v.and_then(cpa_core::yaml::Value::as_bool).unwrap_or(false)
 }
 
 /// `cfg.OpenAICompatibility` after `SanitizeOpenAICompatibility`: entries without a
@@ -49,7 +49,7 @@ pub(crate) fn compat_entries(cfg: &Config) -> Vec<Compat> {
         .document
         .get("api-keys")
         .and_then(|k| k.get("openai-compatibility"))
-        .and_then(serde_yaml_ng::Value::as_sequence);
+        .and_then(cpa_core::yaml::Value::as_sequence);
     let mut out = Vec::new();
     for group in groups.into_iter().flatten() {
         if yaml_str(group.get("base-url")).trim().is_empty() {
@@ -57,7 +57,7 @@ pub(crate) fn compat_entries(cfg: &Config) -> Vec<Compat> {
         }
         let models = group
             .get("models")
-            .and_then(serde_yaml_ng::Value::as_sequence)
+            .and_then(cpa_core::yaml::Value::as_sequence)
             .into_iter()
             .flatten()
             .map(|m| CompatModel {
@@ -66,7 +66,7 @@ pub(crate) fn compat_entries(cfg: &Config) -> Vec<Compat> {
                 use_max_completion_tokens: yaml_bool(m.get("use-max-completion-tokens")),
                 input_modalities: m
                     .get("input-modalities")
-                    .and_then(serde_yaml_ng::Value::as_sequence)
+                    .and_then(cpa_core::yaml::Value::as_sequence)
                     .map(|s| s.iter().map(|v| yaml_str(Some(v))).collect())
                     .unwrap_or_default(),
             })

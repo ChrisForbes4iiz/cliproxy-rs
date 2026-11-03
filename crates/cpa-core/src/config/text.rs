@@ -7,7 +7,7 @@
 //! (flow roots, anchors, tabs, multi-document files, nested legacy sources) returns
 //! `None` and the caller falls back to the value-level writer. Callers must also
 //! check that the result parses to the migrated value.
-use serde_yaml_ng::Value;
+use crate::yaml::Value;
 
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start_matches(' ').len()
@@ -431,7 +431,7 @@ pub(super) fn emit_entry(key: &str, value: &Value) -> Vec<String> {
     }
 }
 
-fn emit_mapping(m: &serde_yaml_ng::Mapping) -> Vec<String> {
+fn emit_mapping(m: &crate::yaml::Mapping) -> Vec<String> {
     m.iter()
         .flat_map(|(k, v)| emit_entry(&k.as_str().map(str::to_owned).unwrap_or_else(|| scalar(k)), v))
         .collect()
@@ -510,7 +510,7 @@ mod tests {
 
     #[test]
     fn emitted_blocks_parse_back_to_the_value() {
-        let value: Value = serde_yaml_ng::from_str(
+        let value: Value = crate::yaml::from_str(
             "a: {b: [1, 'two', {c: '', d: [], e: {}}], f: \"multi\\nline\"}\ng: [[x, y], []]\nh: 'true'\n",
         )
         .unwrap();
@@ -518,6 +518,6 @@ mod tests {
             .into_iter()
             .map(|l| l + "\n")
             .collect();
-        assert_eq!(serde_yaml_ng::from_str::<Value>(&text).unwrap(), value, "{text}");
+        assert_eq!(crate::yaml::from_str::<Value>(&text).unwrap(), value, "{text}");
     }
 }

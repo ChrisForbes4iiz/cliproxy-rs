@@ -3,19 +3,19 @@
 //! input of the other `fixtures/*_go.json` files and Go's config.example.yaml, as
 //! recorded by `tests/reference/yaml_v3/main.go` into `fixtures/yaml_v3_go.json`.
 //!
-//! It does not assert parity: serde_yaml_ng differs from yaml.v3 in known ways (some of
-//! which [`cpa_core::config::parse_yaml`] and the config loader correct). It asserts that
-//! the differences are exactly the ones listed in `fixtures/yaml_v3_known_differences.json`,
+//! It does not assert parity: [`cpa_core::yaml`] differs from yaml.v3 in known ways
+//! (some of which the config loader corrects or refuses). It asserts that the
+//! differences are exactly the ones listed in `fixtures/yaml_v3_known_differences.json`,
 //! so a parser change (cliproxy-rs-7ea.44) shows every case it fixes or breaks. After a
 //! deliberate change, regenerate the list with `YAML_V3_BLESS=1` and review its diff.
 //!
 //! Modes, each compared with Go's recording of the same case:
-//! - `serde_yaml_ng`: `serde_yaml_ng::from_str::<Value>`, the raw parser;
+//! - `yaml`: `cpa_core::yaml::from_str::<Value>`, the raw parser;
 //! - `parse_yaml`: [`cpa_core::config::parse_yaml`] then [`cpa_core::config::expand_merges`],
 //!   the untyped path the config loader builds on;
-//! - `stream`: every document through `serde_yaml_ng::Deserializer::from_str`, against
-//!   a yaml.v3 `Decoder`;
-//! - `typed`: `serde_yaml_ng::from_str::<Shape>`, a struct with the field kinds of Go's
+//! - `stream`: every document through `cpa_core::yaml::from_str_multi`, against a
+//!   yaml.v3 `Decoder`;
+//! - `typed`: `cpa_core::yaml::from_str::<Shape>`, a struct with the field kinds of Go's
 //!   config, against yaml.v3 decoding the same struct.
 //!
 //! A difference is `value` (both parse, the values differ), `go-error` (Go fails, Rust
@@ -24,9 +24,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use cpa_core::yaml::Value;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
-use serde_yaml_ng::Value;
 
 /// A value as flat pre-order `[type, text]` tokens, as the Go recorder writes them.
 type Tokens = Vec<[String; 2]>;
@@ -198,12 +198,8 @@ fn differences() -> Differences {
         let go_error = case.get("error").is_some();
         let go_value = &case["value"];
 
-        let raw = serde_yaml_ng::from_str::<Value>(yaml).map_err(|e| e.to_string());
-        note(
-            "serde_yaml_ng",
-            name,
-            kind(go_error, &raw, |v| same(go_value, &tokens(v))),
-        );
+        let raw = cpa_core::yaml::from_str::<Value>(yaml).map_err(|e| e.to_string());
+        note("yaml", name, kind(go_error, &raw, |v| same(go_value, &tokens(v))));
 
         let cpa = cpa_core::config::parse_yaml(yaml)
             .map_err(|e| e.to_string())
@@ -213,9 +209,7 @@ fn differences() -> Differences {
             });
         note("parse_yaml", name, kind(go_error, &cpa, |v| same(go_value, &tokens(v))));
 
-        let stream: Result<Vec<Value>, String> = serde_yaml_ng::Deserializer::from_str(yaml)
-            .map(|doc| Value::deserialize(doc).map_err(|e| e.to_string()))
-            .collect();
+        let stream: Result<Vec<Value>, String> = cpa_core::yaml::from_str_multi(yaml).map_err(|e| e.to_string());
         let go_stream = case["stream"].as_array().unwrap();
         note(
             "stream",
@@ -225,7 +219,7 @@ fn differences() -> Differences {
             }),
         );
 
-        let typed = serde_yaml_ng::from_str::<Shape>(yaml)
+        let typed = cpa_core::yaml::from_str::<Shape>(yaml)
             .map(shape_json)
             .map_err(|e| e.to_string());
         note(

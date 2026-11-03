@@ -38,7 +38,7 @@ fn setting(state: &Management, key: &str) -> bool {
         .get("observability")
         .and_then(|o| o.get("logs"))
         .and_then(|l| l.get(key))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false)
 }
 

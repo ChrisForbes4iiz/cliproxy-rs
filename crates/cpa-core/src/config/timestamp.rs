@@ -9,7 +9,7 @@ pub const TAG: &str = "!cpa-timestamp";
 /// plain scalar; `None` where yaml.v3 reads anything else. yaml.v3 tries Go's
 /// `time.Parse` with `2006-1-2T15:4:5.999999999Z07:00`, the same with `t`,
 /// `2006-1-2 15:4:5.999999999` and `2006-1-2`, after checking for four digits and `-`.
-pub(super) fn go_timestamp(text: &str) -> Option<String> {
+pub(crate) fn go_timestamp(text: &str) -> Option<String> {
     let b = text.as_bytes();
     if b.len() < 5 || !b[..4].iter().all(u8::is_ascii_digit) || b[4] != b'-' {
         return None;
@@ -93,8 +93,8 @@ const WIDE_OFFSET: &str =
 /// cannot marshal as JSON (`time.Time.MarshalJSON`), so its payload rules skip it and its
 /// JSON views fail. Part of the config decode, not of [`super::parse_yaml`], whose
 /// callers read only their own settings, as Go's do.
-pub(super) fn refuse_wide_offsets(value: &serde_yaml_ng::Value) -> anyhow::Result<()> {
-    use serde_yaml_ng::Value;
+pub(super) fn refuse_wide_offsets(value: &crate::yaml::Value) -> anyhow::Result<()> {
+    use crate::yaml::Value;
     match value {
         Value::Tagged(t) if t.tag == TAG => {
             let wide = |time: &str| {
@@ -129,11 +129,11 @@ fn lit(rest: &mut &[u8], byte: u8) -> Option<()> {
 
 /// A YAML value serialized for JSON with each [`TAG`] value as its text, as Go marshals
 /// a `time.Time`; serde_yaml_ng writes a tagged value as a one-entry map.
-pub struct AsJson<'a>(pub &'a serde_yaml_ng::Value);
+pub struct AsJson<'a>(pub &'a crate::yaml::Value);
 
 impl serde::Serialize for AsJson<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        use serde_yaml_ng::Value;
+        use crate::yaml::Value;
         match self.0 {
             // A `time.Time`; other tags print their value too (yaml.v3 decodes a
             // local tag into `any` as the node's value).

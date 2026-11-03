@@ -848,7 +848,7 @@ async fn run(args: Args, plugins: cpa_plugin::Host, builtin: Vec<(String, String
         && let Some(n) = config
             .document
             .get("worker-threads")
-            .and_then(serde_yaml_ng::Value::as_u64)
+            .and_then(cpa_core::yaml::Value::as_u64)
         && usize::try_from(n).ok() != Some(tokio::runtime::Handle::current().metrics().num_workers())
     {
         let source = match &home_config {
@@ -983,7 +983,7 @@ fn resolve_management_base_url(flag: &str, config: &Config) -> String {
         .document
         .get("management")
         .and_then(|m| m.get("base-url"))
-        .and_then(serde_yaml_ng::Value::as_str)
+        .and_then(cpa_core::yaml::Value::as_str)
         .unwrap_or_default();
     management_base_url(flag, configured, i64::from(config.port))
 }

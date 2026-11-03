@@ -5,8 +5,8 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use cpa_core::yaml::Value as Yaml;
 use serde_json::{Value, json};
-use serde_yaml_ng::Value as Yaml;
 
 use super::{DEFAULT_SERVICE_TYPE, DiscoveredService, go_trim};
 

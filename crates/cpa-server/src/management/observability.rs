@@ -50,7 +50,7 @@ pub(crate) async fn latest_version(State(state): State<Arc<Management>>) -> Resp
         cfg.document
             .get("requests")
             .and_then(|r| r.get("proxy-url"))
-            .and_then(serde_yaml_ng::Value::as_str)
+            .and_then(cpa_core::yaml::Value::as_str)
             .unwrap_or_default(),
     );
     let client = match proxy

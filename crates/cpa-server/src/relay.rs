@@ -42,7 +42,7 @@ pub fn ws_auth(cfg: &Config) -> bool {
         .and_then(|o| o.get("providers"))
         .and_then(|p| p.get("aistudio"))
         .and_then(|a| a.get("ws-auth"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(true)
 }
 

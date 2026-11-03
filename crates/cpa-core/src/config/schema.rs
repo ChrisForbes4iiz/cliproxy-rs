@@ -1,9 +1,9 @@
 //! Field shapes generated from Go structs at ae3ee3be. Runtime defaults and provider
 //! sanitizers are separate; this does not claim to replace those normalizers.
 use crate::gostr::GoStr;
+use crate::yaml::Value;
 use anyhow::{Context, bail};
 use serde_json::Value as Schema;
-use serde_yaml_ng::Value;
 use std::sync::LazyLock;
 
 static SCHEMA: LazyLock<Schema> =
@@ -492,7 +492,7 @@ mod tests {
     use super::*;
 
     fn yaml(text: &str) -> Value {
-        serde_yaml_ng::from_str(text).unwrap()
+        crate::yaml::from_str(text).unwrap()
     }
 
     /// Go's `ParseConfigBytes` and `ValidateV8Config` take an empty

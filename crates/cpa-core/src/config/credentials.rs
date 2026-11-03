@@ -14,8 +14,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::yaml::Value;
 use serde_json::{Map, Value as Json};
-use serde_yaml_ng::Value;
 use sha2::{Digest, Sha256};
 
 use super::Config;
@@ -171,7 +171,7 @@ fn groups<'a>(cfg: &'a Config, family: &str) -> &'a [Value] {
 
 /// `expandV8Groups`: a key inherits the group's base-url and shared fields; a key's
 /// own non-null value wins.
-fn expand(cfg: &Config, family: &str) -> Vec<((usize, usize), serde_yaml_ng::Mapping)> {
+fn expand(cfg: &Config, family: &str) -> Vec<((usize, usize), crate::yaml::Mapping)> {
     let mut out = Vec::new();
     for (g, group) in groups(cfg, family).iter().enumerate() {
         let Some(group) = group.as_mapping() else { continue };
@@ -182,7 +182,7 @@ fn expand(cfg: &Config, family: &str) -> Vec<((usize, usize), serde_yaml_ng::Map
             .flatten()
             .enumerate()
         {
-            let mut item = serde_yaml_ng::Mapping::new();
+            let mut item = crate::yaml::Mapping::new();
             for (field, value) in group {
                 let name = field.as_str().unwrap_or_default();
                 if name == "base-url" || SHARED.contains(&name) {
@@ -200,7 +200,7 @@ fn expand(cfg: &Config, family: &str) -> Vec<((usize, usize), serde_yaml_ng::Map
     out
 }
 
-fn decode(item: &serde_yaml_ng::Mapping) -> Key {
+fn decode(item: &crate::yaml::Mapping) -> Key {
     let get = |k: &str| item.get(k);
     Key {
         index: 0,

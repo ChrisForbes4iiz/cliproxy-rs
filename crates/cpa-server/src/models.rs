@@ -50,7 +50,7 @@ async fn list(
             .get("upstream")
             .and_then(|u| u.get("claude"))
             .and_then(|c| c.get("disable-cloaking-model-list"))
-            .and_then(serde_yaml_ng::Value::as_bool)
+            .and_then(cpa_core::yaml::Value::as_bool)
             .unwrap_or(false)
     };
     // Go `WriteModelListResponse`: plugin response interceptors see every list.

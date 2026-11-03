@@ -99,7 +99,7 @@ pub(crate) fn inject_x_search(cfg: &Config) -> bool {
         .get("upstream")
         .and_then(|p| p.get("xai"))
         .and_then(|x| x.get("inject-x-search"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false)
 }
 

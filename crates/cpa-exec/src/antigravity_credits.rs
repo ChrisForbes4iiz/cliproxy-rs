@@ -70,7 +70,7 @@ pub fn enabled(cfg: &Config) -> bool {
         .and_then(|o| o.get("providers"))
         .and_then(|p| p.get("antigravity"))
         .and_then(|a| a.get("antigravity-credits"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false)
 }
 

@@ -55,7 +55,7 @@ pub fn keepalive(cfg: &Config) -> Option<Duration> {
         .get("requests")
         .and_then(|r| r.get("streaming"))
         .and_then(|s| s.get("keepalive-seconds"))
-        .and_then(serde_yaml_ng::Value::as_i64)
+        .and_then(cpa_core::yaml::Value::as_i64)
         .unwrap_or(0);
     (seconds > 0).then(|| Duration::from_secs(seconds as u64))
 }
@@ -66,7 +66,7 @@ pub fn passthrough_headers(cfg: &Config) -> bool {
     cfg.document
         .get("requests")
         .and_then(|r| r.get("passthrough-headers"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false)
 }
 

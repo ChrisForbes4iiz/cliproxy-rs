@@ -53,7 +53,7 @@ pub(crate) async fn response(request: Request, next: Next) -> Response {
     }
 }
 
-fn setting<'a>(config: &'a cpa_core::config::Config, key: &str) -> Option<&'a serde_yaml_ng::Value> {
+fn setting<'a>(config: &'a cpa_core::config::Config, key: &str) -> Option<&'a cpa_core::yaml::Value> {
     config.document.get("observability")?.get("logs")?.get(key)
 }
 
@@ -72,7 +72,7 @@ pub fn router(management: &Arc<Management>, app: axum::Router) -> axum::Router {
         .document
         .get("server")
         .and_then(|s| s.get("commercial-mode"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         == Some(true)
     {
         return app;
@@ -117,7 +117,7 @@ async fn capture(State(state): State<CaptureState>, mut request: Request, next: 
         return next.run(request).await;
     }
     let config = state.rt.config();
-    let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
+    let enabled = setting(&config, "request-log").and_then(cpa_core::yaml::Value::as_bool) == Some(true);
     let multipart = request.headers().get("content-type").is_some_and(|v| {
         String::from_utf8_lossy(trim(v.as_bytes()))
             .go_lower()
@@ -240,7 +240,7 @@ async fn capture_response(sink: RequestLog, head: bool, mut response: Response) 
         let Some(record) = locked.as_ref() else { return response };
         (record.state.rt.clone(), record.enabled)
     };
-    let current_enabled = setting(&rt.config(), "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
+    let current_enabled = setting(&rt.config(), "request-log").and_then(cpa_core::yaml::Value::as_bool) == Some(true);
     if head && (current_enabled || (!enabled && response.status().as_u16() >= 400 && response.status().as_u16() != 499))
     {
         // Axum strips HEAD bodies after route middleware returns, so a lazy
@@ -454,12 +454,12 @@ fn commercial_mode(config: &cpa_core::config::Config) -> bool {
         .document
         .get("server")
         .and_then(|s| s.get("commercial-mode"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         == Some(true)
 }
 
 fn request_log_on(config: &cpa_core::config::Config) -> bool {
-    setting(config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
+    setting(config, "request-log").and_then(cpa_core::yaml::Value::as_bool) == Some(true)
 }
 
 impl cpa_core::exec::CaptureObserver for RequestLog {
@@ -878,7 +878,7 @@ impl HttpBody for ResponseBody {
                 }
             } else if let Some(record) = self.sink.0.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
                 let config = record.state.rt.config();
-                if self.buffer || setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true)
+                if self.buffer || setting(&config, "request-log").and_then(cpa_core::yaml::Value::as_bool) == Some(true)
                 {
                     record.response.extend_from_slice(bytes);
                 }
@@ -1155,7 +1155,7 @@ impl Record {
             return;
         }
         let config = self.state.rt.config();
-        let enabled = setting(&config, "request-log").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
+        let enabled = setting(&config, "request-log").and_then(cpa_core::yaml::Value::as_bool) == Some(true);
         let error = self.api_errors.iter().any(|(status, message)| {
             let lower = message.go_lower();
             *status != 499 && !lower.contains("context canceled") && !lower.contains("client closed request")
@@ -1223,7 +1223,7 @@ impl Record {
             return;
         }
         let max = setting(&config, "error-logs-max-files")
-            .and_then(serde_yaml_ng::Value::as_i64)
+            .and_then(cpa_core::yaml::Value::as_i64)
             .unwrap_or(10);
         let max = if max < 0 { 10 } else { max };
         let _ = tokio::task::spawn_blocking(move || {

@@ -419,13 +419,13 @@ pub fn global_aliases(cfg: &Config) -> HashMap<String, Vec<OAuthAlias>> {
         .document
         .get("oauth")
         .and_then(|o| o.get("model-alias"))
-        .and_then(serde_yaml_ng::Value::as_mapping)
+        .and_then(crate::yaml::Value::as_mapping)
     else {
         return out;
     };
     for (channel, list) in map {
         let channel = channel.as_str().unwrap_or_default().trim().go_lower();
-        let entries: Vec<OAuthAlias> = serde_yaml_ng::from_value(list.clone()).unwrap_or_default();
+        let entries: Vec<OAuthAlias> = crate::yaml::from_value(list.clone()).unwrap_or_default();
         let clean = sanitize_aliases(entries);
         if !channel.is_empty() && !clean.is_empty() {
             out.insert(channel, clean);

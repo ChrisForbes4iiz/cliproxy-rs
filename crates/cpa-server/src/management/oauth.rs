@@ -426,7 +426,7 @@ fn global_proxy(state: &Management) -> Proxy {
         .document
         .get("requests")
         .and_then(|r| r.get("proxy-url"))
-        .and_then(serde_yaml_ng::Value::as_str)
+        .and_then(cpa_core::yaml::Value::as_str)
         .unwrap_or_default();
     Proxy::parse(global)
 }
@@ -1253,7 +1253,7 @@ async fn start_forwarder(state: &Management, port: u16, path: &str) -> Result<u6
         .get("server")
         .and_then(|s| s.get("tls"))
         .and_then(|t| t.get("enable"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false);
     let target = format!("{}://127.0.0.1:{}{path}", if tls { "https" } else { "http" }, cfg.port);
     let previous = state

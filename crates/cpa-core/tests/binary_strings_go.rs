@@ -88,7 +88,7 @@ fn binary_scalars_decode_like_go() {
             }
         };
         let doc = &config.document;
-        let text = |v: Option<&serde_yaml_ng::Value>| v.and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+        let text = |v: Option<&cpa_core::yaml::Value>| v.and_then(|v| v.as_str()).unwrap_or_default().to_owned();
         let got = serde_json::json!({
             "secret_key": config.management.secret_key,
             "proxy_url": text(doc.get("requests").and_then(|r| r.get("proxy-url"))),

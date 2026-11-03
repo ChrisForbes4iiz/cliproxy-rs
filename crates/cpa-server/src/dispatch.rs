@@ -657,7 +657,7 @@ fn nonstream_keepalive(call: &Call, cfg: &Config) -> Option<Duration> {
         .document
         .get("requests")
         .and_then(|r| r.get("nonstream-keepalive-interval"))
-        .and_then(serde_yaml_ng::Value::as_i64)
+        .and_then(cpa_core::yaml::Value::as_i64)
         .unwrap_or(0);
     (seconds > 0).then(|| Duration::from_secs(seconds as u64))
 }
@@ -668,7 +668,7 @@ fn bootstrap_retries(cfg: &Config) -> usize {
         .get("requests")
         .and_then(|r| r.get("streaming"))
         .and_then(|s| s.get("bootstrap-retries"))
-        .and_then(serde_yaml_ng::Value::as_i64)
+        .and_then(cpa_core::yaml::Value::as_i64)
         .unwrap_or(0)
         .max(0) as usize
 }

@@ -236,12 +236,12 @@ async fn fetch_manifest(client: &wreq::Client, url: &str) -> Result<String, Stri
 /// The manifest's `version` as yaml.v3 decodes it into a string field: any scalar's
 /// text; a document that is not a mapping, or not YAML, fails.
 fn manifest_version(raw: &[u8]) -> Result<String, String> {
-    use serde_yaml_ng::Value;
+    use cpa_core::yaml::Value;
     let decode_error = |e: String| format!("decode antigravity Hub updater manifest: {e}");
     let document: Value = if raw.iter().all(u8::is_ascii_whitespace) {
         Value::Null
     } else {
-        serde_yaml_ng::from_slice(raw).map_err(|e| decode_error(e.to_string()))?
+        cpa_core::yaml::from_slice(raw).map_err(|e| decode_error(e.to_string()))?
     };
     let version = match &document {
         Value::Null => String::new(),

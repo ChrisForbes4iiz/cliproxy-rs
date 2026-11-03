@@ -101,7 +101,7 @@ fn binding_ttl(rt: &Runtime) -> Duration {
         .document
         .get("multimedia")
         .and_then(|m| m.get("video-result-auth-cache-ttl"))
-        .and_then(serde_yaml_ng::Value::as_str)
+        .and_then(cpa_core::yaml::Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(cpa_core::config::parse_duration)
@@ -751,7 +751,7 @@ async fn download(rt: &Runtime, video: &str, url: &str) -> Response {
             cfg.document
                 .get("requests")
                 .and_then(|r| r.get("proxy-url"))
-                .and_then(serde_yaml_ng::Value::as_str)
+                .and_then(cpa_core::yaml::Value::as_str)
                 .unwrap_or_default(),
         ),
     };

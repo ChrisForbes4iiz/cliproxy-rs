@@ -37,7 +37,6 @@ libc.workspace = true
 # The -tui management client: the crossterm backend only.
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde_json.workspace = true
-serde_yaml_ng.workspace = true
 # `all` for SO_REUSEPORT, which Go sets on mDNS sockets outside Linux.
 socket2 = { workspace = true, features = ["all"] }
 tokio.workspace = true

@@ -14,3 +14,4 @@ pub mod format;
 pub mod gostr;
 mod gostr_tables;
 pub mod registry;
+pub mod yaml;

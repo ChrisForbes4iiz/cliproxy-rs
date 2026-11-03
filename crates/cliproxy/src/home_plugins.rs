@@ -62,7 +62,7 @@ fn sync_key(cfg: &SyncConfig) -> String {
         if !node.is_null() {
             // Go hashes `yaml.Marshal(&item.Raw)`: the text, not only the value.
             let raw = cfg.raw_configs.get(id.as_str()).unwrap_or(node);
-            key.push_str(&serde_yaml_ng::to_string(raw).unwrap_or_default());
+            key.push_str(&cpa_core::yaml::to_string(raw).unwrap_or_default());
         }
         key.push('\n');
     }
@@ -424,7 +424,7 @@ mod tests {
             "plugins:\n  enabled: {enabled}\n  dir: {}\n  configs:{configs}\n",
             dir.display()
         );
-        SyncConfig::from_document(&serde_yaml_ng::from_str(&text).unwrap())
+        SyncConfig::from_document(&cpa_core::yaml::from_str(&text).unwrap())
     }
 
     fn plugins() -> HomePlugins {

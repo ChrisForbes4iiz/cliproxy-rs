@@ -119,18 +119,18 @@ impl UsageQueue {
         let usage = cfg.document.get("observability").and_then(|o| o.get("usage"));
         let statistics = usage
             .and_then(|u| u.get("usage-statistics-enabled"))
-            .and_then(serde_yaml_ng::Value::as_bool)
+            .and_then(cpa_core::yaml::Value::as_bool)
             .unwrap_or(false);
         self.claude_cache.store(
             usage
                 .and_then(|u| u.get("claude-cache-telemetry"))
-                .and_then(serde_yaml_ng::Value::as_bool)
+                .and_then(cpa_core::yaml::Value::as_bool)
                 .unwrap_or(false),
             Ordering::SeqCst,
         );
         let retention = usage
             .and_then(|u| u.get("redis-usage-queue-retention-seconds"))
-            .and_then(serde_yaml_ng::Value::as_i64)
+            .and_then(cpa_core::yaml::Value::as_i64)
             .unwrap_or(0);
         self.statistics.store(statistics, Ordering::SeqCst);
         self.retention_seconds.store(

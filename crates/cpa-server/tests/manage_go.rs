@@ -95,7 +95,7 @@ fn yaml_bool_spellings_and_durations_load_like_go() {
         let flag = |path: &[&str]| {
             path.iter()
                 .try_fold(&cfg.document, |node, part| node.get(*part))
-                .and_then(serde_yaml_ng::Value::as_bool)
+                .and_then(cpa_core::yaml::Value::as_bool)
                 .unwrap_or(false)
         };
         let got = match field {
@@ -105,8 +105,8 @@ fn yaml_bool_spellings_and_durations_load_like_go() {
             "plugins.configs.x.enabled" => {
                 let raw = cfg.document["plugins"]["configs"]["x"]["enabled"].clone();
                 json!(match &raw {
-                    serde_yaml_ng::Value::Bool(b) => *b,
-                    serde_yaml_ng::Value::String(s) => cpa_core::config::go_bool(s).unwrap_or(false),
+                    cpa_core::yaml::Value::Bool(b) => *b,
+                    cpa_core::yaml::Value::String(s) => cpa_core::config::go_bool(s).unwrap_or(false),
                     _ => false,
                 })
             }
@@ -141,13 +141,13 @@ fn typed_scalars_and_raw_plugin_entries_load_like_go() {
         let entry = cfg.document["plugins"]["configs"].get("x").cloned().unwrap();
         // Go's raw view of a null entry is `{}`.
         let raw: Value = match &entry {
-            serde_yaml_ng::Value::Null => json!({}),
+            cpa_core::yaml::Value::Null => json!({}),
             other => serde_json::to_value(other).unwrap(),
         };
         assert_eq!(raw, raw_view["body"], "{name}: raw view");
         let enabled = entry.get("enabled").and_then(|v| match v {
-            serde_yaml_ng::Value::Bool(b) => Some(*b),
-            serde_yaml_ng::Value::String(s) => cpa_core::config::go_bool(s),
+            cpa_core::yaml::Value::Bool(b) => Some(*b),
+            cpa_core::yaml::Value::String(s) => cpa_core::config::go_bool(s),
             _ => None,
         });
         let priority = entry.get("priority").and_then(cpa_core::config::go_int);
@@ -178,7 +178,7 @@ fn yaml_merge_keys_load_like_go() {
                 .get("observability")
                 .and_then(|o| o.get("logs"))
                 .and_then(|l| l.get(key))
-                .and_then(serde_yaml_ng::Value::as_bool)
+                .and_then(cpa_core::yaml::Value::as_bool)
                 .unwrap_or(false)
         };
         let claude: Vec<Value> = credentials::from_config(&cfg)
@@ -321,14 +321,14 @@ fn oauth_only_presence_matches_go() {
     let view = cfg.for_api_key();
     assert_eq!(
         view.document["upstream"]["codex"]["disable-codex-cloaking"],
-        serde_yaml_ng::Value::Bool(true)
+        cpa_core::yaml::Value::Bool(true)
     );
     let codex = &view.document["oauth"]["providers"]["codex"];
-    assert_eq!(codex["header-defaults"]["user-agent"], serde_yaml_ng::Value::from(""));
+    assert_eq!(codex["header-defaults"]["user-agent"], cpa_core::yaml::Value::from(""));
     assert!(codex["live-media-relay"].get("ice-servers").is_none());
     assert_eq!(
         view.document["oauth"]["providers"]["aistudio"]["ws-auth"],
-        serde_yaml_ng::Value::Bool(false)
+        cpa_core::yaml::Value::Bool(false)
     );
     assert!(view.oauth_only.is_empty());
     let legacy = Config::parse(cases[0]["yaml"].as_str().unwrap()).unwrap();
@@ -1014,7 +1014,7 @@ mod creds {
     }
 
     fn config_credentials(config: &Value) -> Vec<Value> {
-        let yaml = serde_yaml_ng::to_string(config).unwrap();
+        let yaml = cpa_core::yaml::to_string(config).unwrap();
         let cfg = Config::parse(&yaml).unwrap();
         credentials::from_config(&cfg)
             .iter()
@@ -1290,7 +1290,7 @@ mod creds {
                 // Config effects, compared through the credentials they synthesize.
                 let file = std::fs::read_to_string(&path).unwrap();
                 let rust_config: Value =
-                    serde_json::to_value(serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&file).unwrap()).unwrap();
+                    serde_json::to_value(cpa_core::yaml::from_str::<cpa_core::yaml::Value>(&file).unwrap()).unwrap();
                 assert_eq!(
                     config_credentials(&rust_config),
                     config_credentials(&step["config"]),

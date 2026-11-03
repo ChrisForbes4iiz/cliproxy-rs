@@ -63,6 +63,7 @@ cliproxy-rs is a drop-in Rust replacement for the Go CLIProxyAPI server: one HTT
 
 ```
 cpa-core      config.yaml, credential files, ExecRequest/ExecStream envelope, Format, GoStr, static model registry. No networking.
+              Its `yaml` module is the workspace's only YAML parser (granit-parser plus a port of yaml.v3's scalar resolution; docs/YAML-PARSER.md).
 cpa-common    Go-exact pure helpers: json (gjson/sjson/encoding-json port), thinking, signature, payload rules, session identity, gemini_schema.
 cpa-translate (client format, upstream format) pairs: request, non_stream, stream, token_count. Registered with the `registered!` macro in lib.rs.
 cpa-exec      one executor per provider (claude, codex, gemini, antigravity, devin, aistudio, ...). Owns wire format, auth headers, TLS/HTTP profile.

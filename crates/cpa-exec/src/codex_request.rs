@@ -73,7 +73,7 @@ pub(crate) struct Settings {
 /// `upstream.codex.response-steering`; the older spellings are already moved there.
 pub(crate) fn response_steering(cfg: &Config) -> bool {
     setting(cfg, &["upstream", "codex", "response-steering"])
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false)
 }
 
@@ -81,11 +81,11 @@ pub(crate) fn response_steering(cfg: &Config) -> bool {
 /// true (YAML 1.1 spellings such as `yes` are normalised by the config schema).
 pub(crate) fn chatgpt_keep_alive(cfg: &Config) -> bool {
     setting(cfg, &["oauth", "providers", "codex", "chatgpt-keep-alive"])
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false)
 }
 
-fn setting<'a>(cfg: &'a Config, path: &[&str]) -> Option<&'a serde_yaml_ng::Value> {
+fn setting<'a>(cfg: &'a Config, path: &[&str]) -> Option<&'a cpa_core::yaml::Value> {
     path.iter().try_fold(&cfg.document, |v, k| v.get(*k))
 }
 

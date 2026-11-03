@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use serde_yaml_ng::{Mapping, Value};
+use cpa_core::yaml::{Mapping, Value};
 
 use crate::platform;
 
@@ -449,7 +449,7 @@ fn scalar(value: &Value, raw: Option<&Value>) -> String {
         (Value::String(s), _) => quoted(s),
         (Value::Mapping(_), _) => "{}".to_owned(),
         (Value::Sequence(_), _) => "[]".to_owned(),
-        _ => serde_yaml_ng::to_string(value)
+        _ => cpa_core::yaml::to_string(value)
             .unwrap_or_default()
             .trim_end()
             .to_owned(),
@@ -541,7 +541,7 @@ mod tests {
             };
             assert_eq!(check_json_item(fields).err(), want, "{body}");
         }
-        let yaml = |s: &str| serde_yaml_ng::from_str::<Value>(s).unwrap();
+        let yaml = |s: &str| cpa_core::yaml::from_str::<Value>(s).unwrap();
         assert_eq!(yaml_int(&yaml("5.7")), Some(5));
         assert_eq!(yaml_int(&yaml("!!int 5")), Some(5));
         assert_eq!(yaml_int(&yaml("!foo 123")), None);
@@ -551,7 +551,7 @@ mod tests {
     }
 
     fn doc(text: &str) -> Value {
-        serde_yaml_ng::from_str(text).unwrap()
+        cpa_core::yaml::from_str(text).unwrap()
     }
 
     /// Go `TestRuntimeConfigYAMLAddsHostDefaultsToRawPluginConfig` and the item rules of

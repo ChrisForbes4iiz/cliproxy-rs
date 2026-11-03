@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use cpa_core::config::Config;
 use cpa_core::credential::{Credential, Source};
 use cpa_core::exec::{ExecError, FailureScope};
+use cpa_core::yaml::{Mapping, Value as Yaml};
 use cpa_home::dispatch::{DispatchResponse, decode_concurrency, decode_error, verify_identity};
 use cpa_home::registry::{Registry, ScopeSpec};
 use cpa_home::release::ReleaseFlusher;
@@ -23,7 +24,6 @@ use cpa_server::remote::{
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value};
-use serde_yaml_ng::{Mapping, Value as Yaml};
 use tokio_util::sync::CancellationToken;
 
 /// Go main's 30-second contexts around the Home bootstrap.
@@ -1368,7 +1368,7 @@ mod tests {
         ))
         .unwrap();
         let fixture =
-            serde_yaml_ng::to_value(serde_json::json!({"credentials": {"in-flight": fixture["config"]}})).unwrap();
+            cpa_core::yaml::to_value(serde_json::json!({"credentials": {"in-flight": fixture["config"]}})).unwrap();
         assert_eq!(
             CredentialInFlight::from_document(&fixture),
             CredentialInFlight::default()

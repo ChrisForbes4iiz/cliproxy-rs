@@ -815,23 +815,23 @@ pub fn compat_cooling(cfg: &cpa_core::config::Config) -> Vec<(String, Option<boo
     cfg.document
         .get("api-keys")
         .and_then(|k| k.get("openai-compatibility"))
-        .and_then(serde_yaml_ng::Value::as_sequence)
+        .and_then(cpa_core::yaml::Value::as_sequence)
         .into_iter()
         .flatten()
         .filter(|g| {
             g.get("base-url")
-                .and_then(serde_yaml_ng::Value::as_str)
+                .and_then(cpa_core::yaml::Value::as_str)
                 .is_some_and(|b| !b.trim().is_empty())
-                && g.get("disabled").and_then(serde_yaml_ng::Value::as_bool) != Some(true)
+                && g.get("disabled").and_then(cpa_core::yaml::Value::as_bool) != Some(true)
         })
         .map(|g| {
             (
                 g.get("name")
-                    .and_then(serde_yaml_ng::Value::as_str)
+                    .and_then(cpa_core::yaml::Value::as_str)
                     .unwrap_or_default()
                     .trim()
                     .to_owned(),
-                g.get("disable-cooling").and_then(serde_yaml_ng::Value::as_bool),
+                g.get("disable-cooling").and_then(cpa_core::yaml::Value::as_bool),
             )
         })
         .collect()

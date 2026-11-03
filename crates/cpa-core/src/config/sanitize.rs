@@ -3,7 +3,7 @@
 //! config_yaml.go pruneMappingToGeneratedKeys). An emptied map stays as `{}`.
 use std::collections::HashSet;
 
-use serde_yaml_ng::{Mapping, Value};
+use crate::yaml::{Mapping, Value};
 
 use crate::gostr::GoStr;
 

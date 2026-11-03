@@ -380,7 +380,7 @@ pub(crate) fn details(old_cfg: &Config, new_cfg: &Config) -> Vec<String> {
             "disable-control-panel": m.disable_control_panel,
             "disable-auto-update-panel": m.disable_auto_update_panel,
             "panel-github-repository": if crate::gojson::trim(&m.panel_github_repository).is_empty() { "https://github.com/router-for-me/Cli-Proxy-API-Management-Center" } else { crate::gojson::trim(&m.panel_github_repository) },
-            "base-url": cfg.document.get("management").and_then(|m| m.get("base-url")).and_then(serde_yaml_ng::Value::as_str).unwrap_or_default(),
+            "base-url": cfg.document.get("management").and_then(|m| m.get("base-url")).and_then(cpa_core::yaml::Value::as_str).unwrap_or_default(),
         });
         view
     };
@@ -523,7 +523,7 @@ pub(crate) fn log(old: &Config, new: &Config) {
             .get("observability")
             .and_then(|v| v.get("logs"))
             .and_then(|v| v.get("debug"))
-            .and_then(serde_yaml_ng::Value::as_bool)
+            .and_then(cpa_core::yaml::Value::as_bool)
             .unwrap_or(false)
     };
     let old_debug = debug(old);

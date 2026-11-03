@@ -347,7 +347,7 @@ async fn replay(op: &str, args: &Value, installs: &mut Installs) -> Value {
         }
         "manifest_validate" => plain(go::<Manifest>(&args["manifest"]).validate(), |()| Value::Null),
         "manifest_yaml" => {
-            let node: serde_yaml_ng::Value = serde_yaml_ng::from_str(&str_of(args, "text")).unwrap();
+            let node: cpa_core::yaml::Value = cpa_core::yaml::from_str(&str_of(args, "text")).unwrap();
             let decoded = Manifest::from_yaml(&node);
             let m = decoded.clone().unwrap_or_default();
             let (id, url) = if decoded.is_some() {

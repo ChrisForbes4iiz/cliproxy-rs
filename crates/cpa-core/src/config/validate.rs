@@ -3,8 +3,8 @@
 //! (internal/config/codex_live.go), and the model catalog sources Go checks while
 //! decoding (internal/registry/catalog_config.go). Messages are Go's.
 
+use crate::yaml::Value;
 use anyhow::{Result, bail};
-use serde_yaml_ng::Value;
 
 use super::go_url;
 
@@ -372,7 +372,7 @@ mod tests {
     /// `TestCredentialInFlightConfigRejectsUnsafeBounds`.
     #[test]
     fn in_flight_bounds_follow_go() {
-        let valid = |yaml: &str| in_flight(Some(&serde_yaml_ng::from_str::<Value>(yaml).unwrap())).is_ok();
+        let valid = |yaml: &str| in_flight(Some(&crate::yaml::from_str::<Value>(yaml).unwrap())).is_ok();
         assert!(valid(""), "the defaults");
         assert!(
             valid("snapshot-interval: 1s\nstale-after: 3s\n"),

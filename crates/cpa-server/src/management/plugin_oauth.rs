@@ -42,7 +42,7 @@ fn callback_url(state: &Management, path: &str) -> Option<String> {
         .get("server")
         .and_then(|s| s.get("tls"))
         .and_then(|t| t.get("enable"))
-        .and_then(serde_yaml_ng::Value::as_bool)
+        .and_then(cpa_core::yaml::Value::as_bool)
         .unwrap_or(false);
     Some(format!(
         "{}://127.0.0.1:{}{path}",

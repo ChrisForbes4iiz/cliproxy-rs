@@ -9,9 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::yaml::{Mapping, Value};
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
-use serde_yaml_ng::{Mapping, Value};
 
 mod binary;
 pub mod credentials;
@@ -20,7 +20,7 @@ pub mod go_url;
 mod sanitize;
 mod schema;
 mod text;
-mod timestamp;
+pub(crate) mod timestamp;
 mod trusted;
 mod validate;
 pub use binary::{PLAIN as PLAIN_SCALAR, double_quoted as yaml_double_quoted};
@@ -29,54 +29,15 @@ pub use schema::validate as validate_config_fields;
 pub use schema::{coerce_typed_scalars, go_bool, go_int};
 pub use timestamp::{AsJson, TAG as TIMESTAMP_TAG};
 
-/// `text` parsed as serde_yaml_ng does, except for plain scalars it reads otherwise
-/// than yaml.v3: an integer beyond int64 and uint64, which serde_yaml_ng refuses when
-/// it fits 128 bits (yaml.v3 reads a decimal one as a float and any other, `0x…` or
-/// `0o…`, as text), and a number with underscores (`1_000`) or a leading zero (`007`,
-/// `08`), which serde_yaml_ng reads as text and yaml.v3 as a number. Those scalars are
-/// read as yaml.v3 reads them, and a timestamp (`2001-12-14`), which yaml.v3 reads into
-/// an untyped value as a `time.Time`, is its RFC 3339 text tagged [`TIMESTAMP_TAG`]. A
-/// string setting still gets the scalar's text from the literal walk, which reads `text`
-/// itself; such a mapping key stays text, as yaml.v3 reads it into a string-keyed map.
-pub fn parse_yaml(text: &str) -> Result<Value, serde_yaml_ng::Error> {
-    // serde_yaml_ng, like libyaml with its encoding set, reads a leading BOM as part of
-    // the first line, which then fails a second top-level key; yaml.v3 skips it.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let parse = |text: &str| serde_yaml_ng::from_str::<Value>(text);
-    // Without an underscore or a leading zero, only a failed parse needs a second look;
-    // it keeps its error when no scalar is rewritten.
-    let err = if may_resolve(text) {
-        None
-    } else {
-        match parse(text) {
-            Ok(value) if !needs_scan(&value) => return Ok(value),
-            Ok(_) => None,
-            Err(err) => Some(err),
-        }
-    };
-    let as_is = |err: Option<serde_yaml_ng::Error>| err.map_or_else(|| parse(text), Err);
-    let Ok(scalars) = binary::plain_scalars(text) else {
-        return as_is(err);
-    };
-    // One pass over the scalars, then one parse.
-    let mut out = String::with_capacity(text.len());
-    let mut last = 0;
-    for plain in scalars.into_iter().filter(|p| p.timestamp_tag.is_none()) {
-        let read = std::str::from_utf8(&plain.value)
-            .ok()
-            .and_then(|s| go_read(s, plain.key));
-        let (Some(read), Some(before)) = (read, text.get(last..plain.span.start)) else {
-            continue;
-        };
-        out.push_str(before);
-        out.push_str(&read);
-        last = plain.span.end;
-    }
-    if last == 0 {
-        return as_is(err);
-    }
-    out.push_str(&text[last.min(text.len())..]);
-    parse(&out)
+/// `text` parsed by [`crate::yaml::from_str`], which reads plain scalars as yaml.v3
+/// does: `1_000`, `007`, `08`, `0o17` and integers past 64 bits as yaml.v3 resolves
+/// them, and a timestamp (`2001-12-14`), which yaml.v3 reads into an untyped value as a
+/// `time.Time`, as its RFC 3339 text tagged [`TIMESTAMP_TAG`]. A string setting still
+/// gets the scalar's text from the literal walk, which reads `text` itself; a mapping
+/// key keeps serde_yaml_ng's reading (`1_000:` stays text), as yaml.v3 reads such a key
+/// into a string-keyed map. A leading BOM is skipped, as yaml.v3 skips it.
+pub fn parse_yaml(text: &str) -> Result<Value, crate::yaml::Error> {
+    crate::yaml::from_str(text)
 }
 
 /// `value` as serde_yaml_ng writes it, except that a string [`parse_yaml`] would read
@@ -84,8 +45,8 @@ pub fn parse_yaml(text: &str) -> Result<Value, serde_yaml_ng::Error> {
 /// `2001-12-14`) is double-quoted, as yaml.v3 quotes it, and a [`TIMESTAMP_TAG`] value
 /// is its text, plain, as yaml.v3 writes a `time.Time`. serde_yaml_ng quotes only the
 /// strings it reads as something else itself.
-pub fn yaml_string(value: &Value) -> Result<String, serde_yaml_ng::Error> {
-    let text = serde_yaml_ng::to_string(value)?;
+pub fn yaml_string(value: &Value) -> Result<String, crate::yaml::Error> {
+    let text = crate::yaml::to_string(value)?;
     // A number serde_yaml_ng writes has no underscore or leading zero, so each scalar
     // flagged here is a string. It quotes a string beyond 64 bits (`'18446744073709551616'`)
     // itself.
@@ -850,73 +811,7 @@ fn binary_secret(text: &str, tree: &Value) -> anyhow::Result<bool> {
 /// and whose nulls stay null. Custom tags are dropped. Keys are kept as parsed;
 /// aliases are expanded, merges are not.
 fn scalar_texts(text: &str) -> anyhow::Result<Value> {
-    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-    struct Shaped<'a>(&'a Value);
-    struct Entries<'a>(&'a Mapping);
-    struct Items<'a>(&'a [Value]);
-    impl<'de> DeserializeSeed<'de> for Shaped<'_> {
-        type Value = Value;
-        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
-            match self.0 {
-                Value::Mapping(map) => d.deserialize_map(Entries(map)),
-                Value::Sequence(items) => d.deserialize_seq(Items(items)),
-                Value::Null => IgnoredAny::deserialize(d).map(|_| Value::Null),
-                // A plain timestamp, which parse_yaml tags; the text holds no tag.
-                Value::Tagged(tagged) if tagged.tag == timestamp::TAG => String::deserialize(d).map(Value::String),
-                // A custom tag reaches serde as an enum variant; Go reads the node.
-                Value::Tagged(tagged) => d.deserialize_any(Untagged(&tagged.value)),
-                _ => String::deserialize(d).map(Value::String),
-            }
-        }
-    }
-    struct Untagged<'a>(&'a Value);
-    impl<'de> Visitor<'de> for Untagged<'_> {
-        type Value = Value;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a tagged node")
-        }
-        fn visit_enum<A: serde::de::EnumAccess<'de>>(self, access: A) -> Result<Value, A::Error> {
-            use serde::de::VariantAccess as _;
-            let (IgnoredAny, variant) = access.variant()?;
-            match self.0 {
-                Value::Mapping(_) | Value::Sequence(_) => variant.newtype_variant_seed(Shaped(self.0)),
-                // Text even when spelled `null` or `~`: only a `!!null` node is null.
-                _ => variant.newtype_variant::<String>().map(Value::String),
-            }
-        }
-    }
-    impl<'de> Visitor<'de> for Entries<'_> {
-        type Value = Value;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a mapping")
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
-            let mut out = Mapping::new();
-            for (key, value) in self.0 {
-                access.next_key::<IgnoredAny>()?;
-                out.insert(key.clone(), access.next_value_seed(Shaped(value))?);
-            }
-            Ok(Value::Mapping(out))
-        }
-    }
-    impl<'de> Visitor<'de> for Items<'_> {
-        type Value = Value;
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("a sequence")
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Value, A::Error> {
-            let mut out = Vec::with_capacity(self.0.len());
-            for item in self.0 {
-                out.push(access.next_element_seed(Shaped(item))?.unwrap_or(Value::Null));
-            }
-            Ok(Value::Sequence(out))
-        }
-    }
-    use serde::Deserialize as _;
-    // The shape and the text must hold the same nodes; parse_yaml skips a BOM.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let shape: Value = parse_yaml(text)?;
-    Ok(Shaped(&shape).deserialize(serde_yaml_ng::Deserializer::from_str(text))?)
+    Ok(crate::yaml::load::texts(text)?)
 }
 
 /// Go `yamlScalarExists`: a non-null scalar whose text is `value` anywhere below `node`
@@ -1100,7 +995,7 @@ fn looks_like_bcrypt(key: &[u8]) -> bool {
 fn decode_section<T: serde::de::DeserializeOwned + Default>(root: &Mapping, name: &str) -> anyhow::Result<T> {
     match lookup(root, name) {
         None | Some(Value::Null) => Ok(T::default()),
-        Some(value) => Ok(serde_yaml_ng::from_value(null_scalars_to_zero(value.clone()))?),
+        Some(value) => Ok(crate::yaml::from_value(null_scalars_to_zero(value.clone()))?),
     }
 }
 
@@ -1236,7 +1131,7 @@ mod tests {
     /// API keeps it (Go's v8 upload refuses unknown sections), and its type is checked.
     #[test]
     fn worker_threads_is_a_known_int() {
-        let doc = |text: &str| serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text).unwrap();
+        let doc = |text: &str| crate::yaml::from_str::<crate::yaml::Value>(text).unwrap();
         validate_config_fields(&doc("config-version: 8\nworker-threads: 3\n"), true).unwrap();
         assert!(validate_config_fields(&doc("worker-threads: many\n"), true).is_err());
         assert!(validate_config_fields(&doc("worker-thread: 3\n"), true).is_err());
@@ -1493,7 +1388,7 @@ mod tests {
             ("providers: {codex: {optimize-multi-agent-v2: true}}\n", true),
             ("client: {codex: {optimize-multi-agent-v2: false}}\n", true),
         ] {
-            let value: Value = serde_yaml_ng::from_str(raw).unwrap();
+            let value: Value = crate::yaml::from_str(raw).unwrap();
             assert_eq!(is_v8_layout(&value), v8, "{raw}");
         }
     }
@@ -1854,15 +1749,7 @@ oauth-excluded-models: {{c: [{numbers}]}}
                 serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
             ),
             (
-                "x: &a\u{2028}  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
                 "x: &a\n  # c\n  2001-12-14\n  21:59:43\ny: *a\n",
-                serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
-            ),
-            (
-                "x: &a\u{2029}  2001-12-14\n  21:59:43\ny: *a\n",
                 serde_json::json!({"x": "2001-12-14T21:59:43Z", "y": "2001-12-14T21:59:43Z"}),
             ),
             (
@@ -1884,6 +1771,13 @@ oauth-excluded-models: {{c: [{numbers}]}}
         ] {
             let json = serde_json::to_value(AsJson(&yaml_value(text).unwrap())).unwrap();
             assert_eq!(json, want, "{text}");
+        }
+        // U+2028 and U+2029 end a line for libyaml and yaml.v3 (YAML 1.1) but not for
+        // granit-parser (YAML 1.2): after an anchor they belong to its name, so the alias
+        // names no anchor and the file is refused (docs/DIFFERENCES-FROM-GO.md).
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let text = format!("x: &a{separator}  2001-12-14\n  21:59:43\ny: *a\n");
+            assert!(yaml_value(&text).is_err(), "{text:?}");
         }
         let directive = yaml_value("%TAG ! tag:example.com,2000:\n---\nx: 2001-12-14\n").unwrap();
         assert!(

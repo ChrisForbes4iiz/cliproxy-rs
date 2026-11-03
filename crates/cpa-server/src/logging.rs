@@ -180,11 +180,11 @@ pub fn configure(cfg: &Config) {
         return;
     }
     let next = Applied {
-        logging_to_file: logs_setting(cfg, "logging-to-file").and_then(serde_yaml_ng::Value::as_bool) == Some(true),
+        logging_to_file: logs_setting(cfg, "logging-to-file").and_then(cpa_core::yaml::Value::as_bool) == Some(true),
         max_total_mb: logs_setting(cfg, "logs-max-total-size-mb")
-            .and_then(serde_yaml_ng::Value::as_i64)
+            .and_then(cpa_core::yaml::Value::as_i64)
             .unwrap_or(0),
-        debug: logs_setting(cfg, "debug").and_then(serde_yaml_ng::Value::as_bool) == Some(true),
+        debug: logs_setting(cfg, "debug").and_then(cpa_core::yaml::Value::as_bool) == Some(true),
     };
     let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
     let previous = *state;
@@ -200,7 +200,7 @@ pub fn configure(cfg: &Config) {
     }
 }
 
-fn logs_setting<'a>(cfg: &'a Config, key: &str) -> Option<&'a serde_yaml_ng::Value> {
+fn logs_setting<'a>(cfg: &'a Config, key: &str) -> Option<&'a cpa_core::yaml::Value> {
     cfg.document.get("observability")?.get("logs")?.get(key)
 }
 

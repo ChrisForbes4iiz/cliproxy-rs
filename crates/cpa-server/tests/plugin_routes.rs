@@ -477,7 +477,7 @@ async fn plugin_routes_match_go() {
             }
             "plugins" => {
                 let text = std::fs::read_to_string(&dirs.config).unwrap();
-                let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
+                let doc: cpa_core::yaml::Value = cpa_core::yaml::from_str(&text).unwrap();
                 let plugins = serde_json::to_string(&doc["plugins"]).unwrap();
                 serde_json::from_str(&dirs.normalize(&plugins)).unwrap()
             }

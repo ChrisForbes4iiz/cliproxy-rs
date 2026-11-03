@@ -971,7 +971,7 @@ pub async fn login(auth_dir: &Path, cfg: &Config, options: &LoginOptions) -> Res
             cfg.document
                 .get("requests")
                 .and_then(|r| r.get("proxy-url"))
-                .and_then(serde_yaml_ng::Value::as_str)
+                .and_then(cpa_core::yaml::Value::as_str)
                 .unwrap_or_default(),
         );
         let oauth = OAuth::new(GoClients::new(Default::default()).get(&proxy));

@@ -9,8 +9,8 @@
 //! alias or merge in a file with a tag that could be binary, and any file with a
 //! Unicode line separator, and a `!!binary` value that is not UTF-8, which the config
 //! decoder refuses. Those cases expect Rust's refusal.
+use cpa_core::yaml::Value;
 use serde_json::Value as Json;
-use serde_yaml_ng::Value;
 
 fn masked(v: Json) -> Json {
     match v {

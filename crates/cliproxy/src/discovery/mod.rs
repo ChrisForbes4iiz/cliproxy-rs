@@ -7,8 +7,8 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use cpa_core::yaml::Value as Yaml;
 use serde_json::{Value, json};
-use serde_yaml_ng::Value as Yaml;
 
 pub mod advertise;
 pub mod cli;

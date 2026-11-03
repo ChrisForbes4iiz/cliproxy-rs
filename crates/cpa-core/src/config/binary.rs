@@ -5,7 +5,7 @@
 //! with the non-specific `!` tag implicitly, and treats the literal short tags
 //! `!!binary`, `!!null` and `!!str` that its `shortTag` keeps (`!<!!null>`,
 //! `!%21binary`) as the standard ones; serde_yaml_ng wraps all of those as tagged
-//! values. The tags come from libyaml's own events, so handles, `%TAG` directives and
+//! values. The tags come from granit-parser's events, so handles, `%TAG` directives and
 //! `%XX` escapes resolve as they do for yaml.v3.
 //!
 //! What this does not follow is refused rather than read differently: other literal
@@ -18,12 +18,10 @@
 //! serde_yaml_ng's expanded aliases no longer show.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::CStr;
-use std::mem::MaybeUninit;
 use std::rc::Rc;
 
+use crate::yaml::Value;
 use anyhow::{Context, bail, ensure};
-use serde_yaml_ng::Value;
 
 const UNSUPPORTED_TAG: &str = "a YAML tag in the config file is not supported";
 const UNSUPPORTED_KEY: &str = "a tagged or aliased mapping key in the config file is not supported";
@@ -42,16 +40,7 @@ const MAX_VISITS: usize = 1 << 22;
 /// Go's `base64.StdEncoding` as yaml.v3 applies it: padding required, unused bits
 /// ignored, CR and LF skipped. `None` for invalid data.
 pub(super) fn go_base64(text: &[u8]) -> Option<Vec<u8>> {
-    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
-    use base64::{Engine as _, alphabet};
-    let engine = GeneralPurpose::new(
-        &alphabet::STANDARD,
-        GeneralPurposeConfig::new()
-            .with_decode_allow_trailing_bits(true)
-            .with_decode_padding_mode(DecodePaddingMode::RequireCanonical),
-    );
-    let payload: Vec<u8> = text.iter().copied().filter(|b| !matches!(b, b'\r' | b'\n')).collect();
-    engine.decode(payload).ok()
+    crate::yaml::go_base64(text)
 }
 
 /// Rewrites the tagged scalars in `value`, which serde_yaml_ng parsed from `text` with
@@ -259,8 +248,8 @@ enum Event {
     End,
 }
 
-/// Fails on a tagged node or a document start whose source contains `%00`: libyaml
-/// cuts a tag at the NUL, so its tag would not be the one Go reads.
+/// Fails on a tag holding a NUL (a `%00` escape), which libyaml cut and Go keeps;
+/// refused as it was while these events came from libyaml.
 fn events(text: &str) -> anyhow::Result<Vec<Event>> {
     events_with(text, None)
 }
@@ -270,8 +259,6 @@ pub(super) struct Plain {
     /// Its byte span in the text.
     pub span: std::ops::Range<usize>,
     pub value: Vec<u8>,
-    /// Whether it is a mapping key.
-    pub key: bool,
     /// Where its [`super::timestamp::TAG`] starts, when it has that tag.
     pub timestamp_tag: Option<usize>,
 }
@@ -283,158 +270,93 @@ pub(super) fn plain_scalars(text: &str) -> anyhow::Result<Vec<Plain>> {
     Ok(out)
 }
 
-/// [`events`], recording each untagged plain scalar in `plain`.
+/// [`events`], recording each untagged plain scalar in `plain`. Only the first
+/// document is read, as [`crate::yaml::from_str`] reads it.
 fn events_with(text: &str, mut plain: Option<&mut Vec<Plain>>) -> anyhow::Result<Vec<Event>> {
-    let nul_escape = text.contains("%00");
-    // libyaml with its encoding set reads a leading BOM as a character, indenting the
-    // first line by one, so it is fed without it and its marks shifted past it.
-    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
-    struct Parser(Box<MaybeUninit<unsafe_libyaml::yaml_parser_t>>);
-    impl Drop for Parser {
-        fn drop(&mut self) {
-            // SAFETY: only built after a successful yaml_parser_initialize.
-            unsafe { unsafe_libyaml::yaml_parser_delete(self.0.as_mut_ptr()) }
-        }
-    }
-    fn bytes(ptr: *const u8) -> Option<Vec<u8>> {
-        // SAFETY: libyaml's anchors and tags are NUL-terminated or null.
-        (!ptr.is_null()).then(|| unsafe { CStr::from_ptr(ptr.cast()) }.to_bytes().to_vec())
-    }
+    use granit_parser::Event as E;
+    let options = granit_parser::options! {
+        emit_anchor_events: true,
+        emit_comments: false,
+        flow_nesting_limit: crate::yaml::load::MAX_DEPTH,
+        block_nesting_limit: crate::yaml::load::MAX_DEPTH,
+    };
+    // granit-parser keeps a `%00` escape in a tag as a NUL, as Go does; refused still,
+    // as it was while the tags came from libyaml, which cut them there.
+    let nul = |tag: &Option<Vec<u8>>| tag.as_ref().is_some_and(|t| t.contains(&0));
+    let full = |tag: Option<std::borrow::Cow<'_, granit_parser::Tag>>| {
+        tag.map(|t| format!("{}{}", t.handle(), t.suffix()).into_bytes())
+    };
     let mut out = Vec::new();
-    // Each open collection: whether it is a mapping, and its nodes so far.
-    let mut open: Vec<(bool, usize)> = Vec::new();
-    // SAFETY: the parser is boxed, so it does not move while libyaml holds pointers
-    // into it; `text` outlives it; each event is deleted once its data is copied.
-    unsafe {
-        let mut raw = Box::new(MaybeUninit::<unsafe_libyaml::yaml_parser_t>::uninit());
-        ensure!(
-            !unsafe_libyaml::yaml_parser_initialize(raw.as_mut_ptr()).fail,
-            "failed to start the YAML parser"
-        );
-        let mut parser = Parser(raw);
-        let p = parser.0.as_mut_ptr();
-        unsafe_libyaml::yaml_parser_set_encoding(p, unsafe_libyaml::YAML_UTF8_ENCODING);
-        unsafe_libyaml::yaml_parser_set_input_string(p, text[bom..].as_ptr(), (text.len() - bom) as _);
-        loop {
-            let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
-            // serde_yaml_ng parsed the same text, so this does not fail.
-            ensure!(
-                !unsafe_libyaml::yaml_parser_parse(p, event.as_mut_ptr()).fail,
-                "failed to parse config file"
-            );
-            let event = event.assume_init_mut();
-            let kind = event.type_;
-            if nul_escape {
-                let tagged = match kind {
-                    unsafe_libyaml::YAML_SCALAR_EVENT => !event.data.scalar.tag.is_null(),
-                    unsafe_libyaml::YAML_SEQUENCE_START_EVENT => !event.data.sequence_start.tag.is_null(),
-                    unsafe_libyaml::YAML_MAPPING_START_EVENT => !event.data.mapping_start.tag.is_null(),
-                    // Its span holds the document's directives.
-                    unsafe_libyaml::YAML_DOCUMENT_START_EVENT => true,
-                    _ => false,
-                };
-                let (start, end) = (
-                    event.start_mark.index as usize + bom,
-                    event.end_mark.index as usize + bom,
-                );
-                let span = text.get(start..end);
-                if tagged && span.is_none_or(|s| s.contains("%00")) {
-                    unsafe_libyaml::yaml_event_delete(event);
-                    bail!(UNSUPPORTED_TAG);
+    // Each anchor id's name.
+    let mut names: HashMap<usize, Vec<u8>> = HashMap::new();
+    let text = crate::yaml::load::nel_as_crlf(text);
+    for item in granit_parser::Parser::new_from_str_with_options(&text, options) {
+        // from_str parsed the same text, so this does not fail.
+        let (event, span) = item.map_err(|e| anyhow::anyhow!("failed to parse config file: {e}"))?;
+        let next = match event {
+            E::DocumentEnd => return Ok(out),
+            E::Anchor(id, name) => {
+                let name = name.into_owned().into_bytes();
+                names.insert(id, name.clone());
+                // It follows the node it names.
+                match out.last_mut() {
+                    Some(Event::Scalar { anchor, .. } | Event::Start { anchor, .. }) => *anchor = Some(name),
+                    _ => bail!("config YAML is malformed"),
                 }
+                None
             }
-            let key = match kind {
-                unsafe_libyaml::YAML_SCALAR_EVENT
-                | unsafe_libyaml::YAML_ALIAS_EVENT
-                | unsafe_libyaml::YAML_SEQUENCE_START_EVENT
-                | unsafe_libyaml::YAML_MAPPING_START_EVENT => open.last_mut().is_some_and(|(mapping, nodes)| {
-                    *nodes += 1;
-                    *mapping && *nodes % 2 == 1
-                }),
-                _ => false,
-            };
-            match kind {
-                unsafe_libyaml::YAML_SEQUENCE_START_EVENT => open.push((false, 0)),
-                unsafe_libyaml::YAML_MAPPING_START_EVENT => open.push((true, 0)),
-                unsafe_libyaml::YAML_SEQUENCE_END_EVENT | unsafe_libyaml::YAML_MAPPING_END_EVENT => {
-                    open.pop();
+            E::Scalar(value, style, _, tag) => {
+                let tag = full(tag);
+                ensure!(!nul(&tag), UNSUPPORTED_TAG);
+                let is_plain = style == granit_parser::ScalarStyle::Plain;
+                let timestamp = tag.as_deref() == Some(super::timestamp::TAG.as_bytes());
+                let value = value.into_owned().into_bytes();
+                let source = span.start.byte_offset().zip(span.end.byte_offset());
+                if let Some(plain) = plain.as_deref_mut()
+                    && is_plain
+                    && (tag.is_none() || timestamp)
+                    && let Some((start, end)) = source
+                {
+                    plain.push(Plain {
+                        span: start..end,
+                        value: value.clone(),
+                        timestamp_tag: if timestamp {
+                            span.tag_start.and_then(|m| m.byte_offset())
+                        } else {
+                            None
+                        },
+                    });
                 }
-                _ => {}
+                Some(Event::Scalar {
+                    anchor: None,
+                    tag,
+                    plain: is_plain,
+                    value,
+                })
             }
-            let next = match kind {
-                unsafe_libyaml::YAML_SCALAR_EVENT => {
-                    let s = &event.data.scalar;
-                    let value = std::slice::from_raw_parts(s.value, s.length as usize);
-                    // The event's span starts at an anchor or tag, so the scalar is the
-                    // source bytes that equal its value. One folded over lines
-                    // (`2001-12-14\n  21:59:43`) is not its source: an untagged one starts
-                    // at the event, or after its `&anchor` and the blanks, line breaks
-                    // (NEL, LS and PS too, as libyaml reads them) and comments after it.
-                    let end = event.end_mark.index as usize + bom;
-                    let timestamp = bytes(s.tag).is_some_and(|t| t == super::timestamp::TAG.as_bytes());
-                    let folded_start = || {
-                        let anchor = bytes(s.anchor).map_or(0, |a| 1 + a.len());
-                        let after = event.start_mark.index as usize + bom + anchor;
-                        let rest = text.get(after..end)?;
-                        let mut comment = false;
-                        let skipped = rest
-                            .char_indices()
-                            .find(|&(_, c)| {
-                                let line_break = matches!(c, '\r' | '\n' | '\u{85}' | '\u{2028}' | '\u{2029}');
-                                if line_break {
-                                    comment = false;
-                                } else if c == '#' {
-                                    comment = true;
-                                }
-                                !(comment || line_break || matches!(c, ' ' | '\t'))
-                            })
-                            .map(|(i, _)| i)?;
-                        let first = after + skipped;
-                        (text.as_bytes().get(first) == value.first()).then_some(first)
-                    };
-                    let span = end
-                        .checked_sub(value.len())
-                        .filter(|&start| text.as_bytes().get(start..end) == Some(value))
-                        .or_else(|| s.tag.is_null().then(folded_start).flatten())
-                        .map(|start| start..end);
-                    if let Some(plain) = plain.as_deref_mut()
-                        && s.style == unsafe_libyaml::YAML_PLAIN_SCALAR_STYLE
-                        && (s.tag.is_null() || timestamp)
-                        && let Some(span) = span
-                    {
-                        plain.push(Plain {
-                            span,
-                            value: value.to_vec(),
-                            key,
-                            timestamp_tag: timestamp.then_some(event.start_mark.index as usize + bom),
-                        });
-                    }
-                    Some(Event::Scalar {
-                        anchor: bytes(s.anchor),
-                        tag: bytes(s.tag),
-                        plain: s.style == unsafe_libyaml::YAML_PLAIN_SCALAR_STYLE,
-                        value: std::slice::from_raw_parts(s.value, s.length as usize).to_vec(),
-                    })
-                }
-                unsafe_libyaml::YAML_ALIAS_EVENT => bytes(event.data.alias.anchor).map(Event::Alias),
-                unsafe_libyaml::YAML_SEQUENCE_START_EVENT => Some(Event::Start {
-                    anchor: bytes(event.data.sequence_start.anchor),
+            E::Alias(id) => Some(Event::Alias(
+                names.get(&id).cloned().context("config YAML is malformed")?,
+            )),
+            E::SequenceStart(_, _, tag) => {
+                ensure!(!nul(&full(tag)), UNSUPPORTED_TAG);
+                Some(Event::Start {
+                    anchor: None,
                     mapping: false,
-                }),
-                unsafe_libyaml::YAML_MAPPING_START_EVENT => Some(Event::Start {
-                    anchor: bytes(event.data.mapping_start.anchor),
-                    mapping: true,
-                }),
-                unsafe_libyaml::YAML_SEQUENCE_END_EVENT | unsafe_libyaml::YAML_MAPPING_END_EVENT => Some(Event::End),
-                _ => None,
-            };
-            unsafe_libyaml::yaml_event_delete(event);
-            out.extend(next);
-            if kind == unsafe_libyaml::YAML_STREAM_END_EVENT {
-                return Ok(out);
+                })
             }
-        }
+            E::MappingStart(_, _, tag) => {
+                ensure!(!nul(&full(tag)), UNSUPPORTED_TAG);
+                Some(Event::Start {
+                    anchor: None,
+                    mapping: true,
+                })
+            }
+            E::SequenceEnd | E::MappingEnd => Some(Event::End),
+            _ => None,
+        };
+        out.extend(next);
     }
+    Ok(out)
 }
 
 /// yaml.v3's null spellings.
@@ -595,8 +517,8 @@ impl Walk {
             }
             None => text,
         };
-        Value::Tagged(Box::new(serde_yaml_ng::value::TaggedValue {
-            tag: serde_yaml_ng::value::Tag::new(PLAIN),
+        Value::Tagged(Box::new(crate::yaml::TaggedValue {
+            tag: crate::yaml::Tag::new(PLAIN),
             value: Value::String(text),
         }))
     }

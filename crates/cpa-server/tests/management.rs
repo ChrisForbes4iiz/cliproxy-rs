@@ -866,7 +866,7 @@ async fn typed_secret_keys_are_hashed_as_the_string_they_decode_to() {
         assert_eq!(r.status(), 200, "{written}");
         assert_eq!(get(key).await.unwrap().status(), 200, "{written}: new key");
         assert_eq!(get(old).await.unwrap().status(), 401, "{written}: old key");
-        let file: serde_yaml_ng::Value = serde_yaml_ng::from_str(&f.file()).unwrap();
+        let file: cpa_core::yaml::Value = cpa_core::yaml::from_str(&f.file()).unwrap();
         let hash = file["management"]["secret-key"].as_str().expect("stored as a string");
         assert!(bcrypt::verify(key, hash).unwrap(), "{written}: {hash}");
         old = key;
@@ -918,9 +918,9 @@ async fn unreadable_auth_dir_never_blocks_secret_rotation_or_removal() {
     let text = f.file();
     assert!(!text.contains("fake-rotated"), "secret stored hashed");
     // Removing the secret by hand disables management entirely on the next reload.
-    let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
+    let mut doc: cpa_core::yaml::Value = cpa_core::yaml::from_str(&text).unwrap();
     doc["management"].as_mapping_mut().unwrap().remove("secret-key");
-    std::fs::write(f.dir.join("config.yaml"), serde_yaml_ng::to_string(&doc).unwrap()).unwrap();
+    std::fs::write(f.dir.join("config.yaml"), cpa_core::yaml::to_string(&doc).unwrap()).unwrap();
     watching::reload(&f.state).unwrap();
     let r = get("fake-rotated").await.unwrap();
     assert_eq!((r.status().as_u16(), r.text().await.unwrap()), (404, String::new()));
@@ -989,10 +989,10 @@ async fn writes_normalize_only_what_they_touch() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    let file: serde_yaml_ng::Value = serde_yaml_ng::from_str(&f.file()).unwrap();
+    let file: cpa_core::yaml::Value = cpa_core::yaml::from_str(&f.file()).unwrap();
     assert_eq!(
         file["upstream"]["xai"]["inject-x-search"],
-        serde_yaml_ng::Value::from("on")
+        cpa_core::yaml::Value::from("on")
     );
     let got = send(wreq::Method::GET, "/config/upstream/xai/inject-x-search", "")
         .await
@@ -1000,7 +1000,7 @@ async fn writes_normalize_only_what_they_touch() {
     assert_eq!(got.text().await.unwrap(), r#""on""#);
     assert_eq!(
         f.rt.config().document["upstream"]["xai"]["inject-x-search"],
-        serde_yaml_ng::Value::Bool(true)
+        cpa_core::yaml::Value::Bool(true)
     );
     server.abort();
 }
@@ -1183,10 +1183,10 @@ async fn config_key_toggle_edits_only_the_target_key_in_the_current_file() {
     ] {
         assert!(file.contains(kept), "lost {kept:?}:\n{file}");
     }
-    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&file).unwrap();
+    let doc: cpa_core::yaml::Value = cpa_core::yaml::from_str(&file).unwrap();
     let keys = &doc["api-keys"]["claude"][0]["keys"];
     assert_eq!(keys[0]["api-key"], "fake-b");
-    assert_eq!(keys[0]["excluded-models"], serde_yaml_ng::Value::from(vec!["*"]));
+    assert_eq!(keys[0]["excluded-models"], cpa_core::yaml::Value::from(vec!["*"]));
     assert!(
         keys[1].get("excluded-models").is_none(),
         "fake-a must stay enabled:\n{file}"
@@ -3756,7 +3756,7 @@ async fn config_shared_upstream_round_trip() {
         let d = &cfg.document;
         assert_eq!(
             d["upstream"]["codex"]["stream-bootstrap-buffering"],
-            serde_yaml_ng::Value::Bool(false)
+            cpa_core::yaml::Value::Bool(false)
         );
         assert_eq!(d["upstream"]["claude"]["header-defaults"]["timezone"], "Asia/Singapore");
         assert_eq!(d["oauth"]["auth-auto-refresh-workers"], 3);
@@ -3842,7 +3842,7 @@ async fn legacy_migration_with_shared_upstream_moves_keeps_other_comments() {
                 continue;
             }
             // Nothing is left to migrate: the saved values are the canonical ones.
-            let saved: serde_yaml_ng::Value = serde_yaml_ng::from_str(&file).unwrap();
+            let saved: cpa_core::yaml::Value = cpa_core::yaml::from_str(&file).unwrap();
             let canonical = cpa_core::config::ConfigDocument::parse(&file).unwrap();
             assert_eq!(&saved, canonical.value(), "{tail} {at}: {file}");
             let value = check.iter().try_fold(&saved, |v, k| v.get(*k));
@@ -4533,7 +4533,7 @@ async fn call(base: &str, method: wreq::Method, path: &str, body: &str) -> (u16,
 
 /// Every saved v8 file is fully canonical: nothing is left for a migration to move.
 fn assert_canonical(file: &str) {
-    let saved: serde_yaml_ng::Value = serde_yaml_ng::from_str(file).unwrap();
+    let saved: cpa_core::yaml::Value = cpa_core::yaml::from_str(file).unwrap();
     let canonical = cpa_core::config::ConfigDocument::parse(file).unwrap();
     assert_eq!(&saved, canonical.value(), "{file}");
     assert!(file.contains("config-version: 8"), "{file}");
@@ -4776,7 +4776,7 @@ async fn config_v8_historical_provider_subtrees() {
         assert_canonical(&file);
         let cfg = Config::parse(&file).unwrap();
         let d = &cfg.document;
-        let flag = |v: &serde_yaml_ng::Value| v.as_bool().unwrap_or(false);
+        let flag = |v: &cpa_core::yaml::Value| v.as_bool().unwrap_or(false);
         assert_eq!(
             (
                 flag(&d["upstream"]["codex"]["response-steering"]),
@@ -4873,7 +4873,7 @@ async fn config_v8_historical_configuration_bodies() {
         let file = f.file();
         assert_canonical(&file);
         let d = Config::parse(&file).unwrap().document;
-        let flag = |v: &serde_yaml_ng::Value| v.as_bool().unwrap_or(false);
+        let flag = |v: &cpa_core::yaml::Value| v.as_bool().unwrap_or(false);
         assert_eq!(
             (
                 flag(&d["upstream"]["codex"]["response-steering"]),
@@ -4910,7 +4910,7 @@ async fn config_v8_historical_configuration_bodies() {
             f.file()
         );
     }
-    assert_eq!(claude["model-level-cooling"], serde_yaml_ng::Value::Bool(true));
+    assert_eq!(claude["model-level-cooling"], cpa_core::yaml::Value::Bool(true));
     server.abort();
 
     // Request normalization is not the loader's validation: a missing canonical field
@@ -4934,12 +4934,12 @@ async fn config_v8_historical_configuration_bodies() {
     let d = Config::parse(&file).unwrap().document;
     assert_eq!(
         d["upstream"]["xai"]["inject-x-search"],
-        serde_yaml_ng::Value::Bool(true),
+        cpa_core::yaml::Value::Bool(true),
         "{file}"
     );
     assert_eq!(
         d["upstream"]["codex"]["response-steering"],
-        serde_yaml_ng::Value::Bool(true),
+        cpa_core::yaml::Value::Bool(true),
         "{file}"
     );
     let (status, text) = call(
@@ -5183,7 +5183,7 @@ async fn v0_writes_keep_binary_values() {
     assert_eq!(cfg.document["requests"]["proxy-url"], "http://x.example:80");
     assert_eq!(
         cfg.document["access"]["api-keys"],
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[fake-client, fake-binary, fake-binary]").unwrap()
+        cpa_core::yaml::from_str::<cpa_core::yaml::Value>("[fake-client, fake-binary, fake-binary]").unwrap()
     );
     server.abort();
 }
@@ -5219,15 +5219,15 @@ async fn v0_setters_save_v8_files_in_the_latest_layout() {
         assert_eq!(api.document["routing"]["retry"]["request-retry"], 2);
         assert_eq!(
             api.document["upstream"]["codex"]["response-steering"],
-            serde_yaml_ng::Value::Bool(true)
+            cpa_core::yaml::Value::Bool(true)
         );
         assert_eq!(
             api.document["upstream"]["xai"]["inject-x-search"],
-            serde_yaml_ng::Value::Bool(true)
+            cpa_core::yaml::Value::Bool(true)
         );
         if raw.contains("oauth-agent") {
             // The Codex header defaults stay OAuth-only through the save.
-            let ua = |d: &serde_yaml_ng::Value| {
+            let ua = |d: &cpa_core::yaml::Value| {
                 d["oauth"]["providers"]["codex"]["header-defaults"]["user-agent"]
                     .as_str()
                     .unwrap_or("")
@@ -5352,12 +5352,12 @@ async fn v0_setters_keep_a_legacy_layout() {
         assert_eq!(d["routing"]["retry"]["request-retry"], 2, "{file}");
         assert_eq!(
             d["upstream"]["codex"]["response-steering"],
-            serde_yaml_ng::Value::Bool(true),
+            cpa_core::yaml::Value::Bool(true),
             "{file}"
         );
         assert_eq!(
             d["upstream"]["xai"]["inject-x-search"],
-            serde_yaml_ng::Value::Bool(true),
+            cpa_core::yaml::Value::Bool(true),
             "{file}"
         );
         if raw.contains("legacy-agent") {
@@ -5390,12 +5390,12 @@ async fn v0_setters_keep_a_legacy_layout() {
         assert_eq!(api.document["routing"]["retry"]["request-retry"], retry, "{file}");
         assert_eq!(
             api.document["client"]["codex"]["optimize-multi-agent-v2"],
-            serde_yaml_ng::Value::Bool(true),
+            cpa_core::yaml::Value::Bool(true),
             "{file}"
         );
         assert_eq!(
             api.document["upstream"]["codex"]["response-steering"],
-            serde_yaml_ng::Value::Bool(true),
+            cpa_core::yaml::Value::Bool(true),
             "{file}"
         );
     }
@@ -5457,12 +5457,12 @@ async fn v0_legacy_saves_expand_merges_and_hash_the_key() {
     let d = Config::parse(&file).unwrap().document;
     assert_eq!(
         d["quota-exceeded"]["switch-project"],
-        serde_yaml_ng::Value::Bool(false),
+        cpa_core::yaml::Value::Bool(false),
         "{file}"
     );
     assert_eq!(
         d["quota-exceeded"]["switch-preview-model"],
-        serde_yaml_ng::Value::Bool(true),
+        cpa_core::yaml::Value::Bool(true),
         "{file}"
     );
     assert!(file.contains("blocked-model"), "{file}");

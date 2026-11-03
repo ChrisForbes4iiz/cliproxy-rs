@@ -49,7 +49,7 @@ pub(crate) fn route(rt: &Runtime, c: &Credential, cfg: &Config) -> Option<Route>
             .document
             .get("home")
             .and_then(|h| h.get("enabled"))
-            .and_then(serde_yaml_ng::Value::as_bool)
+            .and_then(cpa_core::yaml::Value::as_bool)
             .unwrap_or(false);
     if home {
         return None;

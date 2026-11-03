@@ -6,9 +6,9 @@ use cpa_core::gostr::GoStr;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+use cpa_core::yaml::Value as Yaml;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use serde_yaml_ng::Value as Yaml;
 
 /// One field of a Go struct (or the element of a slice or map).
 #[derive(Clone, Deserialize)]
@@ -123,7 +123,7 @@ pub(super) fn expand_groups(groups: &Yaml, family: &str) -> Yaml {
             continue;
         }
         for key in keys {
-            let mut item = serde_yaml_ng::Mapping::new();
+            let mut item = cpa_core::yaml::Mapping::new();
             for (k, v) in group.as_mapping().into_iter().flatten() {
                 if k.as_str().is_some_and(|k| SHARED_KEY_FIELDS.contains(&k)) {
                     item.insert(k.clone(), v.clone());
@@ -667,7 +667,7 @@ mod tests {
 
     #[test]
     fn flatten_expands_v8_key_groups() {
-        let doc: Yaml = serde_yaml_ng::from_str(
+        let doc: Yaml = cpa_core::yaml::from_str(
             "observability:\n  logs:\n    debug: true\napi-keys:\n  gemini:\n    - name: g\n      base-url: b\n      keys:\n        - api-key: k1\n        - api-key: k2\n          prefix: p\naccess:\n  api-keys: [c]\n",
         )
         .unwrap();

@@ -299,6 +299,10 @@ timestamps, `%YAML 1.1` octal) come out right from serde-saphyr already, as do
 cases that serde_yaml_ng refuses (recursion limit 128) parse with the raised budget;
 the wrapper should keep a depth limit (Go's is 10 000 flow levels).
 
+## Status
+
+Migrated on 2026-11-03 (beads cliproxy-rs-7ea.44.2 and .44.3): `cpa_core::yaml` is the only YAML code in the workspace, built on granit-parser alone (serde-saphyr was not needed: the typed decoding goes through `from_value` on cpa-core's own `Value`). `serde_yaml_ng` and `unsafe-libyaml` are gone from `Cargo.lock`, and `cargo audit` reports no advisories. The known-differences list of `tests/yaml_v3_go.rs` shrank from 113 to 20 cases on the `parse_yaml` path (140 to 40 raw, 35 to 13 typed).
+
 ## Migration plan
 
 1. **cpa-core: `cpa_core::yaml`** (bead .44.2, the bulk of the work, about 1 to 1.5k

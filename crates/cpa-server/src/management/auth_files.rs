@@ -1441,7 +1441,7 @@ fn toggle_config_key(state: &Management, id: &str, disabled: bool) -> Result<boo
     let basis = doc.migrated_text(&original).unwrap_or_else(|| original.clone());
     let group = doc.get(&["api-keys", family]).and_then(|v| v.get(g)).cloned();
     let key_value = group.as_ref().and_then(|grp| grp.get("keys")?.get(k)).cloned();
-    let pick = |v: Option<&serde_yaml_ng::Value>| -> Option<Vec<String>> {
+    let pick = |v: Option<&cpa_core::yaml::Value>| -> Option<Vec<String>> {
         v.filter(|v| !v.is_null())?
             .as_sequence()
             .map(|s| s.iter().filter_map(|m| m.as_str().map(str::to_owned)).collect())
@@ -1460,21 +1460,21 @@ fn toggle_config_key(state: &Management, id: &str, disabled: bool) -> Result<boo
         .ok_or("config api key entry not found")?;
     let entry = keys
         .get_mut(k)
-        .and_then(serde_yaml_ng::Value::as_mapping_mut)
+        .and_then(cpa_core::yaml::Value::as_mapping_mut)
         .ok_or("config api key entry not found")?;
     entry.insert(
         "excluded-models".into(),
-        serde_yaml_ng::Value::Sequence(next.into_iter().map(Into::into).collect()),
+        cpa_core::yaml::Value::Sequence(next.into_iter().map(Into::into).collect()),
     );
     // Sequence elements are replaced through their parent list.
     let mut groups = doc
         .get(&["api-keys", family])
         .and_then(|v| v.as_sequence().cloned())
         .ok_or("config api key entry not found")?;
-    if let Some(grp) = groups.get_mut(g).and_then(serde_yaml_ng::Value::as_mapping_mut) {
-        grp.insert("keys".into(), serde_yaml_ng::Value::Sequence(keys));
+    if let Some(grp) = groups.get_mut(g).and_then(cpa_core::yaml::Value::as_mapping_mut) {
+        grp.insert("keys".into(), cpa_core::yaml::Value::Sequence(keys));
     }
-    doc.update(&["api-keys", family], serde_yaml_ng::Value::Sequence(groups), false)
+    doc.update(&["api-keys", family], cpa_core::yaml::Value::Sequence(groups), false)
         .map_err(|e| e.to_string())?;
     let text = doc.render_preserving(&basis).map_err(|e| e.to_string())?;
     let next_cfg = cpa_core::config::Config::parse(&text).map_err(|e| e.to_string())?;

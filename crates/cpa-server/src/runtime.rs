@@ -1198,7 +1198,7 @@ fn refresh_workers(cfg: &Config) -> usize {
     cfg.document
         .get("oauth")
         .and_then(|o| o.get("auth-auto-refresh-workers"))
-        .and_then(serde_yaml_ng::Value::as_i64)
+        .and_then(cpa_core::yaml::Value::as_i64)
         .filter(|n| *n > 0)
         .map_or(16, |n| n as usize)
 }
@@ -4303,7 +4303,7 @@ fn signature_cache_config(cfg: &Config) -> (bool, bool) {
             .and_then(|o| o.get("providers"))
             .and_then(|p| p.get("antigravity"))
             .and_then(|a| a.get(key))
-            .and_then(serde_yaml_ng::Value::as_bool)
+            .and_then(cpa_core::yaml::Value::as_bool)
     };
     (
         flag("signature-cache-enabled").unwrap_or(true),

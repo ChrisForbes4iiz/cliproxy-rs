@@ -210,22 +210,22 @@ fn entry_models(cfg: &Config, c: &Credential) -> Option<(Vec<Configured>, &'stat
 /// first enabled entry named by `compat_name`, `provider_key` or the provider. Models
 /// without configured thinking get low/medium/high unless they are image models.
 fn compat_models(cfg: &Config, c: &Credential) -> Option<Vec<Configured>> {
-    let text = |v: Option<&serde_yaml_ng::Value>| match v {
-        Some(serde_yaml_ng::Value::String(s)) => s.trim().to_owned(),
-        Some(serde_yaml_ng::Value::Number(n)) => n.to_string(),
-        Some(serde_yaml_ng::Value::Bool(b)) => b.to_string(),
+    let text = |v: Option<&cpa_core::yaml::Value>| match v {
+        Some(cpa_core::yaml::Value::String(s)) => s.trim().to_owned(),
+        Some(cpa_core::yaml::Value::Number(n)) => n.to_string(),
+        Some(cpa_core::yaml::Value::Bool(b)) => b.to_string(),
         _ => String::new(),
     };
-    let entries: Vec<&serde_yaml_ng::Value> = cfg
+    let entries: Vec<&cpa_core::yaml::Value> = cfg
         .document
         .get("api-keys")
         .and_then(|k| k.get("openai-compatibility"))
-        .and_then(serde_yaml_ng::Value::as_sequence)
+        .and_then(cpa_core::yaml::Value::as_sequence)
         .into_iter()
         .flatten()
         .filter(|g| !text(g.get("base-url")).is_empty())
         .collect();
-    let disabled = |g: &serde_yaml_ng::Value| g.get("disabled").and_then(serde_yaml_ng::Value::as_bool) == Some(true);
+    let disabled = |g: &cpa_core::yaml::Value| g.get("disabled").and_then(cpa_core::yaml::Value::as_bool) == Some(true);
     let by_index = matches!(c.source, Source::Config { .. })
         .then(|| attr(c, "config_index").parse::<usize>().ok())
         .flatten()
@@ -240,10 +240,10 @@ fn compat_models(cfg: &Config, c: &Credential) -> Option<Vec<Configured>> {
     })?;
     let models = entry
         .get("models")
-        .and_then(serde_yaml_ng::Value::as_sequence)
+        .and_then(cpa_core::yaml::Value::as_sequence)
         .into_iter()
         .flatten()
-        .filter_map(|m| serde_yaml_ng::from_value::<ConfigModel>(m.clone()).ok())
+        .filter_map(|m| cpa_core::yaml::from_value::<ConfigModel>(m.clone()).ok())
         .map(|m| Configured {
             thinking: m.thinking.or_else(|| {
                 (!m.image).then(|| ThinkingSupport {
@@ -565,7 +565,7 @@ mod tests {
     /// thinking off; an explicit one wins.
     #[test]
     fn configured_thinking_keeps_the_catalog_disable_type() {
-        let support = |yaml: &str| serde_yaml_ng::from_str::<ThinkingSupport>(yaml).unwrap();
+        let support = |yaml: &str| cpa_core::yaml::from_str::<ThinkingSupport>(yaml).unwrap();
         let configured = support("levels: [low, medium, high, none]");
         let info = resolve_model_info("claude-sonnet-5-5", "claude", Some(configured.clone()));
         let thinking = info.thinking.as_ref().unwrap();

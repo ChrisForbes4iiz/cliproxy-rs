@@ -152,6 +152,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arraydeque"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
+
+[[package]]
 name = "asn1-rs"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -726,7 +732,6 @@ dependencies = [
  "libc",
  "ratatui",
  "serde_json",
- "serde_yaml_ng",
  "socket2",
  "tokio",
  "tokio-util",
@@ -838,7 +843,6 @@ dependencies = [
  "memchr",
  "ryu",
  "serde_json",
- "serde_yaml_ng",
  "sha2 0.10.9",
  "tokio",
 ]
@@ -852,13 +856,15 @@ dependencies = [
  "bcrypt",
  "bytes",
  "futures-util",
+ "granit-parser",
  "http",
+ "indexmap",
+ "itoa",
+ "ryu",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "sha2 0.10.9",
  "tracing",
- "unsafe-libyaml",
  "yaml-edit",
 ]
 
@@ -889,7 +895,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "sha2 0.10.9",
  "socket2",
  "tiktoken-rs",
@@ -917,7 +922,6 @@ dependencies = [
  "cpa-core",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "sha2 0.10.9",
  "tokio",
  "tokio-btls",
@@ -945,7 +949,6 @@ dependencies = [
  "http",
  "libc",
  "serde_json",
- "serde_yaml_ng",
  "sha2 0.10.9",
  "tokio",
  "tokio-util",
@@ -985,7 +988,6 @@ dependencies = [
  "rtc",
  "serde",
  "serde_json",
- "serde_yaml_ng",
  "sha2 0.10.9",
  "socket2",
  "subtle",
@@ -1644,6 +1646,16 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "granit-parser"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05f05586d4d4df3d47123207826c40b252728b438a1a07bad3c01ee6bea401df"
+dependencies = [
+ "arraydeque",
+ "smallvec",
+]
 
 [[package]]
 name = "h2"
@@ -3479,19 +3491,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml_ng"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "sha1"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3778,7 +3777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
@@ -4178,12 +4177,6 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

@@ -401,7 +401,7 @@ pub fn policy(cfg: &Config) -> Policy {
         .document
         .get("oauth")
         .and_then(|o| o.get("request-scoped-errors"))
-        .and_then(serde_yaml_ng::Value::as_mapping);
+        .and_then(cpa_core::yaml::Value::as_mapping);
     for (channel, list) in rules.into_iter().flatten() {
         let channel = channel.as_str().unwrap_or_default().trim().go_lower();
         let clean: Vec<ErrorRule> = list
@@ -411,7 +411,7 @@ pub fn policy(cfg: &Config) -> Policy {
             .filter_map(|r| {
                 let words = |k: &str| -> Vec<String> {
                     r.get(k)
-                        .and_then(serde_yaml_ng::Value::as_sequence)
+                        .and_then(cpa_core::yaml::Value::as_sequence)
                         .into_iter()
                         .flatten()
                         .filter_map(|v| v.as_str().map(|s| s.trim().to_owned()))
@@ -419,12 +419,12 @@ pub fn policy(cfg: &Config) -> Policy {
                         .collect()
                 };
                 let rule = ErrorRule {
-                    status: r.get("status").and_then(serde_yaml_ng::Value::as_i64).unwrap_or(0),
+                    status: r.get("status").and_then(cpa_core::yaml::Value::as_i64).unwrap_or(0),
                     r#match: words("match"),
                     match_regex: words("match-regexr"),
                     action: r
                         .get("action")
-                        .and_then(serde_yaml_ng::Value::as_str)
+                        .and_then(cpa_core::yaml::Value::as_str)
                         .unwrap_or_default()
                         .trim()
                         .go_lower(),
@@ -1310,7 +1310,7 @@ pub(crate) fn v0_save(
     let mut doc = ConfigDocument::unmigrated(root);
     match edit {
         LegacyEdit::Set(value) => {
-            let value = match serde_yaml_ng::to_value(value) {
+            let value = match cpa_core::yaml::to_value(value) {
                 Ok(v) => v,
                 Err(e) => return invalid_config(StatusCode::BAD_REQUEST, e),
             };

@@ -627,12 +627,12 @@ struct WeightError {
     /// `<path>[<i>].weight: <reason>`.
     message: String,
     /// The weight as written.
-    value: serde_yaml_ng::Value,
+    value: cpa_core::yaml::Value,
 }
 
 /// Go `validateWeightMappingNode` on each mapping of a sequence: the first weight that
 /// is not an integer or is above the limit.
-fn weight_error_in(items: &serde_yaml_ng::Value, path: &str) -> Option<WeightError> {
+fn weight_error_in(items: &cpa_core::yaml::Value, path: &str) -> Option<WeightError> {
     for (i, item) in items.as_sequence()?.iter().enumerate() {
         let Some(weight) = item.as_mapping().and_then(|m| m.get("weight")) else {
             continue;
@@ -655,8 +655,8 @@ fn weight_error_in(items: &serde_yaml_ng::Value, path: &str) -> Option<WeightErr
 /// document order, skipping lists a v8 family replaces. A weight that is neither a
 /// number nor null fails Go's decode into `*int` before that: 400.
 // ponytail: that 400 message names the value where yaml.v3 also names the line.
-fn legacy_weight_error(root: &serde_yaml_ng::Value) -> Option<Response> {
-    let v8 = root.get("api-keys").and_then(serde_yaml_ng::Value::as_mapping);
+fn legacy_weight_error(root: &cpa_core::yaml::Value) -> Option<Response> {
+    let v8 = root.get("api-keys").and_then(cpa_core::yaml::Value::as_mapping);
     // Go's flattenV8 replaces a legacy list with the v8 family when that is present.
     let superseded = |legacy: &str| {
         view::KEY_FAMILIES
@@ -690,7 +690,7 @@ fn legacy_weight_error(root: &serde_yaml_ng::Value) -> Option<Response> {
     // yaml.v3 decodes a float into an int (truncating); only the raw-tag check after
     // decoding rejects it.
     Some(if !e.value.is_number() && !e.value.is_null() {
-        let written = serde_yaml_ng::to_string(&e.value).unwrap_or_default();
+        let written = cpa_core::yaml::to_string(&e.value).unwrap_or_default();
         let message = format!(
             "yaml: unmarshal errors:\n  cannot unmarshal {} into int",
             written.trim()
@@ -732,8 +732,8 @@ pub(crate) async fn put_config_yaml(State(state): State<Arc<Management>>, body: 
     let text = normalize_comment_indentation(text);
     let root = match cpa_core::config::yaml_value(&text) {
         Err(e) => return fail(StatusCode::BAD_REQUEST, "invalid_yaml", e.to_string()),
-        Ok(root @ serde_yaml_ng::Value::Mapping(_)) => root,
-        Ok(serde_yaml_ng::Value::Null) if text.trim().is_empty() => serde_yaml_ng::Value::Null,
+        Ok(root @ cpa_core::yaml::Value::Mapping(_)) => root,
+        Ok(cpa_core::yaml::Value::Null) if text.trim().is_empty() => cpa_core::yaml::Value::Null,
         Ok(_) => {
             return fail(
                 StatusCode::BAD_REQUEST,

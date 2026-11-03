@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use cpa_core::yaml::Value;
 use futures_util::future::BoxFuture;
-use serde_yaml_ng::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{self, yaml_bool, yaml_int, yaml_string};
@@ -908,7 +908,7 @@ mod tests {
             "plugins:\n  enabled: true\n  dir: {}\n  configs:\n{configs}",
             root.display()
         );
-        SyncConfig::from_document(&serde_yaml_ng::from_str(&text).unwrap())
+        SyncConfig::from_document(&cpa_core::yaml::from_str(&text).unwrap())
     }
 
     /// Go `syncTestConfig`.
@@ -1474,7 +1474,7 @@ mod tests {
             Err(StoreError::RateLimited(_))
         ));
 
-        let document: Value = serde_yaml_ng::from_str(&format!(
+        let document: Value = cpa_core::yaml::from_str(&format!(
             "requests:\n  proxy-url: \" {proxy_url} \"\nplugins:\n  store-auth:\n    - match: https://api.github.com/\n      type: github-token\n      token-env: {token_env}\n"
         ))
         .unwrap();

@@ -10,10 +10,10 @@ use axum::extract::{Path as UrlPath, Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use cpa_core::config::{Config, ConfigDocument, archive_comments};
+use cpa_core::yaml::{Mapping, Value as Yaml};
 use cpa_plugin::config::{self as pcfg, ItemConfig};
 use cpa_plugin::gojson::{self as pjson, Node};
 use serde_json::{Value, json};
-use serde_yaml_ng::{Mapping, Value as Yaml};
 use tower::ServiceExt as _;
 
 use super::{Management, access};
