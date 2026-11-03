@@ -351,16 +351,19 @@ fn scalar(s: &Scalar, key: bool) -> Result<Value, Error> {
     match tag.as_ref() {
         "!!str" => Ok(text()),
         "!!binary" => {
-            let bytes = go_base64(s.text.as_bytes())
-                .ok_or_else(|| Error::msg("yaml: !!binary value contains invalid base64 data"))?;
-            Ok(match String::from_utf8(bytes) {
-                Ok(text) => Value::String(text),
-                // Go reads the bytes as a string, which a Rust string cannot hold: kept
-                // as its base64 text, tagged, as serde_yaml_ng kept every `!!binary`.
-                Err(_) => Value::Tagged(Box::new(TaggedValue {
+            // Invalid base64, or bytes a Rust string cannot hold (Go reads them as a
+            // string): kept as its base64 text, tagged, as serde_yaml_ng kept every
+            // `!!binary`. The config load's binary pass refuses both with yaml.v3's
+            // messages, so a file that is YAML stays a config error, not a parse error.
+            let tagged = || {
+                Value::Tagged(Box::new(TaggedValue {
                     tag: Tag::new("!!binary"),
                     value: text(),
-                })),
+                }))
+            };
+            Ok(match go_base64(s.text.as_bytes()).map(String::from_utf8) {
+                Some(Ok(text)) => Value::String(text),
+                Some(Err(_)) | None => tagged(),
             })
         }
         wanted @ ("!!bool" | "!!int" | "!!float" | "!!null" | "!!timestamp") => {
