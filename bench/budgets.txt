@@ -20,10 +20,9 @@
 # their lines; the budgets hold today's numbers so that nothing gets worse meanwhile.
 
 # 2026-10-06: Rust 1.99.0.
-# 2026-11-03: Rust 1.99.1. Budget values unchanged: on one machine (WSL Ubuntu 24.04) the
-# base 737ac93b's .text is 30_091_991 with 1.99.0 and 30_093_210 with 1.99.1 (+1.2 KB), and the
-# 2026-11-02 review fixes add 98_496 (+96 KB) over that, inside the 2% tolerance. Absolute
-# values there run about 545 KB above this Ubuntu 22.04 job's, so the CI run confirms them.
+# 2026-11-03: Rust 1.99.1. On one machine (WSL Ubuntu 24.04) the base 737ac93b's .text is
+# 30_091_991 with 1.99.0 and 30_093_210 with 1.99.1 (+1.2 KB); the size lines below are
+# re-measured by this job for the review fixes (see their dated line).
 
 # Release binary and archive, Linux x86_64 (every pull request). Target: binary 30 MB
 # or less, archive 13 MB or less.
@@ -71,10 +70,16 @@
 # (+62 KB binary, +29 KB archive, +4 KB .rodata) over master's build at f123025 in this
 # job (29_501_559 to 29_547_575); the lines below are that job's measurements. The
 # rest of the rise came with master's changes since #150's line.
-size.x86_64-unknown-linux-gnu.binary_bytes   44_107_280  2
-size.x86_64-unknown-linux-gnu.text_bytes     29_547_575  2
-size.x86_64-unknown-linux-gnu.rodata_bytes    8_570_336  2
-size.x86_64-unknown-linux-gnu.archive_bytes  18_721_107  2
+# 2026-11-03: security and stability review fixes (beads epics cliproxy-rs-7ea and
+# cliproxy-rs-zlj): the YAML parser switch to granit-parser with yaml.v3 scalar resolution
+# and alias bounds, git-store credential scoping, panic recovery, bounded bodies and the
+# rest. At f9dd7a34, +247 KB .text (+276 KB binary, +122 KB archive, .rodata unchanged) over
+# the base 737ac93b's build in this job (30_111_223 to 30_358_586); the lines below are
+# that job's measurements.
+size.x86_64-unknown-linux-gnu.binary_bytes   44_960_592  2
+size.x86_64-unknown-linux-gnu.text_bytes     30_358_586  2
+size.x86_64-unknown-linux-gnu.rodata_bytes    8_492_512  2
+size.x86_64-unknown-linux-gnu.archive_bytes  19_130_948  2
 # Crates linked into the binary in two or more versions; a new one fails until it is
 # justified here. 2026-10-05: base64, block-buffer, cpufeatures, crypto-common, digest,
 # getrandom, hashbrown (3), rand, rand_core, sha2, thiserror.

@@ -40,6 +40,9 @@ const links = new Set(["https://github.com/vayungodara/cliproxy-rs"]);
 const external = [...html.matchAll(/\b(?:src|href)="(?!data:|#)([^"]*)"/g)].map((m) => m[1]).filter((url) => !links.has(url));
 if (external.length) throw new Error(`panel: external references remain: ${external.join(", ")}`);
 
+// A Windows checkout (core.autocrlf) gives the sources CRLF line ends; git stores LF, so
+// normalise here or the checksum differs from the one a Linux build of the same commit gives.
+html = html.replace(/\r\n/g, "\n");
 mkdirSync("dist-panel", { recursive: true });
 writeFileSync("dist-panel/management.html", html);
 const sha = createHash("sha256").update(html).digest("hex");

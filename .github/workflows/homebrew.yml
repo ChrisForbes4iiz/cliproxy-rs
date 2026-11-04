@@ -33,6 +33,9 @@ jobs:
       - name: Render a local test tap
         run: |
           brew tap-new --no-git vayungodara/tap
+          # Homebrew refuses to load a formula from a tap it does not trust (since late 2026),
+          # and a tap made by tap-new is not trusted until told so.
+          brew trust vayungodara/tap
           python3 - <<'PY'
           import sys
           from pathlib import Path
