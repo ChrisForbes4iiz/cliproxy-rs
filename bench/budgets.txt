@@ -81,11 +81,14 @@
 # cliproxy-rs-zlj): the YAML parser switch to granit-parser with yaml.v3 scalar resolution
 # and alias bounds, git-store credential scoping, panic recovery, bounded bodies and the
 # rest. At f9dd7a34, +247 KB .text (+276 KB binary, +122 KB archive, .rodata unchanged) over
-# the base 737ac93b's build in this job (30_111_223 to 30_358_586). MERGE-REMEASURE
-size.x86_64-unknown-linux-gnu.binary_bytes   44_725_616  2
-size.x86_64-unknown-linux-gnu.text_bytes     30_146_167  2
-size.x86_64-unknown-linux-gnu.rodata_bytes    8_492_512  2
-size.x86_64-unknown-linux-gnu.archive_bytes  19_024_966  2
+# the base 737ac93b's build in this job (30_111_223 to 30_358_586). Merged with master
+# (#253 to #257) at 000af0b8: +247 KB .text (+283 KB binary, +122 KB archive, +4 KB
+# .rodata) over master's build at 6a3cb25 in this job (30_147_959 to 30_394_554); the
+# lines below are that job's measurements.
+size.x86_64-unknown-linux-gnu.binary_bytes   45_010_128  2
+size.x86_64-unknown-linux-gnu.text_bytes     30_394_554  2
+size.x86_64-unknown-linux-gnu.rodata_bytes    8_496_608  2
+size.x86_64-unknown-linux-gnu.archive_bytes  19_149_769  2
 # Crates linked into the binary in two or more versions; a new one fails until it is
 # justified here. 2026-10-05: base64, block-buffer, cpufeatures, crypto-common, digest,
 # getrandom, hashbrown (3), rand, rand_core, sha2, thiserror.
