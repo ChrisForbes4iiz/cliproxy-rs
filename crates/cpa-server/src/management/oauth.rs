@@ -9,6 +9,7 @@
 
 use cpa_core::gostr::GoStr;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -18,6 +19,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use cpa_core::exec::ExecError;
 use cpa_exec::proxy::Proxy;
+use futures_util::FutureExt;
 use serde_json::{Value, json};
 
 use super::auth_files::{Query, fail, reply};
@@ -25,6 +27,8 @@ use super::{Management, json as respond};
 use crate::runtime::OAuthDelivery as Delivery;
 
 const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// Go `oauthCompletedSessionTTL`, for a binding failed by a file change. A completed
+/// sign-in keeps [`SESSION_TTL`] instead (DIFFERENCES-FROM-GO.md).
 const COMPLETED_TTL: Duration = Duration::from_secs(60);
 const CALLBACK_WAIT: Duration = Duration::from_secs(5 * 60);
 const ANTHROPIC_CALLBACK_PORT: u16 = 54545;
@@ -156,7 +160,9 @@ impl Sessions {
             s.metadata.clear();
             s.siwc_committing = false;
             s.completed = true;
-            s.expires = Instant::now() + COMPLETED_TTL;
+            // Go keeps it a minute; a user who approves on the provider's tab and comes
+            // back later should still read the success.
+            s.expires = Instant::now() + SESSION_TTL;
         }
     }
 
@@ -608,6 +614,7 @@ async fn save_if_pending<T: Send + 'static>(
             if !worker.oauth.is_pending(&sid, &owner) {
                 return Ok(None);
             }
+            assert!(!worker.login_panic, "injected login panic");
             write(auth_dir, value).map(Some).map_err(anyhow::Error::msg)
         }))
     })
@@ -619,7 +626,18 @@ async fn save_if_pending<T: Send + 'static>(
             tracing::error!("failed to save {provider} token: {e}");
             Outcome::Failed(save_error.to_owned())
         }
-        Err(_) => Outcome::Failed(save_error.to_owned()),
+        Err(e) => {
+            resume_panic(e);
+            Outcome::Failed(save_error.to_owned())
+        }
+    }
+}
+
+/// A blocking save task that did not finish: its panic goes on to the worker's panic
+/// catch ([`panicked`]); a cancelled task returns, for the caller's save failure.
+fn resume_panic(e: tokio::task::JoinError) {
+    if let Ok(panic) = e.try_into_panic() {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -634,7 +652,8 @@ async fn settle(state: &Arc<Management>, sid: &str, outcome: Outcome) {
                 worker.publish((*worker.rt.config()).clone(), None);
             })
             .await;
-            if published.is_err() {
+            if let Err(e) = published {
+                resume_panic(e);
                 return fail_session(state, sid, "Failed to save authentication tokens");
             }
             state.oauth.complete(sid);
@@ -653,6 +672,42 @@ fn fail_session(state: &Management, sid: &str, message: &str) {
     if let Some(settled) = &state.login_settled {
         let _ = settled.send(sid.to_owned());
     }
+}
+
+/// The session error after a login worker panicked.
+pub(super) const PANIC_MESSAGE: &str = "Sign-in failed because of an internal error. Start the sign-in again.";
+
+/// Awaits a login worker, catching a panic in it, including one a blocking save task
+/// passed on ([`resume_panic`]). Its error line names only the provider and the state (a
+/// panic payload can quote tokens). Returns whether it panicked. Go recovers nothing in
+/// these goroutines, so there a panic ends the process.
+pub(super) async fn panicked(sid: &str, provider: &str, work: impl Future<Output = ()>) -> bool {
+    let caught = AssertUnwindSafe(work).catch_unwind().await.is_err();
+    if caught {
+        tracing::error!("{provider} sign-in worker panicked; sign-in {sid} failed");
+    }
+    caught
+}
+
+/// Spawns a login's worker: a panic fails the session ([`PANIC_MESSAGE`]) instead of
+/// leaving it waiting until [`SESSION_TTL`], and the login's callback forwarder
+/// (`(port, id)`) stops however the worker ends.
+fn spawn_login(
+    state: &Arc<Management>,
+    sid: &str,
+    provider: &'static str,
+    forwarder: Option<(u16, u64)>,
+    work: impl Future<Output = ()> + Send + 'static,
+) {
+    let (worker, sid) = (state.clone(), sid.to_owned());
+    tokio::spawn(async move {
+        if panicked(&sid, provider, work).await {
+            fail_session(&worker, &sid, PANIC_MESSAGE);
+        }
+        if let Some((port, id)) = forwarder {
+            stop_forwarder(&worker, port, id);
+        }
+    });
 }
 
 fn started(url: String, sid: String) -> Response {
@@ -680,7 +735,8 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
     };
     let (url, sid) = (login.url.clone(), login.state.clone());
     let worker = state.clone();
-    tokio::spawn(async move {
+    let forwarder = forwarder.map(|id| (ANTHROPIC_CALLBACK_PORT, id));
+    spawn_login(&state, &sid, "anthropic", forwarder, async move {
         if let Some(code) = wait_for_callback(&worker, &login.state, "anthropic", "Bad request").await {
             let exchanged = match &worker.login_base {
                 Some(base) => {
@@ -722,7 +778,6 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
             };
             settle(&worker, &login.state, outcome).await;
         }
-        stop_forwarder(&worker, ANTHROPIC_CALLBACK_PORT, forwarder);
     });
     started(url, sid)
 }
@@ -749,7 +804,10 @@ async fn remove_legacy_claude(state: &Arc<Management>, legacy: PathBuf) -> Outco
             tracing::error!("canonical Claude credential saved but legacy credential cleanup failed: {e}");
             Outcome::Failed("Failed to save authentication tokens".into())
         }
-        Err(_) => Outcome::Failed("Failed to save authentication tokens".into()),
+        Err(e) => {
+            resume_panic(e);
+            Outcome::Failed("Failed to save authentication tokens".into())
+        }
     }
 }
 
@@ -774,8 +832,8 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
     };
     let worker = state.clone();
     let flow = sid.clone();
-    tokio::spawn(async move {
-        let guard = LoginGuard::new(worker.clone(), &flow, CODEX_CALLBACK_PORT, forwarder);
+    let forwarder = forwarder.map(|id| (CODEX_CALLBACK_PORT, id));
+    spawn_login(&state, &sid, "codex", forwarder, async move {
         if let Some(code) = wait_for_callback(&worker, &flow, "codex", "Bad Request").await {
             let client = login_client(&worker);
             let oauth = match &worker.login_base {
@@ -810,49 +868,8 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
             };
             settle(&worker, &flow, outcome).await;
         }
-        guard.finish();
     });
     started(url, sid)
-}
-
-/// Settles a login whose task ends without settling it. A panic in the exchange or the
-/// save (a hostile token endpoint once crashed the Codex expiry arithmetic) would
-/// otherwise leave the session pending, polled as `wait` until it expires, with its
-/// callback forwarder bound. [`LoginGuard::finish`] is the normal end; dropping an
-/// unfinished guard fails the session and stops the forwarder.
-struct LoginGuard {
-    state: Arc<Management>,
-    sid: String,
-    port: u16,
-    forwarder: Option<u64>,
-    armed: bool,
-}
-
-impl LoginGuard {
-    fn new(state: Arc<Management>, sid: &str, port: u16, forwarder: Option<u64>) -> Self {
-        Self {
-            state,
-            sid: sid.to_owned(),
-            port,
-            forwarder,
-            armed: true,
-        }
-    }
-
-    /// The task settled the session itself; only the forwarder is left to stop.
-    fn finish(mut self) {
-        self.armed = false;
-        stop_forwarder(&self.state, self.port, self.forwarder.take());
-    }
-}
-
-impl Drop for LoginGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            fail_session(&self.state, &self.sid, "Authentication failed");
-            stop_forwarder(&self.state, self.port, self.forwarder.take());
-        }
-    }
 }
 
 /// Go `RequestAntigravityToken`: reuse the CLI exchange and storage, but unlike
@@ -875,7 +892,8 @@ async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
     };
     let worker = state.clone();
     let flow = sid.clone();
-    tokio::spawn(async move {
+    let forwarder = forwarder.map(|id| (DEFAULT_CALLBACK_PORT, id));
+    spawn_login(&state, &sid, "antigravity", forwarder, async move {
         if let Some(cb) = next_callback(&worker, &flow, "antigravity").await {
             let outcome = async {
                 if !cb.error.is_empty() {
@@ -929,7 +947,6 @@ async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
             .await;
             settle(&worker, &flow, outcome).await;
         }
-        stop_forwarder(&worker, DEFAULT_CALLBACK_PORT, forwarder);
     });
     started(url, sid)
 }
@@ -997,7 +1014,7 @@ async fn start_devin(state: Arc<Management>) -> Response {
     state.oauth.register(&sid, "devin");
     let worker = state.clone();
     let flow = sid.clone();
-    tokio::spawn(async move {
+    spawn_login(&state, &sid, "devin", None, async move {
         // Go runs the whole flow under one five-minute context.
         let deadline = tokio::time::Instant::now() + CALLBACK_WAIT;
         let Some(cb) = next_callback(&worker, &flow, "devin").await else {
@@ -1117,7 +1134,8 @@ async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
         (code.expires_in > 0).then_some(code.expires_in),
     );
     let worker = state.clone();
-    tokio::spawn(async move {
+    let flow_sid = sid.clone();
+    spawn_login(&state, &flow_sid, provider, None, async move {
         let polled = tokio::select! {
             t = flow.poll(&code) => t,
             () = cancelled(&worker, &sid, provider) => return,
@@ -1185,7 +1203,8 @@ async fn start_meta(state: Arc<Management>) -> Response {
     };
     let response = device_started(url, sid.clone(), &code.user_code, Some(expires));
     let worker = state.clone();
-    tokio::spawn(async move {
+    let flow_sid = sid.clone();
+    spawn_login(&state, &flow_sid, "meta", None, async move {
         let waited = tokio::select! {
             b = auth.wait_for_authorization(&code) => b,
             () = cancelled(&worker, &sid, "meta") => return,
@@ -1252,7 +1271,8 @@ async fn start_xai(state: Arc<Management>) -> Response {
         Ok(path)
     }
     let worker = state.clone();
-    tokio::spawn(async move {
+    let flow_sid = sid.clone();
+    spawn_login(&state, &flow_sid, "xai", None, async move {
         let waited = tokio::select! {
             t = auth.poll(&code) => t,
             () = cancelled(&worker, &sid, "xai") => return,
@@ -1411,8 +1431,7 @@ fn redirect_bytes(method: &str, target: &str, query: Option<&str>) -> Vec<u8> {
 }
 
 /// Go `stopCallbackForwarderInstance`: only the forwarder this login started.
-fn stop_forwarder(state: &Management, port: u16, id: Option<u64>) {
-    let Some(id) = id else { return };
+fn stop_forwarder(state: &Management, port: u16, id: u64) {
     let mut forwarders = state.forwarders.lock().unwrap_or_else(PoisonError::into_inner);
     if forwarders.get(&port).is_some_and(|f| f.id == id)
         && let Some(f) = forwarders.remove(&port)
@@ -1643,73 +1662,6 @@ fn redirect_query(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    fn management() -> (Arc<Management>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("cpa-oauth-guard-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.yaml");
-        std::fs::write(&path, format!("oauth: {{auth-dir: {}}}\n", dir.display())).unwrap();
-        let rt = Arc::new(crate::testing::runtime(
-            cpa_core::config::Config::load(&path).unwrap(),
-            Vec::new(),
-            cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
-                codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
-            },
-        ));
-        (Management::new(rt, path), dir)
-    }
-
-    /// A forwarder entry whose task only holds a listener open.
-    async fn fake_forwarder(state: &Management, id: u64) -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let task = tokio::spawn(async move { while listener.accept().await.is_ok() {} });
-        state.forwarders.lock().unwrap().insert(port, Forwarder { id, task });
-        port
-    }
-
-    /// A login task that unwinds (a panic in the exchange or the save) fails its session
-    /// and releases its callback forwarder, instead of leaving the session pending, polled
-    /// as `wait` until it expires, with the forwarder's port bound. A task that settled
-    /// its session itself only releases the forwarder.
-    #[tokio::test]
-    async fn an_unwinding_login_task_fails_its_session_and_stops_its_forwarder() {
-        let (state, dir) = management();
-        state.oauth.register("st", "codex");
-        let port = fake_forwarder(&state, 7).await;
-        let worker = state.clone();
-        let unwound = tokio::spawn(async move {
-            let guard = LoginGuard::new(worker, "st", port, Some(7));
-            if std::hint::black_box(true) {
-                panic!("token exchange panicked");
-            }
-            guard.finish();
-        })
-        .await;
-        assert!(unwound.is_err(), "the task unwound");
-        assert_eq!(
-            state.oauth.get("st"),
-            Some(("codex".into(), "Authentication failed".into(), false)),
-            "the session failed instead of staying pending"
-        );
-        assert!(
-            !state.forwarders.lock().unwrap().contains_key(&port),
-            "the forwarder was released"
-        );
-
-        state.oauth.register("ok", "codex");
-        let port = fake_forwarder(&state, 8).await;
-        let guard = LoginGuard::new(state.clone(), "ok", port, Some(8));
-        state.oauth.complete("ok");
-        guard.finish();
-        assert_eq!(state.oauth.get("ok"), Some(("codex".into(), String::new(), true)));
-        assert!(!state.forwarders.lock().unwrap().contains_key(&port));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
     #[test]
     fn session_causes_drop_upstream_bodies_and_descriptions() {
         for (cause, want) in [
@@ -1797,6 +1749,10 @@ mod tests {
         s.complete("done");
         assert_eq!(s.get("done"), Some(("meta".into(), String::new(), true)));
         assert!(!s.cancel("done"));
+        // 61 s later the success still reads, and a second callback is still refused.
+        s.lock().get_mut("done").unwrap().expires -= Duration::from_secs(61);
+        assert_eq!(s.get("done"), Some(("meta".into(), String::new(), true)));
+        assert_eq!(s.deliver("meta", "done", "c", ""), Delivery::NotPending);
         s.register("live", "kimi");
         assert!(s.cancel("live"));
         assert!(s.get("live").is_none());

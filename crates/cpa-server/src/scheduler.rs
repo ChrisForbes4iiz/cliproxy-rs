@@ -20,9 +20,10 @@ pub enum Strategy {
     RoundRobin,
     FillFirst,
     WeightedRoundRobin,
-    /// cliproxy-rs addition (`soonest-reset`, alias `reset-first`): spend the account
-    /// whose weekly window resets soonest first, until it cools or a usage window runs
-    /// out, then the next soonest. Go has no such strategy and reads it as round-robin.
+    /// cliproxy-rs addition (`soonest-reset`, alias `reset-first`) and the default for
+    /// an unset strategy: spend the account whose weekly window resets soonest first,
+    /// until it cools or a usage window runs out, then the next soonest. Go has no such
+    /// strategy and reads it, like an unset one, as round-robin.
     SoonestReset,
 }
 
@@ -358,7 +359,8 @@ pub fn normalize(raw: RawRouting<'_>) -> Policy {
         strategy: match raw.strategy.trim().to_ascii_lowercase().as_str() {
             "weighted-round-robin" | "weightedroundrobin" | "wrr" => Strategy::WeightedRoundRobin,
             "fill-first" | "fillfirst" | "ff" => Strategy::FillFirst,
-            "soonest-reset" | "soonestreset" | "reset-first" | "resetfirst" => Strategy::SoonestReset,
+            // An unset strategy is reset first; Go reads it as round-robin.
+            "" | "soonest-reset" | "soonestreset" | "reset-first" | "resetfirst" => Strategy::SoonestReset,
             _ => Strategy::RoundRobin,
         },
         force_model_prefix: raw.force_model_prefix,
@@ -807,6 +809,11 @@ pub(crate) struct Scheduler {
     /// Upstream dispatches so far (Go `Manager.executionSeq`): each dispatch takes the
     /// next value ([`Self::dispatch`]); a recorded failure stamps the current one.
     dispatched: u64,
+    /// Credentials whose refresh after an upstream 401 failed with `invalid_grant`
+    /// while the refused tokens were still current, as they were then (Go
+    /// `hasUnauthorizedAuthFailure` from `refreshAuthForRequestAtEpoch`). Neither
+    /// selected nor refreshed until their tokens change ([`Self::tokens_rejected`]).
+    rejected: HashMap<String, std::sync::Arc<Credential>>,
 }
 
 /// Go `cfg.OpenAICompatibility` for cooling: enabled entries with a base URL (Go
@@ -1374,6 +1381,19 @@ impl Scheduler {
 
     pub fn admits(&self, c: &Credential, policy: &Policy) -> bool {
         policy.strategy != Strategy::WeightedRoundRobin || weight(c) > 0
+    }
+
+    /// Records that neither of `c`'s tokens can recover without a new sign-in.
+    pub(crate) fn reject_tokens(&mut self, c: std::sync::Arc<Credential>) {
+        self.rejected.insert(c.id.clone(), c);
+    }
+
+    /// Whether `c` still holds the tokens [`Self::reject_tokens`] recorded (Go
+    /// `updateInternalLocked` lifts the block once `CredentialsChanged`).
+    pub(crate) fn tokens_rejected(&self, c: &Credential) -> bool {
+        self.rejected
+            .get(&c.id)
+            .is_some_and(|r| !crate::runtime::credentials_changed(r, c))
     }
 
     /// [`Self::record_picked`] for an attempt picked just now.
@@ -2011,6 +2031,7 @@ impl Scheduler {
         self.affinity.retain(|id| ids.contains(id));
         self.lcp.retain(|id| ids.contains(id));
         self.probes.retain(|id, _| ids.contains(id.as_str()));
+        self.rejected.retain(|id, _| ids.contains(id.as_str()));
     }
 }
 
@@ -2078,6 +2099,7 @@ impl Scheduler {
     /// `isUnauthorizedError`. Go also matches the error code `unauthorized`, which
     /// cooldowns do not keep.
     pub(crate) fn clear_unauthorized(&mut self, id: &str, now: Instant) -> bool {
+        self.rejected.remove(id);
         let mut changed = false;
         self.cooldowns.retain_of(id, |model, c| {
             let error = c.error.to_ascii_lowercase();
@@ -2287,7 +2309,9 @@ mod tests {
             ("soonest-reset", Strategy::SoonestReset),
             (" Reset-First ", Strategy::SoonestReset),
             ("resetfirst", Strategy::SoonestReset),
-            ("", Strategy::RoundRobin),
+            ("", Strategy::SoonestReset),
+            (" ", Strategy::SoonestReset),
+            ("round-robin", Strategy::RoundRobin),
             ("anything", Strategy::RoundRobin),
         ] {
             assert_eq!(
