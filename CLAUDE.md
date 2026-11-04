@@ -53,7 +53,7 @@ On a shared or small machine prefix builds with `CARGO_BUILD_JOBS=2 nice -n 19`.
 - CI runs the suite inside a loopback-only network namespace. Locally, `cpa_server::testing::runtime` routes any non-loopback credential to a dead proxy so a test cannot reach a provider; mark a credential whose executor points at a mock with `cpa_server::testing::local`.
 - Every test needs its own `auth-dir`. Without one, credential loading falls back to `~/.cli-proxy-api`, where real logins live.
 - `.config/nextest.toml` serialises the heap gate (`crates/cpa-server/tests/alloc_budget.rs`), the wall-clock-bounded tests and the Go plugin tests. If a timing test flakes under `cargo test`, that is why.
-- The Go/Rust differential harness (`./harness/run`, Linux only, needs Go and user namespaces) builds the unmodified Go reference and replays 57 fixtures through both. It has its own workspace in `harness/rust` so `cargo test --workspace` never needs Go.
+- The Go/Rust differential harness (`./harness/run`, Linux only, needs Go and user namespaces) builds the unmodified Go reference and replays 57 fixtures through both. It has its own workspace in `harness/rust` so `cargo test --workspace` never needs Go; that workspace has its own `Cargo.lock`, so a dependency change needs `cargo update --manifest-path harness/rust/Cargo.toml -p <crate>` too, or CI's `--locked` fetch fails.
 
 ## Architecture
 

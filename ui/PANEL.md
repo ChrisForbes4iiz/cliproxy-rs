@@ -61,7 +61,7 @@ SHA-256 of the `dist-panel/management.html` built from this commit:
 sha256sum static/management.html
 ```
 
-`npm run build` writes this value here and to `dist-panel/management.html.sha256`. The build is deterministic, so building the same commit gives the same file.
+`npm run build` writes this value here and to `dist-panel/management.html.sha256`. The build is deterministic, so building the same commit gives the same file, on Windows too: line ends are normalised to LF before the hash, as git stores them.
 
 ## Size
 
