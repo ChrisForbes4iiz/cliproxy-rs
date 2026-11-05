@@ -353,6 +353,11 @@ struct Messages<'m> {
     model: &'m str,
     preserve: bool,
     names: &'m HashMap<Vec<u8>, Vec<u8>>,
+    /// Deferred tools a `tool_reference` loads, by Claude name, as Codex tools (see
+    /// [`loaded_tools`]).
+    loaded: &'m HashMap<Vec<u8>, Vec<u8>>,
+    emitted: HashSet<Vec<u8>>,
+    pending_loaded: Vec<Vec<u8>>,
     items: Vec<Vec<u8>>,
     pending_tool_uses: Vec<Vec<u8>>,
     pending_reminders: Vec<Vec<u8>>,
@@ -362,6 +367,29 @@ struct Messages<'m> {
 impl Messages<'_> {
     fn flush_reminders(&mut self) {
         self.items.append(&mut self.pending_reminders);
+    }
+
+    /// Queues the loaded tools a tool_result's `tool_reference` blocks name, each once.
+    fn queue_loaded(&mut self, result: &Res<'_>) {
+        for name in tool_reference_names(&result.get("content")) {
+            if let Some(tool) = self.loaded.get(&name)
+                && self.emitted.insert(name)
+            {
+                self.pending_loaded.push(tool.clone());
+            }
+        }
+    }
+
+    /// The queued loaded tools as one `additional_tools` item (role developer, the only
+    /// role Codex accepts on it), after the tool results that loaded them.
+    fn flush_loaded(&mut self) {
+        if self.pending_loaded.is_empty() {
+            return;
+        }
+        let mut item = br#"{"type":"additional_tools","role":"developer"}"#.to_vec();
+        gj::set_raw(&mut item, "tools", gj::join(&self.pending_loaded));
+        self.pending_loaded.clear();
+        self.items.push(item);
     }
 
     fn message(&mut self, message: &Res<'_>) {
@@ -472,11 +500,13 @@ impl Messages<'_> {
                     b"tool_result" => {
                         flush(&mut self.items, &mut current);
                         self.items.push(tool_result(part));
+                        self.queue_loaded(part);
                         sendable += 1;
                     }
                     _ => {}
                 }
             }
+            self.flush_loaded();
             flush(&mut self.items, &mut current);
             self.flush_reminders();
         } else if content.kind == Kind::String {
@@ -513,6 +543,100 @@ impl Messages<'_> {
         }
         Some(raw)
     }
+}
+
+/// The `tool_name` of each `tool_reference` block in a tool_result's content.
+fn tool_reference_names(content: &Res<'_>) -> Vec<Vec<u8>> {
+    if !content.is_array() {
+        return vec![];
+    }
+    content
+        .array()
+        .iter()
+        .filter(|block| block.get("type").bytes().as_ref() == b"tool_reference")
+        .map(|block| block.get("tool_name").bytes().into_owned())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Deferred tools (`defer_loading: true`) that a `tool_reference` in a user turn's
+/// tool_result loads, by Claude name (the first declaration of a name), translated.
+/// Claude Code declares a tool its tool search loaded as deferred and loads it with a
+/// `tool_reference`; Anthropic keeps such a definition out of the cached prompt prefix.
+/// Codex reads `tools` ahead of `input`, so a tool added there re-reads the whole
+/// prompt; these go into `input` as `additional_tools` where they were loaded instead.
+/// A deferred tool nothing loads stays in `tools`, after the other tools: Claude Code
+/// moves its never-loaded `DeferredToolPlaceholder` once a tool loads, which would
+/// change `tools` too. Go (convertClaudeRequestToCodex) declares every deferred tool in
+/// `tools`, in the client's order.
+// ponytail: only Claude client requests to Codex. Mapping Claude Code's ToolSearch to
+// Codex client tool_search (tool_search_call/tool_search_output) would also hide the
+// declarations before they are loaded, if Codex's own search ever replaces Claude Code's.
+fn loaded_tools(root: &Res<'_>, tools: &Res<'_>, names: &HashMap<Vec<u8>, Vec<u8>>) -> HashMap<Vec<u8>, Vec<u8>> {
+    let mut referenced: HashSet<Vec<u8>> = HashSet::new();
+    let messages = root.get("messages");
+    if messages.is_array() {
+        for message in messages.array() {
+            let content = message.get("content");
+            if message.get("role").bytes().as_ref() != b"user" || !content.is_array() {
+                continue;
+            }
+            for part in content.array() {
+                if part.get("type").bytes().as_ref() == b"tool_result" {
+                    referenced.extend(tool_reference_names(&part.get("content")));
+                }
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    if referenced.is_empty() || !tools.is_array() {
+        return out;
+    }
+    for tool in tools.array() {
+        if !is_loaded_deferred(&tool, &referenced) {
+            continue;
+        }
+        let name = tool.get("name").bytes().into_owned();
+        out.entry(name).or_insert_with(|| codex_tool(&tool, names));
+    }
+    out
+}
+
+fn is_loaded_deferred(tool: &Res<'_>, referenced: &HashSet<Vec<u8>>) -> bool {
+    tool.get("defer_loading").kind == Kind::True
+        && !is_web_search_tool(&tool.get("type").bytes())
+        && referenced.contains(tool.get("name").bytes().as_ref())
+}
+
+/// One Claude tool (not a web search tool) as a Codex function tool.
+fn codex_tool(tool: &Res<'_>, names: &HashMap<Vec<u8>, Vec<u8>>) -> Vec<u8> {
+    let mut item = tool.raw.to_vec();
+    let kind = tool.get("type");
+    if kind.kind != Kind::String || kind.s.as_ref() != b"function" {
+        gj::set_str(&mut item, "type", "function");
+    }
+    let name = tool.get("name");
+    if name.exists() {
+        let original = name.bytes().into_owned();
+        let short = mapped_name(names, &original);
+        if name.kind != Kind::String || short != original {
+            gj::set_str(&mut item, "name", &short);
+        }
+    }
+    gj::set_raw(
+        &mut item,
+        "parameters",
+        normalize_tool_parameters(&tool.get("input_schema").raw),
+    );
+    for path in ["input_schema", "parameters.$schema", "cache_control", "defer_loading"] {
+        if gj::get(&item, path).exists() {
+            gj::delete(&mut item, path);
+        }
+    }
+    if gj::get(&item, "strict").kind != Kind::False {
+        gj::set_bool(&mut item, "strict", false);
+    }
+    item
 }
 
 /// A `tool_result` block as a `function_call_output` item.
@@ -562,10 +686,15 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
     let root = gj::parse(raw);
     let names = original_to_short(raw);
     gj::set_str(&mut out, "model", model);
+    let tools = root.get("tools");
+    let loaded = loaded_tools(&root, &tools, &names);
     let mut state = Messages {
         model,
         preserve,
         names: &names,
+        loaded: &loaded,
+        emitted: HashSet::new(),
+        pending_loaded: vec![],
         items: vec![],
         pending_tool_uses: vec![],
         pending_reminders: vec![],
@@ -606,9 +735,10 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
         state.flush_reminders();
     }
 
-    let tools = root.get("tools");
     let mut has_web_search = false;
     let mut tool_items: Vec<Vec<u8>> = vec![];
+    // Deferred tools nothing loads, declared after the others (see `loaded_tools`).
+    let mut deferred_items: Vec<Vec<u8>> = vec![];
     if tools.is_array() {
         let web_search: HashSet<Vec<u8>> = tools
             .array()
@@ -628,34 +758,15 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
                 tool_items.push(web_search_tool(&tool));
                 continue;
             }
-            let mut item = tool.raw.to_vec();
-            let kind = tool.get("type");
-            if kind.kind != Kind::String || kind.s.as_ref() != b"function" {
-                gj::set_str(&mut item, "type", "function");
-            }
-            let name = tool.get("name");
-            if name.exists() {
-                let original = name.bytes().into_owned();
-                let short = mapped_name(&names, &original);
-                if name.kind != Kind::String || short != original {
-                    gj::set_str(&mut item, "name", &short);
+            if tool.get("defer_loading").kind == Kind::True {
+                if !loaded.contains_key(tool.get("name").bytes().as_ref()) {
+                    deferred_items.push(codex_tool(&tool, &names));
                 }
+                continue;
             }
-            gj::set_raw(
-                &mut item,
-                "parameters",
-                normalize_tool_parameters(&tool.get("input_schema").raw),
-            );
-            for path in ["input_schema", "parameters.$schema", "cache_control", "defer_loading"] {
-                if gj::get(&item, path).exists() {
-                    gj::delete(&mut item, path);
-                }
-            }
-            if gj::get(&item, "strict").kind != Kind::False {
-                gj::set_bool(&mut item, "strict", false);
-            }
-            tool_items.push(item);
+            tool_items.push(codex_tool(&tool, &names));
         }
+        tool_items.append(&mut deferred_items);
     }
 
     let disable_parallel = root.get("tool_choice.disable_parallel_tool_use");
@@ -743,4 +854,111 @@ fn convert(model: &str, raw: &[u8], preserve: bool) -> Result<Vec<u8>, Error> {
     gj::set_items(&mut out, "input", &state.items);
     state.drops.result()?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod deferred_tool_tests {
+    use super::convert;
+    use serde_json::{Value, json};
+
+    const READ: &str = r#"{"name":"Read","description":"Read a file.","input_schema":{"type":"object","properties":{"path":{"type":"string"}}}}"#;
+    const SEARCH: &str = r#"{"name":"ToolSearch","description":"Load deferred tools.","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}"#;
+    const JIRA: &str = r#"{"name":"mcp__jira__get_issue","description":"Get an issue.","input_schema":{"type":"object","properties":{"key":{"type":"string"}}},"defer_loading":true}"#;
+    const PLACEHOLDER: &str = r#"{"name":"DeferredToolPlaceholder","description":"Never loaded.","input_schema":{"type":"object","properties":{}},"defer_loading":true}"#;
+
+    fn request(tools: &[&str], messages: Value) -> Value {
+        let tools: Vec<Value> = tools.iter().map(|t| serde_json::from_str(t).unwrap()).collect();
+        let body = json!({"model": "claude-sonnet-5-5", "max_tokens": 1024, "tools": tools, "messages": messages});
+        let out = convert("gpt-6.1-sol", body.to_string().as_bytes(), false).unwrap();
+        serde_json::from_slice(&out).unwrap()
+    }
+
+    fn names(tools: &Value) -> Vec<&str> {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect()
+    }
+
+    /// Before the search: one user turn asking for an issue.
+    fn asked() -> Value {
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "Look up ABC-1."}]},
+        ])
+    }
+
+    /// The same conversation after ToolSearch loaded the Jira tool, and one more turn.
+    fn loaded() -> Value {
+        json!([
+            {"role": "user", "content": [{"type": "text", "text": "Look up ABC-1."}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "ToolSearch", "input": {"query": "jira"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "tool_reference", "tool_name": "mcp__jira__get_issue"}]},
+                {"type": "text", "text": "Go on."},
+            ]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_2", "name": "mcp__jira__get_issue", "input": {"key": "ABC-1"}}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": "Done."},
+                {"type": "tool_result", "tool_use_id": "toolu_9", "content": [{"type": "tool_reference", "tool_name": "mcp__jira__get_issue"}]},
+            ]},
+        ])
+    }
+
+    #[test]
+    fn a_loaded_deferred_tool_reaches_codex_as_additional_tools_where_it_was_loaded() {
+        let out = request(&[READ, SEARCH, PLACEHOLDER, JIRA], loaded());
+        // Declared tools, then the placeholder nothing loads.
+        assert_eq!(names(&out["tools"]), ["Read", "ToolSearch", "DeferredToolPlaceholder"]);
+        let input = out["input"].as_array().unwrap();
+        let at = input
+            .iter()
+            .position(|i| i["type"] == "additional_tools")
+            .expect("an additional_tools item");
+        assert_eq!(input[at - 1]["type"], "function_call_output");
+        assert_eq!(input[at - 1]["call_id"], "toolu_1");
+        assert_eq!(
+            input[at + 1]["role"],
+            "user",
+            "the text after the results follows the loaded tools"
+        );
+        let item = &input[at];
+        assert_eq!(item["role"], "developer");
+        assert_eq!(names(&item["tools"]), ["mcp__jira__get_issue"]);
+        let tool = &item["tools"][0];
+        assert_eq!(tool["type"], "function");
+        assert_eq!(tool["parameters"]["properties"]["key"]["type"], "string");
+        assert_eq!(tool["strict"], false);
+        assert!(tool.get("defer_loading").is_none() && tool.get("input_schema").is_none());
+        // A second reference to the same tool loads nothing new.
+        assert_eq!(input.iter().filter(|i| i["type"] == "additional_tools").count(), 1);
+    }
+
+    #[test]
+    fn loading_a_deferred_tool_keeps_the_earlier_codex_request_as_a_prefix() {
+        // Claude Code moves its placeholder behind the other tools once a tool loads.
+        let before = request(&[READ, PLACEHOLDER, SEARCH], asked());
+        let after = request(&[READ, SEARCH, PLACEHOLDER, JIRA], loaded());
+        assert_eq!(before["tools"], after["tools"]);
+        let (before, after) = (before["input"].as_array().unwrap(), after["input"].as_array().unwrap());
+        assert_eq!(before[..], after[..before.len()]);
+    }
+
+    #[test]
+    fn a_deferred_tool_nothing_loads_is_declared_after_the_other_tools() {
+        let out = request(&[JIRA, READ, PLACEHOLDER, SEARCH], asked());
+        assert_eq!(
+            names(&out["tools"]),
+            ["Read", "ToolSearch", "mcp__jira__get_issue", "DeferredToolPlaceholder"]
+        );
+        assert!(out["tools"][2].get("defer_loading").is_none());
+        assert!(
+            !out["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["type"] == "additional_tools")
+        );
+    }
 }

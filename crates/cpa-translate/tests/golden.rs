@@ -297,6 +297,33 @@ fn canonical(raw: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Claude->Codex fixtures with a deferred tool nothing loads: cliproxy-rs declares such a
+/// tool after the other tools (docs/DIFFERENCES-FROM-GO.md, "Claude requests to Codex,
+/// deferred tools"), and the rest of Go's output stands. Each must differ from Go.
+const DEFERRED_LAST: &[&str] = &[
+    "codex-claude/web-search@gpt-5.3-codex",
+    "codex-claude/web-search@grok-4.7(high)",
+];
+
+/// Go's Codex request with the tools the Claude request declares `defer_loading: true`
+/// moved behind the others, each keeping its bytes.
+fn deferred_last(output: &[u8], input: &[u8]) -> Vec<u8> {
+    let deferred: Vec<Vec<u8>> = gj::get(input, "tools")
+        .array()
+        .iter()
+        .filter(|t| t.get("defer_loading").kind == gj::Kind::True)
+        .map(|t| t.get("name").bytes().into_owned())
+        .collect();
+    let (moved, kept): (Vec<_>, Vec<_>) = gj::get(output, "tools")
+        .array()
+        .into_iter()
+        .partition(|t| deferred.contains(&t.get("name").bytes().into_owned()));
+    let tools: Vec<Vec<u8>> = kept.iter().chain(&moved).map(|t| t.raw.to_vec()).collect();
+    let mut out = output.to_vec();
+    gj::set_raw(&mut out, "tools", gj::join(&tools));
+    out
+}
+
 /// Replays one fixture; returns its mismatches.
 fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: bool) -> Vec<String> {
     let mut expected: Vec<Vec<u8>> = f["outputs"]
@@ -307,6 +334,18 @@ fn check(client: Format, upstream: Format, f: &Value, bytes: bool, tool_search: 
         .collect();
     if let Some(refusal) = f["request_error"].as_str() {
         expected = vec![format!("REFUSED:{refusal}").into_bytes()];
+    }
+    if client == Format::Claude
+        && upstream == Format::Codex
+        && DEFERRED_LAST.contains(&f["name"].as_str().unwrap_or_default())
+    {
+        let go = expected[0].clone();
+        expected[0] = deferred_last(&go, &field(&f["input"], bytes));
+        assert_ne!(
+            expected[0], go,
+            "{}: Go already declares its deferred tools last",
+            f["name"]
+        );
     }
     let dynamics: Vec<Dyn> = f["dynamic"]
         .as_array()
