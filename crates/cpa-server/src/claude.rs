@@ -185,7 +185,17 @@ async fn handle(
     let keepalive = respond::keepalive(&rt.config());
     dispatch::serve(&rt, call, move |result| async move {
         match result {
-            Err(failure) => errors::claude(&failure),
+            Err(failure) => {
+                let mut response = errors::claude(&failure);
+                if stream {
+                    // Once a keep-alive committed the event stream (dispatch::holds_stream),
+                    // the failure goes out as the stream's error event.
+                    let body = errors::claude_body(failure.status(), &failure.text());
+                    let event = Bytes::from(format!("event: error\ndata: {body}\n\n"));
+                    response.extensions_mut().insert(dispatch::SseError(event));
+                }
+                response
+            }
             Ok(Done::Buffered { body, .. }) => respond::json(200, "application/json", body),
             Ok(Done::Stream { first, rest, .. }) => {
                 respond::sse(respond::stream(first, rest, ClaudeSse::default(), keepalive))

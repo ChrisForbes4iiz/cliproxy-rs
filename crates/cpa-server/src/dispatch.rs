@@ -495,13 +495,14 @@ fn canonical_model_raw(model: &str) -> &str {
 /// interval, the response commits as 200 `application/json` and a `\n` goes out every
 /// interval until the call finishes; the rendered body follows. The rendered status and
 /// headers are lost then, as in Go, where they are written after the first keep-alive
-/// flush. Media calls marked [`Media::sse`] hold with event-stream keep-alives instead.
+/// flush. Media calls marked [`Media::sse`] hold with event-stream keep-alives instead,
+/// and so do Claude-format streams (a cliproxy-rs addition, [`holds_stream`]).
 pub async fn serve<F, Fut>(rt: &Arc<Runtime>, call: Call, render: F) -> axum::response::Response
 where
     F: FnOnce(Result<Done, Failure>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = axum::response::Response> + Send + 'static,
 {
-    let sse = call.media.as_ref().is_some_and(|m| m.sse);
+    let sse = call.media.as_ref().is_some_and(|m| m.sse) || holds_stream(&call);
     let speech = call.media.as_ref().is_some_and(|m| m.kind == MediaKind::Speech);
     let interval = if sse {
         crate::respond::keepalive(&rt.config())
@@ -619,6 +620,15 @@ where
         headers.insert("x-cpa-trace-id", value);
     }
     response
+}
+
+/// A Claude-format stream waits for its first upstream chunk under the event-stream
+/// keep-alive (`requests.streaming.keepalive-seconds`), as an SSE media call does. Go
+/// writes nothing until that chunk, but Codex sends nothing while the model reasons, and
+/// Claude Code abandons a stream with no bytes for 5 minutes and sends it again
+/// (docs/DIFFERENCES-FROM-GO.md, "Claude streams, keep-alive before the first chunk").
+fn holds_stream(call: &Call) -> bool {
+    call.stream && call.operation == Operation::Generate && call.entry == Format::Claude && call.media.is_none()
 }
 
 /// Upstream response headers bound for the client under `requests.passthrough-headers`.
@@ -2450,6 +2460,7 @@ fn track_usage(done: Done, tracker: Option<crate::usage_record::Tracker>) -> Don
             Done::Buffered { headers, body }
         }
         Done::Stream { headers, first, rest } => {
+            tracker.streaming();
             if let Some(first) = &first {
                 tracker.event(first);
             }
@@ -2766,7 +2777,19 @@ mod tests {
             assert_eq!(records.len(), 1, "{ending}");
             let record: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
             assert_eq!(record["upstream_response_bytes"], 42, "{ending}: {record}");
+            // A client leaving a started stream is Go's deferred publish, not a failure.
+            assert_eq!(record["failed"], ending == "error", "{ending}: {record}");
         }
+
+        // Go `TrackFailure`: a client gone before the executor returned (the attempt's
+        // future dropped mid-bootstrap) is a failed attempt with status 499.
+        drop(crate::usage_record::Tracker::start(&rt, &facts, &credential, "m"));
+        let records = rt.usage_queue().pop_oldest(10);
+        assert_eq!(records.len(), 1);
+        let record: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
+        assert_eq!(record["failed"], true, "{record}");
+        assert_eq!(record["fail"]["status_code"], 499, "{record}");
+        assert_eq!(record["fail"]["body"], "context canceled", "{record}");
     }
 
     /// Go `isConnectionLifecycleError` on the texts executors produce.

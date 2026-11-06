@@ -314,6 +314,64 @@ async fn nonstream_keepalive_commits_like_go() {
     }
 }
 
+/// A cliproxy-rs addition (docs/DIFFERENCES-FROM-GO.md, "Claude streams, keep-alive before
+/// the first chunk"): with `requests.streaming.keepalive-seconds` set, a Claude stream whose
+/// upstream has sent nothing after one interval commits 200 `text/event-stream` and sends
+/// `: keep-alive` comments, then the stream; a failure after that commit is the stream's
+/// `error` event. Go writes nothing until the first chunk. A result within one interval is
+/// answered as without a keep-alive. The held mock answers only after the client has read
+/// the first keep-alive, so no wall-clock margin decides the outcome.
+#[tokio::test]
+async fn claude_stream_keepalive_before_the_first_chunk() {
+    let body =
+        format!(r#"{{"model":"{MODEL}","max_tokens":5,"stream":true,"messages":[{{"role":"user","content":"hi"}}]}}"#);
+
+    // Within one interval: Go's answer, a 400 for a rejected request.
+    let never = "requests:\n  streaming:\n    keepalive-seconds: 86400\n";
+    let p = proxy(never, vec![oauth("a.json", "fake-bad", serde_json::json!({}))]).await;
+    let (status, _, text) = post(&p.url, "/v1/messages", &body).await;
+    assert_eq!(status, 400, "{text}");
+    let p = proxy(never, vec![oauth("a.json", "fake-ok", serde_json::json!({}))]).await;
+    let (status, _, text) = post(&p.url, "/v1/messages", &body).await;
+    assert_eq!(status, 200, "{text}");
+    assert!(text.starts_with("event: message_start\n"), "{text}");
+
+    let every_second = "requests:\n  streaming:\n    keepalive-seconds: 1\n";
+    for token in ["fake-held-ok", "fake-held-bad"] {
+        let p = proxy(every_second, vec![oauth("a.json", token, serde_json::json!({}))]).await;
+        let res = wreq::Client::new()
+            .post(format!("{}/v1/messages", p.url))
+            .header("authorization", "Bearer client-key")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200, "{token}");
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let mut chunks = res.bytes_stream();
+        let mut text = Vec::new();
+        while text.is_empty() {
+            text.extend_from_slice(&chunks.next().await.unwrap().unwrap());
+        }
+        assert_eq!(String::from_utf8_lossy(&text), ": keep-alive\n\n", "{token}");
+        p.seen.release.notify_one();
+        while let Some(chunk) = chunks.next().await {
+            text.extend_from_slice(&chunk.unwrap());
+        }
+        let text = String::from_utf8(text).unwrap();
+        let rest = text.trim_start_matches(": keep-alive\n\n");
+        if token == "fake-held-ok" {
+            assert!(rest.starts_with("event: message_start\n"), "{text}");
+            assert!(rest.contains("event: message_stop\n"), "{text}");
+        } else {
+            assert!(rest.starts_with("event: error\ndata: {"), "{text}");
+            assert!(rest.contains(r#""type":"invalid_request_error""#), "{text}");
+            assert!(rest.contains(r#""message":"bad input""#), "{text}");
+            assert!(rest.ends_with("\n\n"), "{text}");
+        }
+    }
+}
+
 /// gin without `HandleMethodNotAllowed` (Go `engine.handleHTTPRequest`): a known
 /// path's unregistered method and an unregistered HEAD run NoRoute, whose handler
 /// aborts with a bare 404; only `/healthz` registers HEAD. The Go binary comparison is

@@ -2096,6 +2096,9 @@ enum Ending<'a> {
     /// Success, or a stream the client dropped (Go's deferred publish).
     Done,
     Failed(&'a cpa_core::exec::ExecError),
+    /// The client went away before the executor returned (Go `TrackFailure` with the
+    /// request context's `context.Canceled`).
+    Cancelled,
 }
 
 /// One upstream attempt's record in progress. It publishes at most once: what the
@@ -2121,6 +2124,9 @@ pub struct Tracker {
     /// Go `baseURL`: the credential's `base_url` attribute, else its metadata's.
     base_url: String,
     attempt: usize,
+    /// The executor returned a stream ([`Tracker::streaming`]); a drop before it is
+    /// a cancelled attempt.
+    streaming: bool,
 }
 
 impl Tracker {
@@ -2205,7 +2211,14 @@ impl Tracker {
             requested_at: now.fixed_offset(),
             base_url,
             attempt: facts.attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            streaming: false,
         }
+    }
+
+    /// The executor returned its stream: from here a drop is the client leaving a
+    /// started stream (Go's deferred `EnsurePublished`), not a cancelled attempt.
+    pub fn streaming(&mut self) {
+        self.streaming = true;
     }
 
     /// The sink to hand the executor.
@@ -2327,6 +2340,15 @@ impl Tracker {
                     } else {
                         Detail::default()
                     }
+                }
+                // ponytail: Go's body is the executor's wrapped error text (for example
+                // `Post "<url>": context canceled` when the request is cancelled in flight);
+                // the status, 499 (`clienterror.StatusClientClosedRequest`), is the same.
+                Ending::Cancelled => {
+                    record.failed = true;
+                    record.fail_status = 499;
+                    record.fail_body = "context canceled".into();
+                    Detail::default()
                 }
             };
             record.detail = detail;
@@ -2482,7 +2504,11 @@ impl Tracker {
 
 impl Drop for Tracker {
     fn drop(&mut self) {
-        self.publish(Ending::Done);
+        self.publish(if self.streaming {
+            Ending::Done
+        } else {
+            Ending::Cancelled
+        });
     }
 }
 
@@ -2839,11 +2865,12 @@ mod tests {
             observation["failed"], false,
             "absence of usage is not a successful completion signal"
         );
-        let tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "claude-sonnet-4-6");
+        let mut tracker = Tracker::start(&rt, &facts, &credential_for("claude"), "claude-sonnet-4-6");
         tracker.sink().usage_required();
         tracker
             .sink()
             .claude_cache(cpa_core::exec::ClaudeCacheTelemetry::default());
+        tracker.streaming();
         drop(tracker); // Same path as a client dropping its stream before usage.
         let got = rt.usage_queue().pop_oldest(10);
         let observation: Value = serde_json::from_slice(&got[0]).unwrap();
